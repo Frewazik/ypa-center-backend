@@ -1,0 +1,30 @@
+[project]
+name = "ypa-center-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = false
+
+mypy_path = "."
+explicit_package_bases = true
+
+plugins = ["mypy_django_plugin.main"]
+
+[[tool.mypy.overrides]]
+module = "phonenumber_field.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["apps.*.tests", "apps.*.factories"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "config.urls"
+disable_error_code = ["attr-defined"]
+
+[tool.django-stubs]
+django_settings_module = "config.settings"
+

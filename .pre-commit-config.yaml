@@ -1,0 +1,31 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.0
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - django-stubs[compatible-mypy]
+          - djangorestframework-stubs[compatible-mypy]
+          - djangorestframework
+          - djangorestframework-simplejwt
+          - django-cors-headers
+          - django-phonenumber-field
+          - phonenumbers
+          - django-simple-history
+          - django-storages
+          - drf-spectacular
+          - pydantic
+          - pydantic-settings
+          - types-requests
+          - boto3-stubs
+          - psycopg[binary]
+          - taskiq              
+          - taskiq-redis
+        args: [--config-file=pyproject.toml]

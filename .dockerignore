@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# uv / venv
+.venv/
+.uv/
+
+# Django
+media/
+staticfiles/
+local_settings.py
+db.sqlite3
+
+# Environment (ЗАПРЕЩЕНО КОПИРОВАТЬ В ОБРАЗ)
+.env
+.env.*
+!.env.example
+
+# Testing / QA
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# IDEs
+.idea/
+.vscode/
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Docs
+*.md
+LICENSE
