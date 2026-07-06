@@ -35,20 +35,12 @@ from apps.users.services import (
 
 
 class CaptureOnCommitCallbacks(Protocol):
-    """
-    Минимальный протокол фикстуры pytest-django
-    `django_capture_on_commit_callbacks` — для Mypy strict без завязки
-    на внутренние типы pytest_django.
-    """
+    # ПОЧЕМУ: протокол для Mypy strict,
+    # чтобы не тянуть внутренние типы pytest_django
 
     def __call__(
         self, *, using: str = ..., execute: bool = ...
     ) -> AbstractContextManager[list[Callable[[], None]]]: ...
-
-
-# ---------------------------------------------------------------------------
-# Factories
-# ---------------------------------------------------------------------------
 
 
 class ParentFactory(factory.django.DjangoModelFactory):
@@ -82,22 +74,11 @@ class MagicTokensFactory(factory.django.DjangoModelFactory):
 
 
 def _backdate_token(email: str, seconds_ago: int) -> None:
-    """
-    Сдвигает created_at токена в прошлое ЧЕРЕЗ queryset.update().
-
-    auto_now_add=True игнорирует значение, переданное в конструктор/фабрику,
-    и принудительно ставит now() при INSERT — поэтому
-    MagicTokensFactory(created_at=...) молча создаёт «свежий» токен.
-    Queryset.update() идёт мимо save() и записывает значение как есть.
-    """
+    # ПОЧЕМУ: auto_now_add при INSERT игнорирует фабрику;
+    # обходим через прямой QuerySet.update()
     MagicTokens.objects.filter(email=email).update(
         created_at=timezone.now() - timedelta(seconds=seconds_ago)
     )
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -107,19 +88,9 @@ def api_client() -> APIClient:
 
 @pytest.fixture(autouse=True)
 def _clear_default_cache() -> None:
-    """
-    Троттл-счётчики DRF (throttling.py) хранятся в default-кэше и без сброса
-    накапливаются между тестами одного процесса: пятый по счёту view-тест
-    ловил бы 429 от лимита 5/hour, наведённого предыдущими тестами.
-    """
     from django.core.cache import cache
 
     cache.clear()
-
-
-# ---------------------------------------------------------------------------
-# Model tests
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.django_db
@@ -140,10 +111,8 @@ class TestParentModel:
             ParentFactory(email="dup@example.com")
 
     def test_create_user_produces_unusable_password(self) -> None:
-        """
-        ParentManager.create_user — единственная точка создания Parent.
-        Сигнал удалён; инвариант unusable-пароля обеспечивается только менеджером.
-        """
+        # ПОЧЕМУ: инвариант unusable-пароля теперь
+        # жестко обеспечивается менеджером, а не сигналами
         parent = Parent.objects.create_user(
             email="createuser@example.com",
             full_name="",
@@ -151,12 +120,8 @@ class TestParentModel:
         assert not parent.has_usable_password()
 
     def test_create_superuser_with_password_unlocks_admin(self) -> None:
-        """
-        Admin Lockout: Django Admin работает через ModelBackend →
-        check_password(); unusable-пароль отклоняется аппаратно.
-        create_superuser с паролем обязан выдать usable-пароль,
-        проходящий check_password — иначе в админку не войдёт никто.
-        """
+        # ПОЧЕМУ: Django Admin требует check_password();
+        # суперпользователю критичен usable-пароль
         admin = Parent.objects.create_superuser(
             email="admin@example.com",
             password="S3cret!pass",
@@ -167,31 +132,19 @@ class TestParentModel:
         assert admin.check_password("S3cret!pass")
 
     def test_create_superuser_without_password_stays_unusable(self) -> None:
-        """
-        createsuperuser --noinput передаёт password=None: пароль остаётся
-        unusable (задать позже через changepassword), а не пустая строка,
-        проходящая check_password("").
-        """
+        # ПОЧЕМУ: вызов --noinput передает password=None,
+        #  пароль должен остаться unusable
         admin = Parent.objects.create_superuser(email="noinput@example.com")
         assert admin.is_staff is True
         assert not admin.has_usable_password()
 
     def test_create_user_does_not_accept_password(self) -> None:
-        """
-        Инвариант OTP-only для родителей: create_user не имеет параметра
-        password — usable-пароль обычному Parent недостижим ни одним путём.
-        Единственный «чёрный ход» — create_superuser, и только для staff.
-        """
         sig = inspect.signature(Parent.objects.create_user)
         assert "password" not in sig.parameters
 
     def test_create_user_normalizes_email_to_lowercase(self) -> None:
-        """
-        Defense in Depth: менеджер обязан канонизировать email независимо от
-        вызывающего кода. normalize_email() обрабатывает только доменную часть;
-        .lower() на всю строку защищает от раздвоения профилей при создании
-        через Admin, management command или фоновую задачу в обход сериализатора.
-        """
+        # ПОЧЕМУ: защита от дублирования аккаунтов
+        # при создании юзера через админку или менеджмент-команды
         parent = Parent.objects.create_user(email="UPPER@Example.COM")
         assert parent.email == "upper@example.com"
 
@@ -200,23 +153,20 @@ class TestParentModel:
 class TestStudentModel:
     def test_str_returns_full_name(self) -> None:
         # __str__ возвращает только full_name — без обращения к self.parent.email,
-        # чтобы не инициировать ленивый SQL-запрос (N+1 в Admin UI / логах).
+        # чтобы не инициировать ленивый SQL-запрос (N+1 в Admin UI / логах)
         student = StudentFactory(full_name="Иванов Иван Иванович")
         assert str(student) == "Иванов Иван Иванович"
 
     def test_str_does_not_query_parent(self) -> None:
-        """
-        Регрессионный тест на N+1: str(student) не должен обращаться к БД.
-        django.test.utils.CaptureQueriesContext гарантирует ноль запросов
-        при вызове __str__ без prefetch/select_related.
-        """
+        # ПОЧЕМУ: регрессионный тест на N+1;
+        # обращение к __str__ модели не должно триггерить ленивый SQL
         from django.db import connection as _conn
         from django.test.utils import CaptureQueriesContext
 
         student = StudentFactory()
-        # Детач объекта от кэша — принудительный сброс __dict__ кэша Django ORM.
+        # Детач объекта от кэша — принудительный сброс __dict__ кэша Django ORM
         student.refresh_from_db()
-        # Обнуляем кэш related объекта, чтобы parent не был подгружен заранее.
+        # Обнуляем кэш related объекта, чтобы parent не был подгружен заранее
         if "parent" in student.__dict__:
             del student.__dict__["parent"]
 
@@ -243,36 +193,15 @@ class TestMagicTokensModel:
         assert token.is_used is False
 
     def test_both_composite_indexes_exist(self) -> None:
-        """
-        CWE-400: два индекса под два непересекающихся паттерна запросов.
-        - (is_used, expires_at) — глобальная фоновая очистка БЕЗ фильтра
-          по email: email в префиксе делал бы индекс мёртвым (left-prefix
-          B-tree → Seq Scan).
-        - (email, -created_at) — request_otp/verify_otp: is_used посередине
-          ломал бы готовую сортировку для cooldown-запроса (без фильтра
-          is_used) и вызывал filesort всей истории email.
-        Имена ≤ 30 символов: Django (Index.max_name_length) роняет импорт
-        модели ValueError'ом на более длинных именах.
-        """
         indexes = {idx.name: idx.fields for idx in MagicTokens._meta.indexes}
         assert indexes.get("mt_used_expires_idx") == ["is_used", "expires_at"]
         assert indexes.get("mt_email_created_idx") == ["email", "-created_at"]
         assert all(len(name) <= 30 for name in indexes)
 
     def test_no_index_leads_with_email_before_status_columns(self) -> None:
-        """
-        Регрессия на «мёртвый индекс»: индекс очистки не должен начинаться
-        с email (очистка глобальна), а горячий индекс не должен содержать
-        is_used между email и created_at (filesort в request_otp).
-        """
         for idx in MagicTokens._meta.indexes:
             assert idx.fields != ["email", "is_used", "expires_at"]
             assert idx.fields != ["email", "is_used", "-created_at"]
-
-
-# ---------------------------------------------------------------------------
-# Service: request_otp
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.django_db
@@ -288,12 +217,8 @@ class TestRequestOtp:
         )
 
     def test_normalizes_email_before_any_db_access(self) -> None:
-        """
-        CWE-178: канонизация email — обязанность сервисного слоя, не сериализатора.
-        Вызов с «грязным» адресом (регистр, пробелы) должен записать токен
-        под канонической формой: от неё зависят lock_id advisory-блокировки
-        и последующий поиск в verify_otp.
-        """
+        # ПОЧЕМУ: канонизация email выполняется
+        # до БД для стабильного вычисления lock_id
         with patch("apps.users.services.send_otp_email_task") as mock_task:
             mock_task.kiq = AsyncMock()
             request_otp("  MiXed@Example.COM ")
@@ -326,60 +251,39 @@ class TestRequestOtp:
         assert token.code.isdigit()
 
     def test_generate_code_uses_secrets_module(self) -> None:
-        """
-        Проверяем, что _generate_code использует secrets, а не модуль random
-        (CWE-338, вихрь Мерсенна предсказуем). inspect.getsource включает
-        docstring — поэтому docstring _generate_code не должен содержать
-        слово «random», иначе тест даёт ложное срабатывание.
-        """
+        # ПОЧЕМУ: проверка использования криптографически
+        # стойкого CSPRNG (secrets) вместо random
         source = inspect.getsource(_generate_code)
         assert "secrets.choice" in source
         assert "random" not in source
 
     def test_task_is_sync_not_async(self) -> None:
-        """
-        Taskiq-задача должна быть синхронной (def, не async def).
-        Синхронный блокирующий SMTP I/O внутри async def убивает event loop воркера.
-        Taskiq запускает sync-задачи через ThreadPoolExecutor, изолируя блокировку.
-        """
+        # ПОЧЕМУ: сетевой SMTP I/O внутри async def
+        # заблокирует event loop воркера. Таск обязан быть синхронным
         from apps.users.tasks import send_otp_email_task as task_fn
 
         # Taskiq оборачивает функцию в объект Task; добираемся до оригинала.
         original = getattr(task_fn, "original_func", task_fn)
-        assert not inspect.iscoroutinefunction(original), (
-            "send_otp_email_task не должна быть async def: "
-            "синхронный SMTP I/O блокирует event loop Taskiq-воркера."
-        )
+        assert not inspect.iscoroutinefunction(original), ()
 
     def test_on_commit_fires_task(
         self, django_capture_on_commit_callbacks: CaptureOnCommitCallbacks
     ) -> None:
-        """
-        Задача ставится через transaction.on_commit. Под @pytest.mark.django_db
-        тест живёт внутри откатываемой транзакции, и on_commit-хуки сами
-        по себе НЕ выполняются — их принудительно исполняет фикстура
-        django_capture_on_commit_callbacks(execute=True). Без неё тест
-        всегда «зелёный при нуле вызовов» или всегда красный.
-        """
+        # ПОЧЕМУ: хуки on_commit выполняются только при
+        # фиксации транзакции; проверяем реальный await корутины Taskiq
         with patch("apps.users.services.send_otp_email_task") as mock_task:
             mock_task.kiq = AsyncMock()
             with django_capture_on_commit_callbacks(execute=True) as callbacks:
                 request_otp("task@example.com")
 
         assert len(callbacks) == 1
-        # assert_awaited (а не assert_called): kiq — async def. Голый вызов
-        # kiq(email, code) из sync-хука создал бы корутину и бросил её —
-        # call зафиксировался бы, await НЕТ, задача не ушла бы в брокер.
-        # Регрессия ловится только проверкой await.
+        # ПОЧЕМУ: kiq — корутина. Проверяем именно await,
+        # иначе синхронный on_commit молча ее бросит
         mock_task.kiq.assert_awaited_once()
         email_arg = mock_task.kiq.await_args.args[0]
         assert email_arg == "task@example.com"
 
     def test_raises_cooldown_within_interval(self) -> None:
-        """
-        CWE-799: второй запрос в пределах cooldown-интервала должен падать
-        с OTPCooldownError. Первый — создаёт токен, второй — блокируется.
-        """
         with patch("apps.users.services.send_otp_email_task") as mock_task:
             mock_task.kiq = AsyncMock()
             request_otp("cooldown@example.com")
@@ -388,11 +292,8 @@ class TestRequestOtp:
             request_otp("cooldown@example.com")
 
     def test_cooldown_error_carries_actual_remaining_seconds(self) -> None:
-        """
-        Контракт «бэкенд авторитетен по времени»: Retry-After должен отражать
-        фактический остаток cooldown, а не константу. Токен создан 45 с назад
-        → остаток ≈ 15 с, не 60.
-        """
+        # ПОЧЕМУ: бэкенд авторитетен по времени,
+        # отдаем клиенту фактический остаток cooldown, а не константу
         with patch("apps.users.services.send_otp_email_task") as mock_task:
             mock_task.kiq = AsyncMock()
             request_otp("remain@example.com")
@@ -405,11 +306,6 @@ class TestRequestOtp:
         assert 1 <= exc_info.value.retry_after <= OTP_COOLDOWN_SECONDS - 44
 
     def test_allows_request_after_cooldown_expired(self) -> None:
-        """
-        После истечения cooldown-интервала повторный запрос должен проходить.
-        created_at сдвигается queryset.update()'ом: auto_now_add игнорирует
-        значение из фабрики (см. _backdate_token).
-        """
         old_token = MagicTokensFactory(email="aftercooldown@example.com")
         _backdate_token(
             "aftercooldown@example.com", seconds_ago=OTP_COOLDOWN_SECONDS + 1
@@ -423,27 +319,15 @@ class TestRequestOtp:
         assert old_token.is_used is True
 
 
-# ---------------------------------------------------------------------------
-# Advisory Lock unit tests
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.django_db(transaction=True)
 class TestAcquireEmailLock:
     def test_lock_acquired_returns_true(self) -> None:
-        """
-        Первый вызов _acquire_email_lock внутри транзакции возвращает True.
-        """
         with transaction.atomic():
             assert _acquire_email_lock("lock_true@example.com") is True
 
     def test_same_email_same_transaction_lock_is_reentrant(self) -> None:
-        """
-        pg_try_advisory_xact_lock идемпотентен в рамках одной транзакции:
-        PostgreSQL не блокирует саму себя — повторный вызов с тем же ключом
-        всё равно вернёт True. Это штатное поведение PostgreSQL (lock re-entrancy).
-        Тест документирует эту семантику явно.
-        """
+        # ПОЧЕМУ: фиксируем штатное поведение PostgreSQL (lock re-entrancy)
+        # внутри одной транзакции блокировка саму себя не ждет
         with transaction.atomic():
             first = _acquire_email_lock("reentrant@example.com")
             second = _acquire_email_lock("reentrant@example.com")
@@ -453,10 +337,6 @@ class TestAcquireEmailLock:
         assert second is True
 
     def test_different_emails_produce_different_lock_ids(self) -> None:
-        """
-        Два разных email должны давать разные lock_id (коллизии возможны,
-        но в рамках тестового набора — исключены).
-        """
         import hashlib as _hashlib
 
         def lock_id(email: str) -> int:
@@ -465,19 +345,8 @@ class TestAcquireEmailLock:
         assert lock_id("a@example.com") != lock_id("b@example.com")
 
     def test_parallel_request_blocked_by_advisory_lock(self) -> None:
-        """
-        Ключевой тест First-Strike DoS (CWE-362 + CWE-799):
-        симулируем параллельный запрос, подменяя _acquire_email_lock на False
-        для второго вызова. Первый поток получил lock, второй — отбивается
-        OTPCooldownError немедленно, не доходя до cooldown-проверки по БД.
-
-        Почему мок, а не настоящий параллелизм:
-        - Настоящая конкурентность в pytest-django с transaction=True требует
-          многопоточности + синхронизации барьерами. Это сложно, хрупко и медленно.
-        - Мок _acquire_email_lock на False точно воспроизводит контракт:
-          «если lock занят — raise OTPCooldownError». Логика выше lock
-          (cooldown-проверка, create) не должна выполняться вообще.
-        """
+        # ПОЧЕМУ: симулируем занятость advisory lock.
+        # Поток B должен упасть в OTPCooldownError без обращения к СУБД
         call_count = 0
 
         def mock_lock(email: str) -> bool:
@@ -507,11 +376,6 @@ class TestAcquireEmailLock:
         )
 
 
-# ---------------------------------------------------------------------------
-# Service: verify_otp
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.django_db
 class TestVerifyOtp:
     def test_returns_token_pair_on_success(self) -> None:
@@ -527,11 +391,8 @@ class TestVerifyOtp:
         assert token.is_used is True
 
     def test_normalizes_email_before_lookup(self) -> None:
-        """
-        CWE-178, зеркало request_otp: verify_otp обязан искать токен по той же
-        канонической форме email, под которой request_otp его записал —
-        даже если вызывающий код передал «грязный» адрес в обход сериализатора.
-        """
+        # ПОЧЕМУ: проверяем поиск токена по канонической форме,
+        # даже если передан сырой email
         MagicTokensFactory(email="norm@example.com", code="444444")
 
         result = verify_otp("  NORM@Example.com ", "444444")
@@ -558,12 +419,8 @@ class TestVerifyOtp:
         assert Parent.objects.filter(email="exists@example.com").count() == 1
 
     def test_inactive_parent_receives_no_tokens(self) -> None:
-        """
-        Broken Authentication: RefreshToken.for_user у SimpleJWT игнорирует
-        is_active. Деактивированный аккаунт при верном коде НЕ должен получить
-        JWT-пару. Наружу — OTPInvalidError (zero-knowledge: неотличимо от
-        неверного кода, статус аккаунта не раскрывается).
-        """
+        # ПОЧЕМУ: забаненный юзер не должен получить JWT.
+        # Ошибка маскируется под неверный код (анти-энумерация)
         ParentFactory(email="banned@example.com", is_active=False)
         MagicTokensFactory(email="banned@example.com", code="333333")
 
@@ -597,12 +454,8 @@ class TestVerifyOtp:
         assert token.attempts_count == 1
 
     def test_attempts_count_persists_despite_exception(self) -> None:
-        """
-        Критическая проверка CWE-362: исключение выбрасывается ПОСЛЕ закрытия
-        транзакции, поэтому инкремент attempts_count зафиксирован в БД
-        и не может быть отменён выброшенным исключением.
-        3 неверных попытки подряд → счётчик == 3.
-        """
+        # ПОЧЕМУ: инкремент обязан зафиксироваться в БД
+        # до выброса исключения (выход из блока atomic)
         MagicTokensFactory(email="persist@example.com", code="123456")
 
         for _ in range(3):
@@ -613,10 +466,8 @@ class TestVerifyOtp:
         assert token.attempts_count == 3
 
     def test_compare_digest_used_for_timing_safety(self) -> None:
-        """
-        CWE-208: проверяем, что сравнение кода идёт через secrets.compare_digest,
-        а не прямым == (уязвимость к тайминг-атаке).
-        """
+        # ПОЧЕМУ: прямое сравнение строк (==) уязвимо к тайминг-атакам;
+        # проверяем использование secrets
         from apps.users import services as _svc
 
         source = inspect.getsource(_svc.verify_otp)
@@ -626,13 +477,6 @@ class TestVerifyOtp:
         assert "token.code !=" not in source
 
     def test_parent_created_atomically_with_token_burn(self) -> None:
-        """
-        create_user(Parent) и token.is_used=True выполняются в одной транзакции.
-        Проверяем, что после успешного verify_otp:
-        - токен сожжён,
-        - Parent существует и имеет unusable-пароль,
-        и оба факта верны одновременно (нет окна между ними).
-        """
         MagicTokensFactory(email="atomic@example.com", code="777777")
 
         verify_otp("atomic@example.com", "777777")
@@ -643,10 +487,6 @@ class TestVerifyOtp:
         assert not parent.has_usable_password()
 
     def test_orphan_tokens_burned_on_successful_verify(self) -> None:
-        """
-        CWE-362: при успешной верификации все остальные неиспользованные токены
-        для этого email должны быть инвалидированы (защита от орфанных токенов).
-        """
         orphan = MagicTokensFactory(email="orphan@example.com", code="000000")
         active = MagicTokensFactory(email="orphan@example.com", code="111111")
 
@@ -672,12 +512,8 @@ class TestVerifyOtp:
             verify_otp("used@example.com", "123456")
 
     def test_equal_created_at_resolved_by_id_tiebreaker(self) -> None:
-        """
-        Недетерминированность FOR UPDATE: при идентичных created_at (ретраи
-        клиента, сбой синхронизации времени) PostgreSQL не гарантирует порядок
-        равных ключей сортировки. Тай-брейкер -id обязан детерминированно
-        выбирать ПОСЛЕДНИЙ созданный токен (максимальный id).
-        """
+        # ПОЧЕМУ: FOR UPDATE не гарантирует порядок строк
+        # при коллизиях времени; тай-брейкер по id обязателен
         older = MagicTokensFactory(email="tie@example.com", code="111111")
         newer = MagicTokensFactory(email="tie@example.com", code="222222")
         same_moment = timezone.now()
@@ -694,53 +530,41 @@ class TestVerifyOtp:
         assert newer.is_used is True
 
 
-# ---------------------------------------------------------------------------
-# Throttling (CWE-400: глобальный флуд уникальными email / спрей кодов)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.django_db
 class TestOTPThrottling:
     def test_request_per_ip_limit_blocks_unique_email_flood(
         self, api_client: APIClient
     ) -> None:
-        """
-        Ключевой сценарий атаки: уникальный email на каждый запрос обходит
-        и advisory lock, и cooldown. Per-IP троттл (5/hour) обязан отбить
-        шестой запрос ДО сервисного слоя — сервис не должен быть вызван.
-        """
+        # ПОЧЕМУ: троттл по IP обязан отсечь атаку
+        # до вызова сервисного слоя и создания MagicToken
         with patch("apps.users.views.request_otp") as mock_service:
             for i in range(5):
                 resp = api_client.post(
-                    "/api/v1/auth/otp/request",
+                    "/api/v1/auth/otp/request/",
                     {"email": f"unique{i}@example.com"},
                     content_type="application/json",
                 )
                 assert resp.status_code == 202
 
             resp = api_client.post(
-                "/api/v1/auth/otp/request",
+                "/api/v1/auth/otp/request/",
                 {"email": "unique5@example.com"},
                 content_type="application/json",
             )
 
         assert resp.status_code == 429
         assert "Retry-After" in resp
-        # Барьер стоит ПЕРЕД сервисом: шестой запрос до request_otp не дошёл.
+        # Барьер стоит ПЕРЕД сервисом: шестой запрос до request_otp не дошёл
         assert mock_service.call_count == 5
 
     def test_request_per_email_limit_survives_ip_rotation(
         self, api_client: APIClient
     ) -> None:
-        """
-        Второе измерение: бот с пулом адресов (уникальный IP на запрос) не
-        должен пробить лимит 5/hour на один email. Ключ троттла —
-        нормализованный email, поэтому смена регистра тоже не помогает.
-        """
+        # ПОЧЕМУ: лимит по email отсекает ботов, ротирующих IP-адреса
         with patch("apps.users.views.request_otp"):
             for i in range(5):
                 resp = api_client.post(
-                    "/api/v1/auth/otp/request",
+                    "/api/v1/auth/otp/request/",
                     {"email": "victim@example.com"},
                     content_type="application/json",
                     REMOTE_ADDR=f"10.0.0.{i + 1}",
@@ -748,7 +572,7 @@ class TestOTPThrottling:
                 assert resp.status_code == 202
 
             resp = api_client.post(
-                "/api/v1/auth/otp/request",
+                "/api/v1/auth/otp/request/",
                 {"email": "VICTIM@example.com"},
                 content_type="application/json",
                 REMOTE_ADDR="10.0.0.100",
@@ -757,23 +581,20 @@ class TestOTPThrottling:
         assert resp.status_code == 429
 
     def test_verify_per_ip_limit_blocks_code_spray(self, api_client: APIClient) -> None:
-        """
-        attempts_count ограничивает перебор одного кода; спрей по РАЗНЫМ
-        ящикам с одного IP отсекает per-IP троттл на verify (10/min).
-        """
+        # ПОЧЕМУ: отсекаем спрей-атаку (перебор кодов по разным ящикам с одного IP)
         with patch(
             "apps.users.views.verify_otp", side_effect=OTPNotFoundError
         ) as mock_service:
             for i in range(10):
                 resp = api_client.post(
-                    "/api/v1/auth/otp/verify",
+                    "/api/v1/auth/otp/verify/",
                     {"email": f"spray{i}@example.com", "code": "000000"},
                     content_type="application/json",
                 )
                 assert resp.status_code == 401
 
             resp = api_client.post(
-                "/api/v1/auth/otp/verify",
+                "/api/v1/auth/otp/verify/",
                 {"email": "spray10@example.com", "code": "000000"},
                 content_type="application/json",
             )
@@ -782,17 +603,9 @@ class TestOTPThrottling:
         assert mock_service.call_count == 10
 
 
-# ---------------------------------------------------------------------------
-# Service: purge_stale_otp_tokens
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.django_db
 class TestPurgeStaleOtpTokens:
     def test_deletes_expired_unused_immediately(self) -> None:
-        """
-        Фаза 1: протухший невведённый код удаляется сразу, живой — остаётся.
-        """
         MagicTokensFactory(
             email="dead@example.com",
             expires_at=timezone.now() - timedelta(minutes=1),
@@ -809,11 +622,6 @@ class TestPurgeStaleOtpTokens:
         assert MagicTokens.objects.filter(pk=alive.pk).exists()
 
     def test_used_tokens_respect_retention_window(self) -> None:
-        """
-        Фаза 2: использованный токен живёт OTP_USED_RETENTION_DAYS
-        (окно разбора инцидентов), затем удаляется. Свежий использованный
-        и протухший-но-в-окне — не трогаются.
-        """
         ancient = MagicTokensFactory(
             email="ancient@example.com",
             is_used=True,
@@ -837,12 +645,7 @@ class TestPurgeStaleOtpTokens:
         assert result == {"expired_unused": 0, "retired_used": 0}
 
     def test_purge_predicates_are_index_aligned(self) -> None:
-        """
-        Регрессия на left-prefix: обе фазы обязаны фильтровать по is_used
-        (равенство) — это префикс индекса mt_used_expires_idx. Предикат
-        «expires_at < X» без is_used не смог бы использовать индекс вовсе.
-        Белый ящик: проверяем исходник сервиса.
-        """
+        # ПОЧЕМУ: фильтр без is_used игнорировал бы индекс (нарушение left-prefix B-Tree)
         from apps.users import services as _svc
 
         source = inspect.getsource(_svc.purge_stale_otp_tokens)
@@ -850,17 +653,12 @@ class TestPurgeStaleOtpTokens:
         assert source.count("is_used=True") >= 1
 
 
-# ---------------------------------------------------------------------------
-# View tests
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.django_db
 class TestOTPRequestView:
     def test_returns_202(self, api_client: APIClient) -> None:
         with patch("apps.users.views.request_otp") as mock_service:
             resp = api_client.post(
-                "/api/v1/auth/otp/request",
+                "/api/v1/auth/otp/request/",
                 {"email": "view@example.com"},
                 content_type="application/json",
             )
@@ -871,33 +669,27 @@ class TestOTPRequestView:
     def test_returns_429_with_retry_after_on_cooldown(
         self, api_client: APIClient
     ) -> None:
-        """
-        CWE-799: cooldown должен возвращать 429 с заголовком Retry-After
-        (api-core-contracts.md §0.2). Исключение без явного retry_after
-        несёт дефолт — полный интервал.
-        """
         with patch("apps.users.views.request_otp", side_effect=OTPCooldownError):
             resp = api_client.post(
-                "/api/v1/auth/otp/request",
+                "/api/v1/auth/otp/request/",
                 {"email": "cd@example.com"},
                 content_type="application/json",
             )
         assert resp.status_code == 429
         assert resp["Retry-After"] == str(OTP_COOLDOWN_SECONDS)
-        assert resp.json()["code"] == "RATE_LIMITED"
+
+        data = resp.json()
+        assert "type" in data
+        assert "extensions" in data
+        assert "request_id" in data["extensions"]
 
     def test_retry_after_reflects_exception_payload(
         self, api_client: APIClient
     ) -> None:
-        """
-        Retry-After обязан транслировать фактический остаток cooldown
-        из OTPCooldownError.retry_after, а не константу: бэкенд авторитетен
-        по времени, фронт рисует таймер по заголовку.
-        """
         exc = OTPCooldownError("осталось 17 с", retry_after=17)
         with patch("apps.users.views.request_otp", side_effect=exc):
             resp = api_client.post(
-                "/api/v1/auth/otp/request",
+                "/api/v1/auth/otp/request/",
                 {"email": "cd17@example.com"},
                 content_type="application/json",
             )
@@ -905,14 +697,22 @@ class TestOTPRequestView:
         assert resp["Retry-After"] == "17"
 
     def test_returns_400_on_invalid_email(self, api_client: APIClient) -> None:
-        # DRF serializer.is_valid(raise_exception=True) → ValidationError → 400.
-        # Схема @extend_schema синхронизирована: задокументирован 400, а не 422.
         resp = api_client.post(
-            "/api/v1/auth/otp/request",
+            "/api/v1/auth/otp/request/",
             {"email": "not-an-email"},
             content_type="application/json",
         )
         assert resp.status_code == 400
+
+        # Проверка контракта RFC 7807
+        data = resp.json()
+        assert data["type"] == "urn:problem-type:validationerror"
+        assert data["title"] == "Validation Error"
+
+        # Проверяем, что парсер извлек деталь ошибки конкретного поля
+        params = data["extensions"]["invalid_params"]
+        assert len(params) == 1
+        assert params[0]["name"] == "email"
 
 
 @pytest.mark.django_db
@@ -922,7 +722,7 @@ class TestOTPVerifyView:
 
         with patch("apps.users.views.verify_otp", return_value=fake_tokens):
             resp = api_client.post(
-                "/api/v1/auth/otp/verify",
+                "/api/v1/auth/otp/verify/",
                 {"email": "v@example.com", "code": "123456"},
                 content_type="application/json",
             )
@@ -933,7 +733,7 @@ class TestOTPVerifyView:
     def test_returns_401_on_invalid_code(self, api_client: APIClient) -> None:
         with patch("apps.users.views.verify_otp", side_effect=OTPInvalidError):
             resp = api_client.post(
-                "/api/v1/auth/otp/verify",
+                "/api/v1/auth/otp/verify/",
                 {"email": "v@example.com", "code": "000000"},
                 content_type="application/json",
             )
@@ -943,22 +743,16 @@ class TestOTPVerifyView:
     def test_expired_token_returns_same_response_as_wrong_code(
         self, api_client: APIClient
     ) -> None:
-        """
-        CWE-204: OTPExpiredError должен давать тот же HTTP-ответ, что и OTPInvalidError.
-        Разные ответы позволяют атакующему определить, что жертва запрашивала
-        код в последние 5 минут (утечка поведенческих метаданных).
-        Забаненный аккаунт сервис маскирует под OTPInvalidError — он покрыт
-        этим же контрактом автоматически.
-        """
+        # ПОЧЕМУ: одинаковый ответ маскирует статус аккаунта и время запроса кода
         with patch("apps.users.views.verify_otp", side_effect=OTPExpiredError):
             resp_expired = api_client.post(
-                "/api/v1/auth/otp/verify",
+                "/api/v1/auth/otp/verify/",
                 {"email": "v@example.com", "code": "000000"},
                 content_type="application/json",
             )
         with patch("apps.users.views.verify_otp", side_effect=OTPInvalidError):
             resp_invalid = api_client.post(
-                "/api/v1/auth/otp/verify",
+                "/api/v1/auth/otp/verify/",
                 {"email": "v@example.com", "code": "000000"},
                 content_type="application/json",
             )
@@ -969,7 +763,7 @@ class TestOTPVerifyView:
     def test_returns_429_on_brute_force(self, api_client: APIClient) -> None:
         with patch("apps.users.views.verify_otp", side_effect=OTPBruteForceError):
             resp = api_client.post(
-                "/api/v1/auth/otp/verify",
+                "/api/v1/auth/otp/verify/",
                 {"email": "v@example.com", "code": "000000"},
                 content_type="application/json",
             )
@@ -977,10 +771,15 @@ class TestOTPVerifyView:
         assert resp.json()["code"] == "RATE_LIMITED"
 
     def test_returns_400_on_non_digit_code(self, api_client: APIClient) -> None:
-        # DRF serializer.is_valid(raise_exception=True) → ValidationError → 400.
         resp = api_client.post(
-            "/api/v1/auth/otp/verify",
+            "/api/v1/auth/otp/verify/",
             {"email": "v@example.com", "code": "abcdef"},
             content_type="application/json",
         )
         assert resp.status_code == 400
+
+        data = resp.json()
+        assert data["type"] == "urn:problem-type:validationerror"
+
+        params = data["extensions"]["invalid_params"]
+        assert any(p["name"] == "code" for p in params)

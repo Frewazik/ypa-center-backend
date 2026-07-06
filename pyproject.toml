@@ -2,6 +2,10 @@
 name = "ypa-center-backend"
 version = "0.1.0"
 requires-python = ">=3.12"
+dependencies = [
+    "dj-database-url>=3.1.2",
+    "whitenoise>=6.12.0",
+]
 
 [tool.mypy]
 python_version = "3.12"

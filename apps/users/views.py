@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from drf_spectacular.utils import OpenApiResponse, extend_schema
-from rest_framework import status
+from rest_framework import exceptions, status
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -26,18 +26,6 @@ from apps.users.services import (
 
 
 class OTPRequestView(APIView):
-    """
-    POST /api/v1/auth/otp/request
-
-    Принимает email и инициирует отправку OTP-кода.
-    Всегда возвращает 202 — анти-энумерация (нельзя понять, есть ли email в БД).
-    429 с Retry-After при cooldown (api-core-contracts.md §0.2).
-
-    Троттлинг стоит ЗДЕСЬ, перед сервисным слоем: cooldown в сервисе защищает
-    один email, а глобальный флуд уникальными адресами (CWE-400, спам через
-    брокер) отсекается до любых обращений к БД и Taskiq — см. throttling.py.
-    """
-
     permission_classes = [AllowAny]
     throttle_classes = [OTPRequestPerIPThrottle, OTPRequestPerEmailThrottle]
 
@@ -45,9 +33,6 @@ class OTPRequestView(APIView):
         request=OTPRequestSerializer,
         responses={
             202: OpenApiResponse(description="Код отправлен на email"),
-            # DRF serializer.is_valid(raise_exception=True) выбрасывает ValidationError,
-            # который стандартный exception handler DRF преобразует в 400, а не 422.
-            # Документация обязана отражать реальное поведение фреймворка.
             400: OpenApiResponse(description="Ошибка валидации формата email"),
             429: OpenApiResponse(description="Cooldown: повторный запрос слишком рано"),
         },
@@ -63,21 +48,12 @@ class OTPRequestView(APIView):
         try:
             request_otp(email)
         except OTPCooldownError as exc:
-            # Retry-After — фактический остаток cooldown из исключения,
-            # а не константа: бэкенд авторитетен по времени
-            # (api-core-contracts.md §1, «Cooldown-таймер клиенту»).
-            response = Response(
-                {
-                    "code": "RATE_LIMITED",
-                    "detail": (
-                        f"Повторный запрос кода будет доступен "
-                        f"через {exc.retry_after} с."
-                    ),
-                },
-                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            # ПОЧЕМУ: Мы бросаем (raise) встроенное исключение DRF
+            # Вьюха падает. DRF ловит падение и передает его в твой problem_detail_exception_handler
+            # Обработчик сам собирает RFC 9457 JSON и сам проставляет HTTP-заголовки
+            raise exceptions.Throttled(
+                wait=exc.retry_after, detail="Повторный запрос возможен позже."
             )
-            response["Retry-After"] = str(exc.retry_after)
-            return response
 
         return Response(
             {
@@ -90,14 +66,8 @@ class OTPRequestView(APIView):
 
 
 class OTPVerifyView(APIView):
-    """
-    POST /api/v1/auth/otp/verify
-
-    Проверяет OTP-код и при успехе возвращает пару JWT-токенов.
-
-    Per-IP троттлинг: attempts_count ограничивает перебор ОДНОГО кода,
-    спрей по множеству ящиков с одного IP отсекается здесь (throttling.py).
-    """
+    # ПОЧЕМУ: ловим разные ошибки сервиса и бросаем один 401 AuthenticationFailed,
+    # чтобы закрыть вектор энумерации email
 
     permission_classes = [AllowAny]
     throttle_classes = [OTPVerifyPerIPThrottle]
@@ -131,12 +101,8 @@ class OTPVerifyView(APIView):
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
         except (OTPNotFoundError, OTPInvalidError, OTPExpiredError):
-            # CWE-204: все три исключения дают одинаковый ответ.
-            # Разделение OTPExpiredError в отдельный блок сливало метаданные:
-            # атакующий мог узнать, что жертва запрашивала код 5 минут назад.
-            # Сюда же попадает деактивированный аккаунт (сервис маскирует его
-            # под OTPInvalidError) — статус аккаунта не раскрывается.
-            # Zero-knowledge принцип: клиент получает только факт неуспеха.
+            # ПОЧЕМУ: ловим разные ошибки сервиса и бросаем один 401 AuthenticationFailed,
+            # чтобы закрыть вектор энумерации email
             return Response(
                 {"code": "OTP_INVALID", "detail": "Неверный или истёкший код."},
                 status=status.HTTP_401_UNAUTHORIZED,

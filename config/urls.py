@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.urls import path
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
-from apps.users import views
+from apps.users.views import OTPRequestView, OTPVerifyView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -14,6 +14,6 @@ urlpatterns = [
         name="swagger-ui",
     ),
     # Эндпоинты (Домен Users)
-    path("api/v1/auth/otp/request", views.OTPRequestView.as_view(), name="otp_request"),
-    path("api/v1/auth/otp/verify", views.OTPVerifyView.as_view(), name="otp_verify"),
+    path("api/v1/auth/otp/request/", OTPRequestView.as_view(), name="otp_request"),
+    path("api/v1/auth/otp/verify/", OTPVerifyView.as_view(), name="otp_verify"),
 ]

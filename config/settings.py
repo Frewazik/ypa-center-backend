@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from urllib.parse import urlparse
+import dj_database_url
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,31 +16,26 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── Django core ───────────────────────────────────────────────────────────
-    SECRET_KEY: str = Field(default="temporary-secret-key-for-local-dev-only-12345")
+    SECRET_KEY: str
     DEBUG: bool = True
     ALLOWED_HOSTS: list[str] = Field(
         default=["localhost", "127.0.0.1", "127.0.0.1:8000"]
     )
     ENVIRONMENT: Literal["local", "staging", "production"] = "local"
 
-    # ── Database & Redis ──────────────────────────────────────────────────────
     DATABASE_URL: str = Field(
         default="postgresql://postgres:postgres@localhost:5432/yra"
     )
     REDIS_URL: str = Field(default="redis://localhost:6379/0")
 
-    # ── S3 / Media ────────────────────────────────────────────────────────────
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_STORAGE_BUCKET_NAME: str = ""
     AWS_S3_ENDPOINT_URL: str = ""
     AWS_S3_REGION_NAME: str = "us-east-1"
 
-    # ── CORS ─────────────────────────────────────────────────────────────────
     CORS_ALLOWED_ORIGINS: list[str] = Field(default=["http://localhost:3000"])
 
-    # ── Email ─────────────────────────────────────────────────────────────────
     EMAIL_HOST: str = "localhost"
     EMAIL_PORT: int = 25
     EMAIL_HOST_USER: str = ""
@@ -63,7 +58,6 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    # Third-party
     "rest_framework",
     "rest_framework_simplejwt",
     "corsheaders",
@@ -71,7 +65,6 @@ INSTALLED_APPS = [
     "simple_history",
     "storages",
     "drf_spectacular",
-    # Local apps (DDD Domains)
     "apps.core",
     "apps.users",
     "apps.schedule",
@@ -82,6 +75,8 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
+    "apps.core.middleware.RequestIDMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -111,19 +106,13 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "config.wsgi.application"
 
-# Безопасное приведение типов Pydantic v2 к словарю DATABASES в Django
-_db_url = urlparse(_env.DATABASE_URL)
-
 DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": _db_url.path.lstrip("/") if _db_url.path else "yra",
-        "USER": _db_url.username or "postgres",
-        "PASSWORD": _db_url.password or "postgres",
-        "HOST": _db_url.hostname or "localhost",
-        "PORT": str(_db_url.port or 5432),
-        "OPTIONS": {"sslmode": "disable" if _env.ENVIRONMENT == "local" else "require"},
-    }
+    "default": dj_database_url.parse(
+        _env.DATABASE_URL,
+        conn_max_age=600,  # ПОЧЕМУ: conn_max_age держит коннекты; при масштабировании подов упремся в лимит БД
+        conn_health_checks=True,
+        ssl_require=_env.ENVIRONMENT != "local",
+    )
 }
 
 CACHES = {
@@ -154,11 +143,12 @@ REST_FRAMEWORK = {
         "rest_framework.throttling.AnonRateThrottle",
         "rest_framework.throttling.UserRateThrottle",
     ],
+    # TODO: лимиты задушат SPA; переписать на ScopedThrottles после тестов
     "DEFAULT_THROTTLE_RATES": {
         "anon": "100/hour",
         "user": "1000/hour",
     },
-    # "EXCEPTION_HANDLER": "apps.core.exceptions.problem_detail_exception_handler",
+    "EXCEPTION_HANDLER": "apps.core.exceptions.problem_detail_exception_handler",
 }
 
 SPECTACULAR_SETTINGS = {
@@ -194,7 +184,7 @@ CORS_ALLOWED_ORIGINS = _env.CORS_ALLOWED_ORIGINS
 CORS_ALLOW_CREDENTIALS = True
 
 LANGUAGE_CODE = "ru-ru"
-TIME_ZONE = "Asia/Yekaterinburg"
+TIME_ZONE = "Asia/Novosibirsk"
 USE_I18N = True
 USE_TZ = True
 
