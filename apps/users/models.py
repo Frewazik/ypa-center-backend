@@ -6,6 +6,7 @@ from django.contrib.auth.models import (
     PermissionsMixin,
 )
 from django.db import models
+from django.conf import settings
 from phonenumber_field.modelfields import PhoneNumberField
 
 from typing import ClassVar
@@ -158,3 +159,15 @@ class MagicTokens(models.Model):
 
     def __str__(self) -> str:
         return f"OTP для {self.email} (использован: {self.is_used})"
+
+
+class TeacherProfile(models.Model):
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="teacher_profile",
+    )
+    middle_name = models.CharField("Отчество", max_length=100, blank=True)
+
+    class Meta:
+        db_table = "teacher_profile"

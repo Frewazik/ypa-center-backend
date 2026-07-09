@@ -58,6 +58,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "django.contrib.postgres",
     "rest_framework",
     "rest_framework_simplejwt",
     "corsheaders",
@@ -67,7 +68,8 @@ INSTALLED_APPS = [
     "drf_spectacular",
     "apps.core",
     "apps.users",
-    "apps.schedule",
+    "apps.catalog.apps.CatalogConfig",
+    "apps.schedule.apps.ScheduleConfig",
     "apps.billing",
     "apps.public_forms",
 ]

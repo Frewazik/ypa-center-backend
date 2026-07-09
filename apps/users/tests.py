@@ -696,13 +696,15 @@ class TestOTPRequestView:
         assert resp.status_code == 429
         assert resp["Retry-After"] == "17"
 
-    def test_returns_400_on_invalid_email(self, api_client: APIClient) -> None:
+    def test_returns_422_on_invalid_email(self, api_client: APIClient) -> None:
         resp = api_client.post(
             "/api/v1/auth/otp/request/",
             {"email": "not-an-email"},
             content_type="application/json",
         )
-        assert resp.status_code == 400
+        # ПОЧЕМУ: Ошибка валидации формата почты сериализатором
+        # мапится обработчиком RFC 9457 в 422 статус
+        assert resp.status_code == 422
 
         # Проверка контракта RFC 7807
         data = resp.json()
@@ -770,13 +772,13 @@ class TestOTPVerifyView:
         assert resp.status_code == 429
         assert resp.json()["code"] == "RATE_LIMITED"
 
-    def test_returns_400_on_non_digit_code(self, api_client: APIClient) -> None:
+    def test_returns_422_on_non_digit_code(self, api_client: APIClient) -> None:
         resp = api_client.post(
             "/api/v1/auth/otp/verify/",
             {"email": "v@example.com", "code": "abcdef"},
             content_type="application/json",
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 422
 
         data = resp.json()
         assert data["type"] == "urn:problem-type:validationerror"

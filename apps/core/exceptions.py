@@ -50,6 +50,10 @@ def problem_detail_exception_handler(
 ) -> Response | None:
     response = exception_handler(exc, context)
 
+    # ПОЧЕМУ: Спецификация контракта требует отдавать 422 UNPROCESSABLE_ENTITY на ошибки валидации данных вместо дефолтного 400
+    if response is not None and isinstance(exc, ValidationError):
+        response.status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+
     request = context.get("request")
     request_id = request.META.get("HTTP_X_REQUEST_ID") if request else None
 
