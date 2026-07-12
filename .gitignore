@@ -25,7 +25,6 @@ var/
 # uv / venv
 .venv/
 .uv/
-uv.lock
 
 # Django
 *.log

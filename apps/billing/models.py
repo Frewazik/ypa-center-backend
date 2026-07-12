@@ -18,9 +18,8 @@ class TransactionStatus(models.TextChoices):
     PENDING = "PENDING", "Ожидает оплаты"
     SUCCEEDED = "SUCCEEDED", "Оплачен"
     CANCELED = "CANCELED", "Отменён"
-    # ПОЧЕМУ: Терминальный статус рассинхрона (сумма/валюта не сошлись).
-    # Не смешивать с CANCELED. FAILED требует ручного разбора/возврата.
-    # Причину писать в metadata.
+    # ПОЧЕМУ: для фатальных ошибок сверки (сумма/валюта); причина уходит в metadata,
+    # чтобы не смешивать с пользовательским CANCELED
     FAILED = "FAILED", "Ошибка сверки"
 
 
@@ -34,8 +33,8 @@ class SubscriptionPlan(models.Model):
     name = models.CharField("Название", max_length=255)
     slots_count = models.PositiveSmallIntegerField("Число слотов")
     price = models.IntegerField("Цена, в копейках")
-    # ПОЧЕМУ: Базовая цена разового занятия для формулы депозита
-    # «оплачено − посещено × базовая цена». Делить price на слоты нельзя.
+    # ПОЧЕМУ: деление price на slots_count дает плавающую копейку;
+    # нужна строгая база для возврата на депозит
     base_session_price = models.IntegerField("Базовая цена занятия, в копейках")
 
     class Meta:
@@ -66,16 +65,13 @@ class Subscription(models.Model):
         default=SubscriptionStatus.DRAFT,
         db_index=True,
     )
-    # ПОЧЕМУ: Снапшоты цен на момент покупки. При изменении прайса в
-    # SubscriptionPlan мы не должны дарить/списывать разницу клиенту
-    # при расчете несгораемого остатка.
+    # ПОЧЕМУ: защита от изменения прайса в будущем; расчет возврата идет по зафиксированным ценам
     purchase_price = models.IntegerField("Цена покупки, в копейках")
     base_session_price = models.IntegerField(
         "Базовая цена занятия на момент покупки, в копейках"
     )
     created_at = models.DateTimeField("Создан", auto_now_add=True)
-    # TODO: Заполнять при активации через SchedulePort.
-    # Месяц отсчитывается от ПЕРВОГО занятия, а не от даты оплаты.
+    # TODO: заполнять при активации через SchedulePort — месяц от первого занятия, не от оплаты.
     start_date = models.DateField("Дата первого занятия", null=True, blank=True)
     expires_at = models.DateTimeField("Истекает", null=True, blank=True)
 
@@ -99,8 +95,7 @@ class SubscriptionSlot(models.Model):
         verbose_name="Абонемент",
     )
     slot_id = models.IntegerField("ID слота расписания (домен schedule)", db_index=True)
-    # ПОЧЕМУ: Снапшот выданных фишек. Дефолтное правило может меняться,
-    # а формула остатка должна считать по факту продажи.
+    # ПОЧЕМУ: правила выдачи меняются, фиксируем фактическое количество на момент продажи
     granted_tokens = models.PositiveSmallIntegerField("Выдано фишек", default=4)
     remaining_tokens = models.PositiveSmallIntegerField("Остаток фишек", default=4)
 
@@ -167,8 +162,7 @@ class Transaction(models.Model):
         default=dict,
         blank=True,
     )
-    # ПОЧЕМУ: Очередь возвратов строится на физической колонке.
-    # Поиск по JSONB на миллионах строк даст Seq Scan.
+    # ПОЧЕМУ: вынесено из metadata в отдельную колонку, поиск должников по JSONB даст Seq Scan
     requires_compensation = models.BooleanField("Требуется возврат", default=False)
     created_at = models.DateTimeField("Создана", auto_now_add=True)
 
@@ -176,8 +170,8 @@ class Transaction(models.Model):
         verbose_name = "Транзакция"
         verbose_name_plural = "Транзакции"
         indexes = [
-            # ПОЧЕМУ: Частичный индекс. Содержит только должников для очереди возвратов.
-            # Обычный индекс по булеану планировщик PostgreSQL проигнорирует.
+            # ПОЧЕМУ: B-Tree индекс по boolean неэффективен;
+            # partial-индекс отсекает только реальных должников
             models.Index(
                 fields=["created_at"],
                 condition=Q(requires_compensation=True),
@@ -194,7 +188,9 @@ class Transaction(models.Model):
 
 
 class EnrollmentStatus(models.TextChoices):
-    # FSM записи: HELD (бронь до оплаты) -> ENROLLED (записан) -> CANCELED.
+    # ПОЧЕМУ: HELD удерживает место в группе строго на время жизни
+    # неоплаченной транзакции (15 минут),
+    # защищая от овербукинга до ответа платежного шлюза
     HELD = "HELD", "Бронь до оплаты"
     ENROLLED = "ENROLLED", "Записан"
     CANCELED = "CANCELED", "Отменена"
@@ -232,8 +228,8 @@ class Enrollment(models.Model):
         verbose_name = "Запись в группу"
         verbose_name_plural = "Записи в группы"
         constraints = [
-            # ПОЧЕМУ: partial-индекс (без CANCELED), чтобы разрешить перекупку после отмены.
-            # Вместе с advisory-lock страхует от двойного клика с разными Idempotency-Key.
+            # ПОЧЕМУ: partial-индекс исключает CANCELED, позволяя купить слот повторно
+            # Ловит гонки на уровне БД
             models.UniqueConstraint(
                 fields=["student", "schedule"],
                 condition=Q(
@@ -287,15 +283,15 @@ class Attendance(models.Model):
 
 class IdempotencyRecord(models.Model):
     key = models.CharField("Idempotency-Key", max_length=36, primary_key=True)
-    # ПОЧЕМУ: fingerprint ловит попытку прокинуть старый ключ на новый payload (409 конфликт).
+    # ПОЧЕМУ: защита от подмены тела запроса при том же Idempotency-Key (возвращает 409)
     request_fingerprint = models.CharField("Отпечаток запроса (sha256)", max_length=64)
     response_status = models.PositiveSmallIntegerField("HTTP-статус ответа")
     response_body = models.JSONField("Тело ответа")
     locked_until = models.DateTimeField(
         "Резервация действительна до", null=True, blank=True
     )
-    # ПОЧЕМУ: fencing token. Если процесс словил OOM/GC-паузу, лок протухает и его забирает другой воркер.
-    # Без токена "воскресший" процесс продолжит мутации и мы получим двойное списание.
+    # ПОЧЕМУ: fencing-токен отсекает зависший процесс, если после таймаута блокировку
+    # перехватил другой воркер
     lock_token = models.UUIDField("Токен владельца резервации", null=True, blank=True)
     created_at = models.DateTimeField("Создана", auto_now_add=True, db_index=True)
 
@@ -341,8 +337,8 @@ class ParentDeposit(models.Model):
 
 
 class DepositEntry(models.Model):
-    # ВАЖНО: Любая мутация ParentDeposit.balance должна идти в транзакции с
-    # SELECT ... FOR UPDATE и инсертом в DepositEntry. Кошелек без журнала не аудируется.
+    # !!! мутация ParentDeposit.balance допускается строго под SELECT FOR UPDATE
+    # с одновременным INSERT сюда (аудит)
     deposit = models.ForeignKey(
         ParentDeposit,
         on_delete=models.PROTECT,
@@ -377,8 +373,8 @@ class DepositEntry(models.Model):
         verbose_name = "Движение депозита"
         verbose_name_plural = "Движения депозита"
         constraints = [
-            # ПОЧЕМУ: Защита от race condition/ретраев крона.
-            # Одно основание — одна запись на источник.
+            # ПОЧЕМУ: гарантирует идемпотентность начислений
+            # (защита от двойного списания/возврата при ретраях Taskiq)
             models.UniqueConstraint(
                 fields=["subscription", "reason"],
                 condition=Q(subscription__isnull=False),
