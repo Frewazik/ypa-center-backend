@@ -17,4 +17,5 @@ urlpatterns = [
     path("api/v1/auth/otp/request/", OTPRequestView.as_view(), name="otp_request"),
     path("api/v1/auth/otp/verify/", OTPVerifyView.as_view(), name="otp_verify"),
     path("api/v1/public/", include("apps.schedule.urls")),
+    path("api/v1/public/", include("apps.public_forms.urls", namespace="public_forms")),
 ]

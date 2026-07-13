@@ -52,6 +52,9 @@ DEBUG = _env.DEBUG
 ALLOWED_HOSTS = _env.ALLOWED_HOSTS
 
 INSTALLED_APPS = [
+    "unfold",
+    "unfold.contrib.filters",
+    "unfold.contrib.forms",
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -204,3 +207,15 @@ EMAIL_HOST_USER = _env.EMAIL_HOST_USER
 EMAIL_HOST_PASSWORD = _env.EMAIL_HOST_PASSWORD
 EMAIL_USE_TLS = _env.EMAIL_USE_TLS
 AUTH_USER_MODEL = "users.Parent"
+
+CAPTCHA_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+CAPTCHA_SECRET_KEY = "dummy-secret-key"
+
+TELEGRAM_BOT_TOKEN = "dummy-bot-token"
+TELEGRAM_MANAGER_CHAT_ID = "dummy-chat-id"
+
+UNFOLD = {
+    "SITE_TITLE": "Улица Радости — админка",
+    "SITE_HEADER": "Улица Радости",
+    "DASHBOARD_CALLBACK": "apps.billing.dashboard.dashboard_callback",
+}
