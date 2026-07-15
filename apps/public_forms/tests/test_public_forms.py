@@ -19,7 +19,10 @@ from apps.public_forms.models import (
     FeedbackStatus,
 )
 from apps.public_forms.services import verify_captcha_token
-from apps.public_forms.tests.factories import CallbackRequestFactory, FeedbackRequestFactory
+from apps.public_forms.tests.factories import (
+    CallbackRequestFactory,
+    FeedbackRequestFactory,
+)
 
 pytestmark = [pytest.mark.django_db, pytest.mark.urls("apps.public_forms.urls")]
 
@@ -175,15 +178,21 @@ class TestThrottling:
         # один счётчик, даже если REMOTE_ADDR (адрес прокси) одинаков
         for _ in range(THROTTLE_LIMIT):
             api_client.post(
-                CALLBACK_URL, callback_payload, format="json",
+                CALLBACK_URL,
+                callback_payload,
+                format="json",
                 HTTP_X_FORWARDED_FOR="203.0.113.1",
             )
         blocked = api_client.post(
-            CALLBACK_URL, callback_payload, format="json",
+            CALLBACK_URL,
+            callback_payload,
+            format="json",
             HTTP_X_FORWARDED_FOR="203.0.113.1",
         )
         other_client = api_client.post(
-            CALLBACK_URL, callback_payload, format="json",
+            CALLBACK_URL,
+            callback_payload,
+            format="json",
             HTTP_X_FORWARDED_FOR="203.0.113.2",
         )
 
@@ -199,7 +208,9 @@ class TestCaptchaTokenVerification:
         handler: Callable[[httpx.Request], httpx.Response],
     ) -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        monkeypatch.setattr("apps.public_forms.services.get_http_client", lambda: client)
+        monkeypatch.setattr(
+            "apps.public_forms.services.get_http_client", lambda: client
+        )
 
     async def test_non_json_200_response_returns_false(
         self, monkeypatch: pytest.MonkeyPatch

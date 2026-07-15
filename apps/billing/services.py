@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import logging
 import uuid
 from contextlib import suppress
 from collections.abc import Sequence
@@ -32,6 +33,8 @@ from apps.billing.models import (
 )
 from apps.billing.ports import SchedulePort, UnknownSlotError
 from apps.users.models import Student
+
+logger = logging.getLogger(__name__)
 
 
 class BillingError(Exception):
@@ -1083,3 +1086,174 @@ def sweep_finalized_idempotency_records(*, now: datetime | None = None) -> int:
         .delete()
     )
     return deleted
+
+
+# Административные операции (Django Admin)
+
+
+class InvalidFreezePeriodError(BillingError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class SubscriptionNotFreezableError(BillingError):
+    def __init__(self, subscription_id: int, status: str) -> None:
+        super().__init__(
+            f"Абонемент id={subscription_id} (status={status}) нельзя заморозить: "
+            "требуется ACTIVE с установленным expires_at."
+        )
+        self.subscription_id = subscription_id
+        self.status = status
+
+
+class TokenNotRefundableError(BillingError):
+    def __init__(self, attendance_id: int, reason: str) -> None:
+        super().__init__(
+            f"Возврат фишки по отметке id={attendance_id} невозможен: {reason}"
+        )
+        self.attendance_id = attendance_id
+        self.reason = reason
+
+
+@dataclass(frozen=True, slots=True)
+class BulkFreezeResult:
+    frozen_count: int
+    frozen_days: int
+    errors: list[str]
+
+
+def bulk_freeze_subscriptions(
+    *,
+    subscription_ids: Sequence[int],
+    start_date: date,
+    end_date: date,
+    reason: str,
+) -> BulkFreezeResult:
+    if end_date <= start_date:
+        raise InvalidFreezePeriodError(
+            "Дата окончания заморозки должна быть позже даты начала."
+        )
+    if not reason.strip():
+        raise InvalidFreezePeriodError("Причина заморозки обязательна.")
+    if not subscription_ids:
+        raise InvalidFreezePeriodError("Не выбрано ни одного абонемента.")
+
+    frozen_days = (end_date - start_date).days
+    shift = timedelta(days=frozen_days)
+    errors: list[str] = []
+
+    with db_transaction.atomic():
+        # ПОЧЕМУ: одна транзакция и одна блокировка на весь пакет вместо
+        # O(N) отдельных get()+UPDATE, иначе экшен на 50 строк съедает
+        # пул соединений и ловит дедлоки
+        subscriptions = list(
+            Subscription.objects.select_for_update().filter(pk__in=subscription_ids)
+        )
+
+        found_ids = {subscription.pk for subscription in subscriptions}
+        for missing_id in set(subscription_ids) - found_ids:
+            errors.append(f"Абонемент #{missing_id}: не найден.")
+
+        to_update: list[Subscription] = []
+        for subscription in subscriptions:
+            if (
+                subscription.status != SubscriptionStatus.ACTIVE
+                or subscription.expires_at is None
+            ):
+                errors.append(
+                    f"Абонемент #{subscription.pk}: заморозить можно только "
+                    f"активный с датой истечения (сейчас {subscription.status})."
+                )
+                continue
+            subscription.expires_at += shift
+            to_update.append(subscription)
+
+        if to_update:
+            Subscription.objects.bulk_update(to_update, ["expires_at"])
+
+    # TODO: завести таблицу subscription_freeze (журнал заморозок с reason,
+    # performed_by) — сейчас причина фиксируется только в логах
+    logger.info(
+        "Frozen %s subscriptions for %s days (%s — %s): %s",
+        len(to_update),
+        frozen_days,
+        start_date,
+        end_date,
+        reason,
+    )
+    return BulkFreezeResult(
+        frozen_count=len(to_update), frozen_days=frozen_days, errors=errors
+    )
+
+
+def refund_token(attendance_id: int) -> None:
+    # !!!: зеркало debit_token — обязано оставаться идемпотентным
+    # и работать под теми же блокировками
+    with db_transaction.atomic():
+        try:
+            attendance = (
+                Attendance.objects.select_for_update(of=("self",))
+                .select_related("enrollment__subscription")
+                .get(pk=attendance_id)
+            )
+        except Attendance.DoesNotExist as exc:
+            raise AttendanceNotFoundError(attendance_id) from exc
+
+        if not attendance.token_debited:
+            return
+
+        subscription = attendance.enrollment.subscription
+        # ПОЧЕМУ: возврат на не-ACTIVE запрещен — sweep_expired_subscriptions
+        # уже обнулил остатки и начислил несгораемый остаток на депозит,
+        # инкремент remaining_tokens задним числом разъехался бы с учетом
+        if subscription.status != SubscriptionStatus.ACTIVE:
+            raise TokenNotRefundableError(
+                attendance_id,
+                f"абонемент id={subscription.pk} в статусе {subscription.status}.",
+            )
+
+        try:
+            slot = SubscriptionSlot.objects.select_for_update(of=("self",)).get(
+                subscription_id=attendance.enrollment.subscription_id,
+                slot_id=attendance.enrollment.schedule_id,
+            )
+        except SubscriptionSlot.DoesNotExist as exc:
+            raise SlotBalanceNotFoundError(
+                attendance.enrollment.subscription_id,
+                attendance.enrollment.schedule_id,
+            ) from exc
+
+        slot.remaining_tokens += 1
+        slot.save(update_fields=["remaining_tokens"])
+        attendance.token_debited = False
+        attendance.save(update_fields=["token_debited"])
+
+
+def set_attendance_status(
+    *, attendance_id: int, status: AttendanceStatus
+) -> Attendance:
+    # ПОЧЕМУ: статус и движение фишки — одна транзакция, вложенные atomic
+    # внутри debit/refund_token схлопываются в savepoint-ы
+    with db_transaction.atomic():
+        try:
+            attendance = Attendance.objects.select_for_update(of=("self",)).get(
+                pk=attendance_id
+            )
+        except Attendance.DoesNotExist as exc:
+            raise AttendanceNotFoundError(attendance_id) from exc
+
+        if attendance.status != status:
+            was_debited = attendance.token_debited
+            attendance.status = status
+            attendance.save(update_fields=["status"])
+
+            if status == AttendanceStatus.ATTENDED:
+                debit_token(attendance_id)
+            elif was_debited:
+                # ПОЧЕМУ: бизнес-правило — отмена отметки возвращает фишку
+                # (project-context §13.9)
+                refund_token(attendance_id)
+
+        attendance.refresh_from_db()
+    return attendance

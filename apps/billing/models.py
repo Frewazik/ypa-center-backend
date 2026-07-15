@@ -29,6 +29,12 @@ class AttendanceStatus(models.TextChoices):
     ABSENT_OK = "ABSENT_OK", "Отсутствие (уважительное)"
 
 
+class AttendanceCommentTag(models.TextChoices):
+    POSITIVE = "POSITIVE", "Позитивный"
+    NEGATIVE = "NEGATIVE", "Негативный"
+    NEUTRAL = "NEUTRAL", "Нейтральный"
+
+
 class SubscriptionPlan(models.Model):
     name = models.CharField("Название", max_length=255)
     slots_count = models.PositiveSmallIntegerField("Число слотов")
@@ -265,6 +271,13 @@ class Attendance(models.Model):
         choices=AttendanceStatus.choices,
     )
     token_debited = models.BooleanField("Фишка списана", default=False)
+    comment = models.TextField("Комментарий педагога", blank=True)
+    comment_tag = models.CharField(
+        "Тональность комментария",
+        max_length=16,
+        choices=AttendanceCommentTag.choices,
+        default=AttendanceCommentTag.NEUTRAL,
+    )
     created_at = models.DateTimeField("Создана", auto_now_add=True)
 
     class Meta:

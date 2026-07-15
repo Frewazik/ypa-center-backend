@@ -8,13 +8,17 @@ from apps.public_forms.models import CallbackRequest, FeedbackRequest
 def _honeypot_field() -> serializers.CharField:
     # ПОЧЕМУ: поле скрыто через CSS на фронте, живой человек его
     # не видит — заполнит только бот
-    return serializers.CharField(required=False, allow_blank=True, write_only=True, default="")
+    return serializers.CharField(
+        required=False, allow_blank=True, write_only=True, default=""
+    )
 
 
 def _captcha_field() -> serializers.CharField:
     # ПОЧЕМУ: жёсткий required выдал бы honeypot-ловушку ошибкой 400
     # на запросах ботов без токена
-    return serializers.CharField(required=False, allow_blank=True, write_only=True, default="")
+    return serializers.CharField(
+        required=False, allow_blank=True, write_only=True, default=""
+    )
 
 
 class CallbackRequestCreateSerializer(serializers.ModelSerializer[CallbackRequest]):
@@ -23,7 +27,13 @@ class CallbackRequestCreateSerializer(serializers.ModelSerializer[CallbackReques
 
     class Meta:
         model = CallbackRequest
-        fields = ("name", "phone", "preferred_time_window", "website_url", "captcha_token")
+        fields = (
+            "name",
+            "phone",
+            "preferred_time_window",
+            "website_url",
+            "captcha_token",
+        )
 
 
 class FeedbackRequestCreateSerializer(serializers.ModelSerializer[FeedbackRequest]):

@@ -217,5 +217,5 @@ TELEGRAM_MANAGER_CHAT_ID = "dummy-chat-id"
 UNFOLD = {
     "SITE_TITLE": "Улица Радости — админка",
     "SITE_HEADER": "Улица Радости",
-    "DASHBOARD_CALLBACK": "apps.billing.dashboard.dashboard_callback",
+    "DASHBOARD_CALLBACK": "apps.core.dashboard.dashboard_callback",
 }

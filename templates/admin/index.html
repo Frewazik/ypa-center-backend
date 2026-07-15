@@ -1,0 +1,23 @@
+{% extends "unfold/layouts/base_simple.html" %}
+{% load unfold %}
+
+{% block content %}
+  {% component "unfold/components/container.html" %}
+    {% component "unfold/components/flex.html" with class="gap-4 mb-8" %}
+      {% for card in kpi %}
+        {% component "unfold/components/card.html" with class="lg:w-1/2" %}
+          {% component "unfold/components/text.html" %}{{ card.title }}{% endcomponent %}
+          {% component "unfold/components/title.html" %}{{ card.metric }}{% endcomponent %}
+        {% endcomponent %}
+      {% endfor %}
+    {% endcomponent %}
+
+    {% component "unfold/components/card.html" with title="Топ-5 групп по записям" class="mb-8" %}
+      {% component "unfold/components/chart/bar.html" with data=top_groups_chart height=320 %}{% endcomponent %}
+    {% endcomponent %}
+
+    {% component "unfold/components/card.html" with title="Платежи за 30 дней" %}
+      {% component "unfold/components/chart/line.html" with data=payments_chart height=320 %}{% endcomponent %}
+    {% endcomponent %}
+  {% endcomponent %}
+{% endblock %}
