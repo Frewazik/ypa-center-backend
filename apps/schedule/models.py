@@ -143,6 +143,11 @@ class Schedule(models.Model):
     max_capacity = models.PositiveSmallIntegerField("Максимум детей", default=6)
     is_active = models.BooleanField("Активна", default=True)
 
+    # ПОЧЕМУ: публичная витрина обязана показывать возраст на уровне
+    # подгруппы, а не кружка — у одного кружка группы разных возрастов
+    age_min = models.PositiveSmallIntegerField("Возраст от", null=True, blank=True)
+    age_max = models.PositiveSmallIntegerField("Возраст до", null=True, blank=True)
+
     # ПОЧЕМУ: Денормализация ради ExclusionConstraint
     # Значения перезаписываются триггером (0003), ORM-хуки игнорируются
     day_of_week = models.SmallIntegerField(
@@ -170,6 +175,12 @@ class Schedule(models.Model):
             models.CheckConstraint(
                 condition=Q(day_of_week__gte=0, day_of_week__lte=6),
                 name="schedule_day_of_week_in_range",
+            ),
+            models.CheckConstraint(
+                condition=Q(age_min__isnull=True)
+                | Q(age_max__isnull=True)
+                | Q(age_max__gte=F("age_min")),
+                name="schedule_age_range_valid",
             ),
             ExclusionConstraint(
                 name="no_teacher_time_overlap",

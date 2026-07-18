@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import hashlib
 import secrets
 import string
+from dataclasses import dataclass
 from datetime import timedelta
-from typing import TypedDict
 
 from asgiref.sync import async_to_sync
-from django.db import connection, models, transaction
+from django.db import models, transaction
 from django.utils import timezone
 
+from apps.core.locks import text_lock_key, try_advisory_xact_lock
 from apps.users.constants import (
     OTP_COOLDOWN_SECONDS,
     OTP_LENGTH,
@@ -48,12 +48,14 @@ class OTPCooldownError(Exception):
         self.retry_after = retry_after
 
 
-class TokenPair(TypedDict):
+@dataclass(frozen=True, slots=True)
+class TokenPair:
     access: str
     refresh: str
 
 
-class PurgeResult(TypedDict):
+@dataclass(frozen=True, slots=True)
+class PurgeResult:
     expired_unused: int
     retired_used: int
 
@@ -69,17 +71,9 @@ def _generate_code() -> str:
 
 
 def _acquire_email_lock(email: str) -> bool:
-    # ПОЧЕМУ: Advisory Lock по хэшу email защищает от гонки создания,
-    # так как SELECT FOR UPDATE возвращает None для новых адресов и пропускает параллельные потоки
-    lock_id = int(hashlib.sha256(email.encode()).hexdigest()[:16], 16) >> 1
-    with connection.cursor() as cur:
-        cur.execute("SELECT pg_try_advisory_xact_lock(%s)", [lock_id])
-        row = cur.fetchone()
-        if row is None:
-            ## ПОЧЕМУ: None означает аномалию драйвера.
-            # Ложный отказ (429) безопаснее гонки создания
-            return False
-        return bool(row[0])
+    # ПОЧЕМУ: для нового адреса нет строки под SELECT FOR UPDATE —
+    # гонку первого запроса закрывает advisory lock по хэшу email
+    return try_advisory_xact_lock(text_lock_key(email))
 
 
 def request_otp(email: str) -> None:
@@ -109,7 +103,6 @@ def request_otp(email: str) -> None:
                 retry_after=remaining,
             )
 
-        # Инвалидируем все неиспользованные токены для этого email.
         MagicTokens.objects.filter(email=email, is_used=False).update(is_used=True)
 
         code = _generate_code()
@@ -177,7 +170,6 @@ def verify_otp(email: str, code: str) -> TokenPair:
         raise error_to_raise
 
     if parent is None:
-        # ПОЧЕМУ: Mypy требует гарантии не-None. Проверка невырезаема при оптимизации Python -O
         raise OTPNotFoundError("Не удалось связать профиль пользователя.")
 
     refresh: RefreshToken = RefreshToken.for_user(parent)

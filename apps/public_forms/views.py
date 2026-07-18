@@ -36,6 +36,8 @@ class CallbackRequestCreateView(APIView):
     async def post(self, request: Request) -> Response:
         serializer = CallbackRequestCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        # !!!: django-ipware читает X-Forwarded-For. Это безопасно ТОЛЬКО если
+        # доверенный reverse-proxy (nginx) жёстко перетирает заголовки клиента
         client_ip, _ = get_client_ip(request)
         await process_callback_submission(serializer.validated_data, client_ip)
         # ПОЧЕМУ: ответ одинаков для реальной заявки и honeypot-дропа,

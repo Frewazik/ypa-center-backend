@@ -4,12 +4,10 @@ import hashlib
 import json
 import uuid
 from collections.abc import Mapping
-from typing import ClassVar
 
 from asgiref.sync import async_to_sync
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
-from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import (
     APIException,
     NotFound,
@@ -169,7 +167,7 @@ class YookassaWebhookView(APIView):
     # ПОЧЕМУ: тело вебхука не является доверенным источником истины
     # извлекаем только object.id как триггер, реальный статус запрашивает воркер
 
-    authentication_classes: ClassVar[list[type[BaseAuthentication]]] = []
+    authentication_classes = []
     permission_classes = [YookassaIPAllowlist]
 
     @extend_schema(

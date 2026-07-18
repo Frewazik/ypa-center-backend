@@ -1152,6 +1152,55 @@ class TestLateSuccessCompensationFlow:
         assert tx.requires_compensation is False
         assert tx.metadata["refund_status"] == "failed"
 
+    def test_active_claim_blocks_parallel_tick_before_network_call(self) -> None:
+        # ПОЧЕМУ: claim check — конкурентный тик (дубль крона, ручной запуск)
+        # не должен дойти до create_refund, пока lease первого воркера жив
+        tx = _make_pending_payment([101])
+        Transaction.objects.filter(pk=tx.pk).update(
+            external_id=f"yk-{tx.pk}",
+            requires_compensation=True,
+            metadata={"compensation_required": True},
+            compensation_claimed_until=timezone.now() + timedelta(minutes=5),
+        )
+        gateway = FakeGateway()
+
+        assert issue_pending_refunds(gateway=gateway) == 0
+        assert gateway.refund_calls == []
+        tx.refresh_from_db()
+        assert tx.requires_compensation is True
+
+    def test_expired_claim_is_reclaimed(self) -> None:
+        # ПОЧЕМУ: воркер, убитый после сетевого вызова, не хоронит возврат —
+        # истёкший lease перехватывается, дубль гасится Idempotence-Key
+        tx = _make_pending_payment([101])
+        Transaction.objects.filter(pk=tx.pk).update(
+            external_id=f"yk-{tx.pk}",
+            requires_compensation=True,
+            metadata={"compensation_required": True},
+            compensation_claimed_until=timezone.now() - timedelta(seconds=1),
+        )
+        gateway = FakeGateway()
+
+        assert issue_pending_refunds(gateway=gateway) == 1
+        assert len(gateway.refund_calls) == 1
+        tx.refresh_from_db()
+        assert tx.requires_compensation is False
+        assert tx.compensation_claimed_until is None
+        assert tx.metadata["refund_status"] == "succeeded"
+
+    def test_successful_refund_releases_claim(self) -> None:
+        tx = _make_pending_payment([101])
+        Transaction.objects.filter(pk=tx.pk).update(
+            external_id=f"yk-{tx.pk}",
+            requires_compensation=True,
+            metadata={"compensation_required": True},
+        )
+        gateway = FakeGateway()
+
+        assert issue_pending_refunds(gateway=gateway) == 1
+        tx.refresh_from_db()
+        assert tx.compensation_claimed_until is None
+
     def test_refunds_are_chunked_against_oom(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

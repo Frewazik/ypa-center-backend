@@ -4,16 +4,11 @@ import logging
 
 from django.conf import settings
 from django.core.mail import send_mail
-from taskiq import TaskiqScheduler
-from taskiq.schedule_sources import LabelScheduleSource
-from taskiq_redis import ListQueueBroker
 
 from apps.users.constants import OTP_TTL_MINUTES
+from config.tkq import broker
 
 logger = logging.getLogger(__name__)
-
-# ПОЧЕМУ: читаем напрямую без getattr; отсутствие урла должно жестко уронить приложение на старте
-broker: ListQueueBroker = ListQueueBroker(url=settings.TASKIQ_BROKER_URL)
 
 
 @broker.task
@@ -35,12 +30,6 @@ def send_otp_email_task(email: str, code: str) -> None:
     )
 
 
-scheduler: TaskiqScheduler = TaskiqScheduler(
-    broker=broker,
-    sources=[LabelScheduleSource(broker)],
-)
-
-
 @broker.task(schedule=[{"cron": "0 * * * *"}])
 def purge_stale_otp_tokens_task() -> None:
     # ПОЧЕМУ: локальный импорт предотвращает циклическую зависимость (services импортирует tasks)
@@ -49,6 +38,6 @@ def purge_stale_otp_tokens_task() -> None:
     result = purge_stale_otp_tokens()
     logger.info(
         "purge_stale_otp_tokens: expired_unused=%d retired_used=%d",
-        result["expired_unused"],
-        result["retired_used"],
+        result.expired_unused,
+        result.retired_used,
     )

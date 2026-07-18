@@ -18,7 +18,7 @@ staticfiles/
 local_settings.py
 db.sqlite3
 
-# Environment (ЗАПРЕЩЕНО КОПИРОВАТЬ В ОБРАЗ)
+# Environment
 .env
 .env.*
 !.env.example

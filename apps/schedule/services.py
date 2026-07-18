@@ -10,10 +10,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeAlias
 
 from django.core.exceptions import ValidationError
-from django.db import IntegrityError, connection, transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Count, Q
 from django.utils import timezone
 
+from apps.core.locks import advisory_xact_lock
 from apps.schedule.models import DayOfWeek, MaskType, Room, Schedule, ScheduleMask
 
 if TYPE_CHECKING:
@@ -24,7 +25,7 @@ RESCHEDULE_REASON = "Перенос"
 
 @dataclass(frozen=True, slots=True)
 class SlotOverride:
-    # ПОЧЕМУ: DTO для контракта ответа. \
+    # ПОЧЕМУ: DTO для контракта ответа
     # Фронтенду необходимо знать оригинальное время до переноса для UI
 
     original_start_time: datetime.time
@@ -61,8 +62,7 @@ _MaskIndex: TypeAlias = Mapping[tuple[int, datetime.date], ScheduleMask]
 
 def normalize_week_start(
     day: datetime.date,
-) -> datetime.date:  # ПОЧЕМУ: Вместимость считается SQL-агрегацией, домен billing не импортируется для чистой изоляции.
-    # Бюджет: 2 SQL-запроса на сетку недели
+) -> datetime.date:
     return day - datetime.timedelta(days=day.weekday())
 
 
@@ -96,14 +96,11 @@ def create_schedule_mask(
     new_room: Room | None = None,
     new_teacher: TeacherProfile | None = None,
 ) -> ScheduleMask:
-    # ПОЧЕМУ: Блокировка строки через SELECT FOR UPDATE сериализует конкурентные маски одной группы
-    # и гарантирует актуальность денормализованных триггером полей
-    # ПОЧЕМУ: Advisory-локи сериализуют переносы разных групп на один ресурс
-    # Ретро-маски запрещены для сохранения истории посещаемости
-    # IntegrityError при гонке уникальности маппится в ValidationError
     if schedule.pk is None:
         raise ValidationError({"schedule": "Группа не сохранена в БД."}, code="invalid")
     if target_date < timezone.localdate():
+        # ПОЧЕМУ: Ретро-маски запрещены, иначе задним числом переписывается история
+        # посещаемости, которая уже могла отметиться по факту занятия
         raise ValidationError(
             {"target_date": "Маска на прошедшую дату запрещена."}, code="invalid"
         )
@@ -128,8 +125,8 @@ def create_schedule_mask(
                 _ensure_no_collision(landing, exclude_schedule_id=locked.pk)
             mask.save()
     except IntegrityError as exc:
-        # Единственный INSERT в транзакции — сама маска; FK-существование уже
-        # проверено full_clean, реалистичный источник — проигранная гонка на
+        # Единственный INSERT в транзакции сама маска; FK-существование уже
+        # проверено full_clean, реалистичный источник, проигранная гонка на
         # uniq_mask_per_schedule_per_date.
         raise ValidationError(
             {"target_date": "Маска для этой группы на эту дату уже существует."},
@@ -161,8 +158,8 @@ def _validate_mask_target(schedule: Schedule, target_date: datetime.date) -> Non
 
 
 def _effective_session(schedule: Schedule, mask: ScheduleMask) -> _EffectiveSession:
-    # ПОЧЕМУ: Расчет физического приземления переноса с наследованием пустых new_*.
-    # Строка schedule должна быть прочитана из СУБД
+    # ПОЧЕМУ: пустые new_* в частичном переносе наследуют исходное значение
+    # группы — маска может двигать только время, оставляя день, например
     day_of_week = (
         mask.new_day_of_week
         if mask.new_day_of_week is not None
@@ -188,19 +185,12 @@ def _effective_session(schedule: Schedule, mask: ScheduleMask) -> _EffectiveSess
 
 
 def _lock_resources(session: _EffectiveSession) -> None:
-    # ПОЧЕМУ: Транзакционные advisory-локи предотвращают гонку параллельных переносов на один ресурс.
-    # Снимаются на COMMIT/ROLLBACK автоматически
-    with connection.cursor() as cursor:
-        if session.room_id is not None:
-            cursor.execute(
-                "SELECT pg_advisory_xact_lock(%s, %s)",
-                [_LOCK_NS_ROOM, session.room_id],
-            )
-        if session.teacher_id is not None:
-            cursor.execute(
-                "SELECT pg_advisory_xact_lock(%s, %s)",
-                [_LOCK_NS_TEACHER, session.teacher_id],
-            )
+    # ПОЧЕМУ: транзакционные advisory-локи предотвращают гонку
+    # параллельных переносов на один ресурс
+    if session.room_id is not None:
+        advisory_xact_lock(_LOCK_NS_ROOM, session.room_id)
+    if session.teacher_id is not None:
+        advisory_xact_lock(_LOCK_NS_TEACHER, session.teacher_id)
 
 
 def _ensure_no_collision(
@@ -313,7 +303,9 @@ def build_week_grid(week_start: datetime.date) -> list[WeekSlot]:
     schedules = list(
         Schedule.objects.filter(is_active=True, activity__is_active=True)
         .select_related("activity", "teacher__user", "room")
-        .annotate(
+        # ПОЧЕМУ ignore: capacity_taken объявлен на модели ради типизации
+        # потребителей; django-stubs считает annotate() переопределением
+        .annotate(  # type: ignore[no-redef]
             capacity_taken=Count(
                 "enrollment",
                 filter=Q(enrollment__status__in=["HELD", "ENROLLED"]),
@@ -342,8 +334,8 @@ def _load_masks(
     week_start: datetime.date,
     week_end: datetime.date,
 ) -> _MaskIndex:
-    # ПОЧЕМУ: Выборка всех масок недели одним запросом для исключения N+1.
-    #  Ключ уникален по UniqueConstraint в БД
+    # ПОЧЕМУ: все маски недели — одним запросом, чтобы не бить N+1 по группам.
+    # Ключ (schedule_id, target_date) уникален по констрейнту в БД
     masks = ScheduleMask.objects.filter(
         schedule_id__in=list(schedule_ids),
         target_date__range=(week_start, week_end),
@@ -357,8 +349,8 @@ def _project_schedule(
     week_start: datetime.date,
     masks: _MaskIndex,
 ) -> WeekSlot:
-    # ПОЧЕМУ: Проекция группы на календарный день с учетом масок.
-    #  Отмененное занятие остается в сетке с флагом для фронтенда
+    # ПОЧЕМУ: отменённое занятие не выкидываем из сетки остаётся с флагом
+    # is_cancelled, фронт рисует его перечёркнутым, а не молча прячет
     session_date = week_start + datetime.timedelta(days=schedule.day_of_week)
     mask = masks.get((schedule.pk, session_date))
     if mask is None:

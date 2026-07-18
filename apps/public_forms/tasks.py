@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import Literal
 
 import httpx
 from django.conf import settings
-from taskiq import AsyncBroker, InMemoryBroker, SimpleRetryMiddleware
-from taskiq_redis import ListQueueBroker
 
 from apps.public_forms.models import CallbackRequest, FeedbackRequest
+from config.tkq import broker
 
 logger = logging.getLogger(__name__)
 
@@ -23,25 +21,8 @@ class NotificationDeliveryError(Exception):
     pass
 
 
-def _build_broker() -> AsyncBroker:
-    # ПОЧЕМУ: воркер taskiq — отдельный процесс, его entrypoint обязан
-    # вызвать django.setup() до импорта этого модуля
-    base: AsyncBroker
-    if os.getenv("ENVIRONMENT", "").lower() == "test":
-        base = InMemoryBroker()
-    else:
-        base = ListQueueBroker(url=settings.TASKIQ_BROKER_URL)
-    return base.with_middlewares(SimpleRetryMiddleware(default_retry_count=3))
-
-
-broker = _build_broker()
-
-
-async def _post_to_telegram(text: str) -> httpx.Response:
-    # ПОЧЕМУ: ленивый импорт разрывает цикл tasks <-> services
-    from apps.public_forms.services import get_http_client
-
-    return await get_http_client().post(
+async def _post_to_telegram(client: httpx.AsyncClient, text: str) -> httpx.Response:
+    return await client.post(
         f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage",
         json={"chat_id": settings.TELEGRAM_MANAGER_CHAT_ID, "text": text},
     )
@@ -58,14 +39,22 @@ async def _deliver(text: str, form_type: FormType, request_id: int) -> None:
         )
         return
 
+    # ПОЧЕМУ: ленивый импорт разрывает цикл tasks <-> services
+    from apps.public_forms.services import get_http_client
+
     try:
-        response = await _post_to_telegram(text)
-        if response.status_code == 429:
-            retry_after = min(
-                float(response.headers.get("Retry-After", "1")), RETRY_AFTER_CAP_SECONDS
-            )
-            await asyncio.sleep(retry_after)
-            response = await _post_to_telegram(text)
+        async with get_http_client() as client:
+            response = await _post_to_telegram(client, text)
+            if response.status_code == 429:
+                # ПОЧЕМУ: sleep кооперативен — слот воркера ждёт, но event loop
+                # свободен для остальных задач; ожидание жёстко ограничено капом,
+                # а второй 429 уходит в ретрай брокера через исключение ниже
+                retry_after = min(
+                    float(response.headers.get("Retry-After", "1")),
+                    RETRY_AFTER_CAP_SECONDS,
+                )
+                await asyncio.sleep(retry_after)
+                response = await _post_to_telegram(client, text)
     except httpx.HTTPError as exc:
         raise NotificationDeliveryError(
             f"Telegram недоступен (form={form_type} id={request_id})"

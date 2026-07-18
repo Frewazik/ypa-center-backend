@@ -7,9 +7,9 @@ from contextlib import suppress
 from collections.abc import Sequence
 from datetime import date, datetime, time, timedelta
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Literal
 
-from django.db import IntegrityError, connection
+from django.db import IntegrityError
 from django.db import transaction as db_transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -32,6 +32,7 @@ from apps.billing.models import (
     TransactionStatus,
 )
 from apps.billing.ports import SchedulePort, UnknownSlotError
+from apps.core.locks import advisory_xact_lock
 from apps.users.models import Student
 
 logger = logging.getLogger(__name__)
@@ -220,21 +221,6 @@ class EnrollmentNotEnrolledError(BillingError):
         self.status = status
 
 
-class YookassaPaymentMetadata(TypedDict):
-    transaction_id: str
-
-
-class YookassaPaymentObject(TypedDict):
-    id: str
-    status: str
-    metadata: YookassaPaymentMetadata
-
-
-class YookassaWebhookPayload(TypedDict):
-    event: str
-    object: YookassaPaymentObject
-
-
 CheckoutStatus = Literal["PENDING_PAYMENT", "CONFIRMED"]
 
 
@@ -261,6 +247,9 @@ _SLOT_LOCK_CLASS = 815_001
 # при массовой отмене или падении БД
 _SWEEP_CHUNK_SIZE = 1_000
 _REFUND_CHUNK_SIZE = 500
+# ПОЧЕМУ: lease обязан переживать сетевой вызов к шлюзу с ретраями,
+# но не блокировать возврат надолго после смерти воркера
+_REFUND_CLAIM_TTL = timedelta(minutes=10)
 
 
 # ПОЧЕМУ: дефолтное значение для снапшота, бизнес-правила могут меняться,
@@ -496,6 +485,11 @@ def create_payment(
 
 
 def _fulfill_prepaid_order(tx: Transaction, schedule_port: SchedulePort) -> None:
+    subscription_id = tx.subscription_id
+    if subscription_id is None:
+        raise UnlinkedPaymentError(
+            "deposit-prepaid", f"транзакция {tx.pk} не связана с абонементом"
+        )
     slot_ids = _selected_slot_ids(tx, "deposit-prepaid")
     try:
         start_date, expires_at = _activation_window(slot_ids, schedule_port)
@@ -506,19 +500,19 @@ def _fulfill_prepaid_order(tx: Transaction, schedule_port: SchedulePort) -> None
     tx.metadata = {**tx.metadata, "paid_from_deposit": True}
     tx.save(update_fields=["status", "metadata"])
     Subscription.objects.filter(
-        pk=tx.subscription_id, status=SubscriptionStatus.PENDING
+        pk=subscription_id, status=SubscriptionStatus.PENDING
     ).update(
         status=SubscriptionStatus.ACTIVE,
         start_date=start_date,
         expires_at=expires_at,
     )
     Enrollment.objects.filter(
-        subscription_id=tx.subscription_id, status=EnrollmentStatus.HELD
+        subscription_id=subscription_id, status=EnrollmentStatus.HELD
     ).update(status=EnrollmentStatus.ENROLLED)
     SubscriptionSlot.objects.bulk_create(
         [
             SubscriptionSlot(
-                subscription_id=tx.subscription_id,
+                subscription_id=subscription_id,
                 slot_id=slot_id,
                 granted_tokens=_TOKENS_PER_SLOT,
                 remaining_tokens=_TOKENS_PER_SLOT,
@@ -529,11 +523,8 @@ def _fulfill_prepaid_order(tx: Transaction, schedule_port: SchedulePort) -> None
 
 
 def _lock_slot_for_booking(slot_id: int) -> None:
-    # ПОЧЕМУ: в биллинге нет строки слота для FOR UPDATE (слот — чужой домен).
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT pg_advisory_xact_lock(%s, %s)", [_SLOT_LOCK_CLASS, slot_id]
-        )
+    # ПОЧЕМУ: в биллинге нет строки слота для FOR UPDATE (слот — чужой домен)
+    advisory_xact_lock(_SLOT_LOCK_CLASS, slot_id)
 
 
 def _occupied_seats(slot_id: int, *, exclude_enrollment_pk: int | None = None) -> int:
@@ -644,6 +635,9 @@ def _apply_success(
                 deferred = data_error
             else:
                 slot_ids = _selected_slot_ids(tx, info.id)
+                # Сужение Optional: не-None гарантирован _validate_success_payload
+                subscription_id = tx.subscription_id
+                assert subscription_id is not None
                 tx.status = TransactionStatus.SUCCEEDED
                 tx.external_id = info.id
                 tx.save(update_fields=["status", "external_id"])
@@ -664,7 +658,7 @@ def _apply_success(
                     )
                 else:
                     activated = Subscription.objects.filter(
-                        pk=tx.subscription_id, status=SubscriptionStatus.PENDING
+                        pk=subscription_id, status=SubscriptionStatus.PENDING
                     ).update(
                         status=SubscriptionStatus.ACTIVE,
                         start_date=start_date,
@@ -684,18 +678,18 @@ def _apply_success(
                         )
                     else:
                         overbook_reason = _try_enroll_held_seats(
-                            tx, slot_ids, schedule_port
+                            subscription_id, slot_ids, schedule_port
                         )
                         if overbook_reason is not None:
                             _mark_for_compensation(
                                 tx,
                                 {
                                     "reason": overbook_reason,
-                                    "subscription_id": tx.subscription_id,
+                                    "subscription_id": subscription_id,
                                 },
                             )
                             Subscription.objects.filter(
-                                pk=tx.subscription_id,
+                                pk=subscription_id,
                                 status=SubscriptionStatus.ACTIVE,
                             ).update(
                                 status=SubscriptionStatus.CANCELED,
@@ -704,13 +698,13 @@ def _apply_success(
                             )
                             _release_order_resources(tx)
                             deferred = SeatsTakenAfterPaymentError(
-                                info.id, tx.subscription_id or 0, overbook_reason
+                                info.id, subscription_id, overbook_reason
                             )
                         else:
                             SubscriptionSlot.objects.bulk_create(
                                 [
                                     SubscriptionSlot(
-                                        subscription_id=tx.subscription_id,
+                                        subscription_id=subscription_id,
                                         slot_id=slot_id,
                                         granted_tokens=_TOKENS_PER_SLOT,
                                         remaining_tokens=_TOKENS_PER_SLOT,
@@ -744,7 +738,7 @@ def _validate_success_payload(
 
 
 def _try_enroll_held_seats(
-    tx: Transaction, slot_ids: list[int], schedule_port: SchedulePort
+    subscription_id: int, slot_ids: list[int], schedule_port: SchedulePort
 ) -> str | None:
     # ПОЧЕМУ: перед финальным зачислением обязательна повторная проверка мест,
     # так как бронь (HELD) могла протухнуть за время проведения платежа
@@ -752,13 +746,17 @@ def _try_enroll_held_seats(
     for slot_id in ordered:
         _lock_slot_for_booking(slot_id)
 
+    # ПОЧЕМУ: multi-row FOR UPDATE без ORDER BY лочит строки в порядке плана;
+    # два конкурентных захвата пересекающихся наборов — готовый ABBA-дедлок
     own_by_slot = {
         enrollment.schedule_id: enrollment
-        for enrollment in Enrollment.objects.select_for_update().filter(
-            subscription_id=tx.subscription_id,
+        for enrollment in Enrollment.objects.select_for_update()
+        .filter(
+            subscription_id=subscription_id,
             schedule_id__in=ordered,
             status=EnrollmentStatus.HELD,
         )
+        .order_by("pk")
     }
 
     for slot_id in ordered:
@@ -861,7 +859,7 @@ def _result_from_record(record: IdempotencyRecord) -> CheckoutResult:
             expires_at = datetime.fromisoformat(raw_expires)
         except ValueError as exc:
             raise CorruptedIdempotencyRecordError(record.key) from exc
-    checkout_status: CheckoutStatus = raw_status  # type: ignore[assignment]
+    checkout_status: CheckoutStatus = raw_status
     return CheckoutResult(
         transaction_id=transaction_id,
         status=checkout_status,
@@ -907,10 +905,14 @@ def sweep_stale_pending_transactions(*, now: datetime | None = None) -> int:
     # от провайдера потерялся или клиент бросил оплату на полпути
     moment = now if now is not None else timezone.now()
     cutoff = moment - _PENDING_TRANSACTION_TTL
+    # ПОЧЕМУ: LIMIT без ORDER BY недетерминирован — при переполнении чанка
+    # свипер обязан снимать самые старые брони первыми
     stale_ids = list(
         Transaction.objects.filter(
             status=TransactionStatus.PENDING, created_at__lt=cutoff
-        ).values_list("pk", flat=True)[:_SWEEP_CHUNK_SIZE]
+        )
+        .order_by("created_at")
+        .values_list("pk", flat=True)[:_SWEEP_CHUNK_SIZE]
     )
 
     swept = 0
@@ -973,7 +975,9 @@ def _credit_unused_sessions(subscription: Subscription) -> int:
     # !!!: строгий SELECT FOR UPDATE обязателен, иначе есть риск
     # начислить возврат по грязным данным до коммита списания фишки
     slots = list(
-        SubscriptionSlot.objects.select_for_update().filter(subscription=subscription)
+        SubscriptionSlot.objects.select_for_update()
+        .filter(subscription=subscription)
+        .order_by("pk")
     )
     granted_sessions = sum(slot.granted_tokens for slot in slots)
     used_sessions = max(
@@ -1014,7 +1018,10 @@ def _locked_parent_deposit(parent_id: int) -> ParentDeposit:
     return ParentDeposit.objects.select_for_update().get(parent_id=parent_id)
 
 
-def issue_pending_refunds(*, gateway: PaymentGateway) -> int:
+def issue_pending_refunds(
+    *, gateway: PaymentGateway, now: datetime | None = None
+) -> int:
+    moment = now if now is not None else timezone.now()
     candidate_ids = list(
         Transaction.objects.filter(requires_compensation=True)
         .order_by("created_at")
@@ -1023,9 +1030,21 @@ def issue_pending_refunds(*, gateway: PaymentGateway) -> int:
 
     issued = 0
     for tx_id in candidate_ids:
+        # ПОЧЕМУ (claim check): возврат резервируется в БД ДО похода в сеть —
+        # параллельный тик (дубль крона, ручной запуск из админки) не отправит
+        # второй create_refund. Lease с TTL, а не вечный флаг: воркер, убитый
+        # после сетевого вызова, не хоронит возврат — после истечения lease
+        # повтор дедуплицируется Idempotence-Key провайдера
+        claimed = Transaction.objects.filter(
+            Q(compensation_claimed_until__isnull=True)
+            | Q(compensation_claimed_until__lt=moment),
+            pk=tx_id,
+            requires_compensation=True,
+        ).update(compensation_claimed_until=moment + _REFUND_CLAIM_TTL)
+        if claimed == 0:
+            continue
+
         tx = Transaction.objects.get(pk=tx_id)
-        if not tx.requires_compensation:
-            continue  # успел другой воркер
         if tx.external_id is None:
             _quarantine_refund(
                 tx_id, "платёж не подтверждён провайдером — возвращать нечего"
@@ -1049,13 +1068,20 @@ def issue_pending_refunds(*, gateway: PaymentGateway) -> int:
             if not locked.requires_compensation:
                 continue
             locked.requires_compensation = False
+            locked.compensation_claimed_until = None
             locked.metadata = {
                 **locked.metadata,
                 "compensation_required": False,
                 "refund_id": refund.id,
                 "refund_status": refund.status,
             }
-            locked.save(update_fields=["requires_compensation", "metadata"])
+            locked.save(
+                update_fields=[
+                    "requires_compensation",
+                    "compensation_claimed_until",
+                    "metadata",
+                ]
+            )
             issued += 1
     return issued
 
@@ -1066,13 +1092,20 @@ def _quarantine_refund(tx_id: uuid.UUID, reason: str) -> None:
         if not locked.requires_compensation:
             return
         locked.requires_compensation = False
+        locked.compensation_claimed_until = None
         locked.metadata = {
             **locked.metadata,
             "compensation_required": False,
             "refund_status": "failed",
             "refund_error": reason,
         }
-        locked.save(update_fields=["requires_compensation", "metadata"])
+        locked.save(
+            update_fields=[
+                "requires_compensation",
+                "compensation_claimed_until",
+                "metadata",
+            ]
+        )
 
 
 def sweep_finalized_idempotency_records(*, now: datetime | None = None) -> int:
@@ -1147,8 +1180,12 @@ def bulk_freeze_subscriptions(
         # ПОЧЕМУ: одна транзакция и одна блокировка на весь пакет вместо
         # O(N) отдельных get()+UPDATE, иначе экшен на 50 строк съедает
         # пул соединений и ловит дедлоки
+        # ПОЧЕМУ: без ORDER BY два пересекающихся пакета заморозки лочат
+        # строки в разном порядке и ловят взаимный дедлок
         subscriptions = list(
-            Subscription.objects.select_for_update().filter(pk__in=subscription_ids)
+            Subscription.objects.select_for_update()
+            .filter(pk__in=subscription_ids)
+            .order_by("pk")
         )
 
         found_ids = {subscription.pk for subscription in subscriptions}

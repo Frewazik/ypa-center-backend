@@ -1,11 +1,5 @@
-"""Фабрики Factory Boy домена «Расписание».
-
-Внешние домены подключены строковыми путями моделей
-(``Meta.model = "app.Model"`` — factory_boy разрешает их лениво через реестр
-Django), поэтому файл не импортирует чужие домены. Метки приложений —
-предположение по DDD-разбиению проекта; при другом разбиении меняются только
-константы ниже.
-"""
+# ПОЧЕМУ: модели внешних доменов подключаются лениво через реестровые строки Django
+# это сохраняет жесткую изоляцию доменов и предотвращает циклические импорты
 
 from __future__ import annotations
 
@@ -46,7 +40,7 @@ class ActivityFactory(factory.django.DjangoModelFactory):
     name = factory.Sequence(lambda n: f"Кружок {n}")
     slug = factory.Sequence(lambda n: f"activity-{n}")
     category = "CLUB"
-    price = 400_000  # копейки: 4000.00 руб (`README.md` §5)
+    price = 400_000
     is_active = True
 
 
@@ -59,8 +53,6 @@ class RoomFactory(factory.django.DjangoModelFactory):
 
 
 class TimeSlotFactory(factory.django.DjangoModelFactory):
-    """Комбинации (день, час) уникальны в пределах 84 подряд созданных слотов."""
-
     class Meta:
         model = TimeSlot
 
@@ -72,9 +64,6 @@ class TimeSlotFactory(factory.django.DjangoModelFactory):
 
 
 class ScheduleFactory(factory.django.DjangoModelFactory):
-    """Каждая группа получает собственных преподавателя, кабинет и слот —
-    массовое создание никогда не задевает exclusion-констрейнты."""
-
     class Meta:
         model = Schedule
 
@@ -85,6 +74,15 @@ class ScheduleFactory(factory.django.DjangoModelFactory):
     group_name = factory.Sequence(lambda n: f"Группа {n}")
     max_capacity = 6
     is_active = True
+
+    @classmethod
+    def _after_postgeneration(cls, instance, create, results=None):
+        super()._after_postgeneration(instance, create, results)
+        if not create:
+            return
+        # ПОЧЕМУ: денормализованные поля заполняются BEFORE-триггером на стороне Postgres
+        # ORM выполняет INSERT с NULL, требуется принудительный рефреш для актуализации
+        instance.refresh_from_db()
 
 
 class ScheduleMaskFactory(factory.django.DjangoModelFactory):
@@ -153,7 +151,6 @@ class EnrollmentFactory(factory.django.DjangoModelFactory):
 
     @classmethod
     def _adjust_kwargs(cls, **kwargs):
-        # Трансляция старого флага тестов в новый FSM-статус биллинга
         if "is_active" in kwargs:
             kwargs["status"] = "ENROLLED" if kwargs.pop("is_active") else "CANCELED"
         return kwargs

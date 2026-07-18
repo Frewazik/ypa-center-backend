@@ -4,6 +4,7 @@ from typing import TypeAlias, TypedDict, cast
 from django.utils.translation import gettext as _
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
+from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.settings import api_settings
 from rest_framework.views import exception_handler
@@ -37,7 +38,7 @@ def _get_invalid_params(
     else:
         params.append(
             {
-                "name": parent_key or cast(str, api_settings.NON_FIELD_ERRORS_KEY),
+                "name": parent_key or api_settings.NON_FIELD_ERRORS_KEY,
                 "reason": str(error_data),
             }
         )
@@ -55,7 +56,9 @@ def problem_detail_exception_handler(
         response.status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
 
     request = context.get("request")
-    request_id = request.META.get("HTTP_X_REQUEST_ID") if request else None
+    request_id = (
+        request.META.get("HTTP_X_REQUEST_ID") if isinstance(request, Request) else None
+    )
 
     if response is None:
         logger.error("Необработанное исключение API: %s", str(exc), exc_info=True)

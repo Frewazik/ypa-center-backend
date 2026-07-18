@@ -48,9 +48,8 @@ class OTPRequestView(APIView):
         try:
             request_otp(email)
         except OTPCooldownError as exc:
-            # ПОЧЕМУ: Мы бросаем (raise) встроенное исключение DRF
-            # Вьюха падает. DRF ловит падение и передает его в твой problem_detail_exception_handler
-            # Обработчик сам собирает RFC 9457 JSON и сам проставляет HTTP-заголовки
+            # ПОЧЕМУ: Throttled уходит в problem_detail_exception_handler,
+            # который собирает RFC 9457 тело и заголовок Retry-After
             raise exceptions.Throttled(
                 wait=exc.retry_after, detail="Повторный запрос возможен позже."
             )
@@ -66,9 +65,6 @@ class OTPRequestView(APIView):
 
 
 class OTPVerifyView(APIView):
-    # ПОЧЕМУ: ловим разные ошибки сервиса и бросаем один 401 AuthenticationFailed,
-    # чтобы закрыть вектор энумерации email
-
     permission_classes = [AllowAny]
     throttle_classes = [OTPVerifyPerIPThrottle]
 
@@ -101,11 +97,14 @@ class OTPVerifyView(APIView):
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
         except (OTPNotFoundError, OTPInvalidError, OTPExpiredError):
-            # ПОЧЕМУ: ловим разные ошибки сервиса и бросаем один 401 AuthenticationFailed,
+            # ПОЧЕМУ: разные причины отказа схлопываются в один 401,
             # чтобы закрыть вектор энумерации email
             return Response(
                 {"code": "OTP_INVALID", "detail": "Неверный или истёкший код."},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        return Response(tokens, status=status.HTTP_200_OK)
+        return Response(
+            {"access": tokens.access, "refresh": tokens.refresh},
+            status=status.HTTP_200_OK,
+        )

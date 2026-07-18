@@ -42,6 +42,8 @@ class SubscriptionPlan(models.Model):
     # ПОЧЕМУ: деление price на slots_count дает плавающую копейку;
     # нужна строгая база для возврата на депозит
     base_session_price = models.IntegerField("Базовая цена занятия, в копейках")
+    is_unlimited = models.BooleanField("Безлимит", default=False)
+    is_active = models.BooleanField("Активен", default=True)
 
     class Meta:
         verbose_name = "Тарифный план"
@@ -49,6 +51,12 @@ class SubscriptionPlan(models.Model):
 
     def __str__(self) -> str:
         return self.name
+
+    @property
+    def price_per_session(self) -> int | None:
+        if self.is_unlimited or not self.slots_count:
+            return None
+        return round(self.price / self.slots_count)
 
 
 class Subscription(models.Model):
@@ -170,6 +178,12 @@ class Transaction(models.Model):
     )
     # ПОЧЕМУ: вынесено из metadata в отдельную колонку, поиск должников по JSONB даст Seq Scan
     requires_compensation = models.BooleanField("Требуется возврат", default=False)
+    # ПОЧЕМУ: lease-резервация возврата (claim check) — параллельный тик
+    # процессора компенсаций не должен отправить второй create_refund;
+    # TTL вместо вечного флага, чтобы возврат упавшего воркера не завис навсегда
+    compensation_claimed_until = models.DateTimeField(
+        "Возврат зарезервирован до", null=True, blank=True
+    )
     created_at = models.DateTimeField("Создана", auto_now_add=True)
 
     class Meta:

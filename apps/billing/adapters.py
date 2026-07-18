@@ -90,7 +90,10 @@ class YookassaSettings(BaseSettings):
 
 class YookassaHttpGateway:
     def __init__(self, settings: YookassaSettings | None = None) -> None:
-        self._settings = settings if settings is not None else YookassaSettings()
+        # ПОЧЕМУ ignore: shop_id/secret_key заполняет pydantic-settings из env
+        self._settings = (
+            settings if settings is not None else YookassaSettings()  # type: ignore[call-arg]
+        )
 
     def get_payment(self, payment_id: str) -> PaymentInfo:
         if not _PAYMENT_ID_PATTERN.match(payment_id):

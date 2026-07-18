@@ -43,7 +43,9 @@ class Settings(BaseSettings):
     EMAIL_USE_TLS: bool = False
 
 
-_env = Settings()
+# ПОЧЕМУ ignore: обязательные поля заполняет pydantic-settings из env/.env,
+# mypy без pydantic-плагина видит их как незаполненные аргументы конструктора
+_env = Settings()  # type: ignore[call-arg]
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -75,6 +77,11 @@ INSTALLED_APPS = [
     "apps.schedule.apps.ScheduleConfig",
     "apps.billing",
     "apps.public_forms",
+    "apps.events.apps.EventsConfig",
+    "apps.content.apps.ContentConfig",
+    "apps.public_api.apps.PublicApiConfig",
+    "apps.me.apps.MeConfig",
+    "apps.journal.apps.JournalConfig",
 ]
 
 MIDDLEWARE = [
@@ -158,13 +165,11 @@ REST_FRAMEWORK = {
 
 SPECTACULAR_SETTINGS = {
     "TITLE": "Улица Радости API",
-    "DESCRIPTION": "Детский центр развития — спецификация контрактов ядра.",
+    "DESCRIPTION": "Детский центр развития - спецификация контрактов ядра.",
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
     "COMPONENT_SPLIT_REQUEST": True,
 }
-
-TASKIQ_BROKER_URL = str(_env.REDIS_URL)
 
 if _env.AWS_STORAGE_BUCKET_NAME:
     STORAGES = {
@@ -210,12 +215,30 @@ AUTH_USER_MODEL = "users.Parent"
 
 CAPTCHA_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 CAPTCHA_SECRET_KEY = "dummy-secret-key"
+# ПОЧЕМУ: public_forms читает этот таймаут для httpx; без него проверка
+# капчи падала бы в AttributeError на первом же запросе
+EXTERNAL_HTTP_TIMEOUT_SECONDS = 5.0
 
 TELEGRAM_BOT_TOKEN = "dummy-bot-token"
 TELEGRAM_MANAGER_CHAT_ID = "dummy-chat-id"
 
 UNFOLD = {
-    "SITE_TITLE": "Улица Радости — админка",
+    "SITE_TITLE": "Улица Радости - админка",
     "SITE_HEADER": "Улица Радости",
     "DASHBOARD_CALLBACK": "apps.core.dashboard.dashboard_callback",
+    "COLORS": {
+        "primary": {
+            "50": "240 253 244",
+            "100": "220 252 231",
+            "200": "187 247 208",
+            "300": "134 239 172",
+            "400": "74 222 128",
+            "500": "34 197 94",
+            "600": "22 163 74",
+            "700": "21 128 61",
+            "800": "22 101 52",
+            "900": "20 83 45",
+            "950": "5 46 22",
+        },
+    },
 }

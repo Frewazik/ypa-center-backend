@@ -12,6 +12,18 @@ dependencies = [
     "drf-spectacular>=0.30.0",
     "httpx>=0.28.1",
     "whitenoise>=6.12.0",
+    "django>=5.1,<6.1",
+    "djangorestframework>=3.15.2",
+    "djangorestframework-simplejwt>=5.4.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "taskiq>=0.11.0",
+    "taskiq-redis>=1.0.0",
+    "redis>=5.2.0",
+    "django-storages[s3]>=1.14.4",
+    "boto3>=1.35.0",
+    "psycopg[binary]>=3.2.0",
+    "django-cors-headers>=4.6.0",
 ]
 
 [tool.mypy]
@@ -28,9 +40,35 @@ plugins = ["mypy_django_plugin.main"]
 module = "phonenumber_field.*"
 ignore_missing_imports = true
 
+# ПОЧЕМУ: маска apps.*.tests не захватывает подмодули (test_billing и т.д.)
+# strict-режим на Factory Boy без стабов даёт сотни ложных ошибок
 [[tool.mypy.overrides]]
-module = ["apps.*.tests", "apps.*.factories"]
+module = [
+    "apps.*.tests",
+    "apps.*.tests.*",
+    "apps.*.factories",
+    "apps.*.migrations.*",
+]
 ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = ["adrf.*", "ipware.*", "simple_history.*", "unfold.*"]
+ignore_missing_imports = true
+
+
+[[tool.mypy.overrides]]
+module = "apps.*.admin"
+disallow_subclassing_any = false
+disallow_untyped_decorators = false
+warn_return_any = false
+
+[[tool.mypy.overrides]]
+module = "apps.*.serializers"
+disallow_any_generics = false
+
+[[tool.mypy.overrides]]
+module = "apps.public_forms.views"
+disallow_subclassing_any = false
 
 [[tool.mypy.overrides]]
 module = "config.urls"
@@ -42,5 +80,11 @@ django_settings_module = "config.settings"
 [dependency-groups]
 dev = [
     "pytest-asyncio>=1.4.0",
+    "pytest-django>=4.9.0",
+    "factory-boy>=3.3.1",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "django-stubs[compatible-mypy]>=5.1.1",
+    "djangorestframework-stubs[compatible-mypy]>=3.15.1",
 ]
 

@@ -45,7 +45,20 @@ class FreezeSubscriptionActionForm(forms.Form):
 
 @admin.register(SubscriptionPlan)
 class SubscriptionPlanAdmin(ModelAdmin):
-    list_display = ("id", "name", "slots_count", "price")
+    # ПОЧЕМУ: менять цену тарифа безопасно — активные абонементы считаются
+    # по зафиксированному Subscription.purchase_price, витрина инвалидируется
+    # сигналом public_api мгновенно
+    list_display = (
+        "id",
+        "name",
+        "slots_count",
+        "price",
+        "base_session_price",
+        "is_unlimited",
+        "is_active",
+    )
+    list_editable = ("price", "base_session_price", "is_active")
+    list_filter = ("is_active", "is_unlimited")
     search_fields = ("name",)
     ordering = ("id",)
 
@@ -159,6 +172,17 @@ class AttendanceAdmin(ModelAdmin):
     search_fields = ("enrollment__student__full_name",)
     readonly_fields = ("token_debited", "created_at")
     actions_row = ("row_mark_attended", "row_mark_absent_ok", "row_mark_absent_err")
+
+    def get_queryset(self, request: HttpRequest) -> QuerySet[Attendance]:
+        # ПОЧЕМУ: роль «Учитель» видит посещаемость только своих групп;
+        # суперюзер (teacher_profile отсутствует) видит всё
+        queryset = super().get_queryset(request)
+        if request.user.is_superuser:
+            return queryset
+        teacher = getattr(request.user, "teacher_profile", None)
+        if teacher is None:
+            return queryset
+        return queryset.filter(enrollment__schedule__teacher=teacher)
 
     @admin.display(description="Ребёнок", ordering="enrollment__student__full_name")
     def student_name(self, obj: Attendance) -> str:

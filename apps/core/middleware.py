@@ -13,7 +13,6 @@ class RequestIDMiddleware:
     def __call__(self, request: HttpRequest) -> HttpResponse:
         request_id = request.META.get("HTTP_X_REQUEST_ID") or uuid.uuid4().hex
 
-        # Записываем в META для совместимости с DRF и сторонними библиотеками
         request.META["HTTP_X_REQUEST_ID"] = request_id
 
         # FIXME: Техдолг. Для production-ready логирования нужно биндить request_id

@@ -119,6 +119,15 @@ class Student(models.Model):
         verbose_name = "Ребёнок"
         verbose_name_plural = "Дети"
         ordering = ["full_name"]
+        constraints = [
+            # ПОЧЕМУ: ловит дабл-сабмит формы. Близнецов различает дата
+            # рождения + разные имена; полный тёзка с той же датой у одного
+            # родителя в реальности не встречается
+            models.UniqueConstraint(
+                fields=("parent", "full_name", "dob"),
+                name="uq_student_per_parent_name_dob",
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.full_name
@@ -168,6 +177,10 @@ class TeacherProfile(models.Model):
         related_name="teacher_profile",
     )
     middle_name = models.CharField("Отчество", max_length=100, blank=True)
+    photo_url = models.URLField("Фото (URL)", max_length=500, blank=True)
+    position = models.CharField("Должность на витрине", max_length=150, blank=True)
+    quote = models.CharField("Цитата", max_length=255, blank=True)
+    bio = models.TextField("О преподавателе", blank=True)
 
     class Meta:
         db_table = "teacher_profile"

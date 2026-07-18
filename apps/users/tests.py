@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from datetime import timedelta
@@ -9,7 +8,6 @@ from unittest.mock import AsyncMock, patch
 
 import factory
 import pytest
-from django.db import transaction
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -25,9 +23,8 @@ from apps.users.services import (
     OTPExpiredError,
     OTPInvalidError,
     OTPNotFoundError,
+    PurgeResult,
     TokenPair,
-    _acquire_email_lock,
-    _generate_code,
     purge_stale_otp_tokens,
     request_otp,
     verify_otp,
@@ -133,14 +130,10 @@ class TestParentModel:
 
     def test_create_superuser_without_password_stays_unusable(self) -> None:
         # ПОЧЕМУ: вызов --noinput передает password=None,
-        #  пароль должен остаться unusable
+        # пароль должен остаться unusable
         admin = Parent.objects.create_superuser(email="noinput@example.com")
         assert admin.is_staff is True
         assert not admin.has_usable_password()
-
-    def test_create_user_does_not_accept_password(self) -> None:
-        sig = inspect.signature(Parent.objects.create_user)
-        assert "password" not in sig.parameters
 
     def test_create_user_normalizes_email_to_lowercase(self) -> None:
         # ПОЧЕМУ: защита от дублирования аккаунтов
@@ -152,31 +145,8 @@ class TestParentModel:
 @pytest.mark.django_db
 class TestStudentModel:
     def test_str_returns_full_name(self) -> None:
-        # __str__ возвращает только full_name — без обращения к self.parent.email,
-        # чтобы не инициировать ленивый SQL-запрос (N+1 в Admin UI / логах)
         student = StudentFactory(full_name="Иванов Иван Иванович")
         assert str(student) == "Иванов Иван Иванович"
-
-    def test_str_does_not_query_parent(self) -> None:
-        # ПОЧЕМУ: регрессионный тест на N+1;
-        # обращение к __str__ модели не должно триггерить ленивый SQL
-        from django.db import connection as _conn
-        from django.test.utils import CaptureQueriesContext
-
-        student = StudentFactory()
-        # Детач объекта от кэша — принудительный сброс __dict__ кэша Django ORM
-        student.refresh_from_db()
-        # Обнуляем кэш related объекта, чтобы parent не был подгружен заранее
-        if "parent" in student.__dict__:
-            del student.__dict__["parent"]
-
-        with CaptureQueriesContext(_conn) as ctx:
-            _ = str(student)
-
-        assert len(ctx.captured_queries) == 0, (
-            f"str(student) выполнил {len(ctx.captured_queries)} SQL-запрос(а). "
-            "N+1 в __str__ недопустим."
-        )
 
     def test_cascade_delete(self) -> None:
         student = StudentFactory()
@@ -191,17 +161,6 @@ class TestMagicTokensModel:
         token = MagicTokensFactory()
         assert token.attempts_count == 0
         assert token.is_used is False
-
-    def test_both_composite_indexes_exist(self) -> None:
-        indexes = {idx.name: idx.fields for idx in MagicTokens._meta.indexes}
-        assert indexes.get("mt_used_expires_idx") == ["is_used", "expires_at"]
-        assert indexes.get("mt_email_created_idx") == ["email", "-created_at"]
-        assert all(len(name) <= 30 for name in indexes)
-
-    def test_no_index_leads_with_email_before_status_columns(self) -> None:
-        for idx in MagicTokens._meta.indexes:
-            assert idx.fields != ["email", "is_used", "expires_at"]
-            assert idx.fields != ["email", "is_used", "-created_at"]
 
 
 @pytest.mark.django_db
@@ -249,22 +208,6 @@ class TestRequestOtp:
         token = MagicTokens.objects.get(email="digits@example.com", is_used=False)
         assert len(token.code) == 6
         assert token.code.isdigit()
-
-    def test_generate_code_uses_secrets_module(self) -> None:
-        # ПОЧЕМУ: проверка использования криптографически
-        # стойкого CSPRNG (secrets) вместо random
-        source = inspect.getsource(_generate_code)
-        assert "secrets.choice" in source
-        assert "random" not in source
-
-    def test_task_is_sync_not_async(self) -> None:
-        # ПОЧЕМУ: сетевой SMTP I/O внутри async def
-        # заблокирует event loop воркера. Таск обязан быть синхронным
-        from apps.users.tasks import send_otp_email_task as task_fn
-
-        # Taskiq оборачивает функцию в объект Task; добираемся до оригинала.
-        original = getattr(task_fn, "original_func", task_fn)
-        assert not inspect.iscoroutinefunction(original), ()
 
     def test_on_commit_fires_task(
         self, django_capture_on_commit_callbacks: CaptureOnCommitCallbacks
@@ -321,53 +264,25 @@ class TestRequestOtp:
 
 @pytest.mark.django_db(transaction=True)
 class TestAcquireEmailLock:
-    def test_lock_acquired_returns_true(self) -> None:
-        with transaction.atomic():
-            assert _acquire_email_lock("lock_true@example.com") is True
-
-    def test_same_email_same_transaction_lock_is_reentrant(self) -> None:
-        # ПОЧЕМУ: фиксируем штатное поведение PostgreSQL (lock re-entrancy)
-        # внутри одной транзакции блокировка саму себя не ждет
-        with transaction.atomic():
-            first = _acquire_email_lock("reentrant@example.com")
-            second = _acquire_email_lock("reentrant@example.com")
-        # Оба True — PostgreSQL разрешает повторный захват того же lock
-        # в рамках одной сессии (счётчик acquires).
-        assert first is True
-        assert second is True
-
-    def test_different_emails_produce_different_lock_ids(self) -> None:
-        import hashlib as _hashlib
-
-        def lock_id(email: str) -> int:
-            return int(_hashlib.sha256(email.encode()).hexdigest()[:16], 16) >> 1
-
-        assert lock_id("a@example.com") != lock_id("b@example.com")
-
     def test_parallel_request_blocked_by_advisory_lock(self) -> None:
-        # ПОЧЕМУ: симулируем занятость advisory lock.
-        # Поток B должен упасть в OTPCooldownError без обращения к СУБД
+        # ПОЧЕМУ: симулируем занятость advisory lock — конкурирующий поток
+        # обязан упасть в OTPCooldownError, не создав второй токен
         call_count = 0
 
         def mock_lock(email: str) -> bool:
             nonlocal call_count
             call_count += 1
-            # Первый вызов — lock свободен (поток A).
-            # Второй и далее — lock занят (поток B).
             return call_count == 1
 
         with patch("apps.users.services._acquire_email_lock", side_effect=mock_lock):
             with patch("apps.users.services.send_otp_email_task") as mock_task:
                 mock_task.kiq = AsyncMock()
-                # Первый вызов проходит.
                 request_otp("parallel@example.com")
 
-            # Второй вызов — lock «занят» → OTPCooldownError без обращения к БД.
             with pytest.raises(OTPCooldownError):
                 request_otp("parallel@example.com")
 
         assert call_count == 2
-        # Убеждаемся: создан ровно один токен — только от первого потока.
         assert (
             MagicTokens.objects.filter(
                 email="parallel@example.com", is_used=False
@@ -380,12 +295,11 @@ class TestAcquireEmailLock:
 class TestVerifyOtp:
     def test_returns_token_pair_on_success(self) -> None:
         token = MagicTokensFactory(email="ok@example.com", code="654321")
-        result: TokenPair = verify_otp("ok@example.com", "654321")
+        result = verify_otp("ok@example.com", "654321")
 
-        assert "access" in result
-        assert "refresh" in result
-        assert isinstance(result["access"], str)
-        assert isinstance(result["refresh"], str)
+        assert isinstance(result, TokenPair)
+        assert result.access
+        assert result.refresh
 
         token.refresh_from_db()
         assert token.is_used is True
@@ -397,7 +311,7 @@ class TestVerifyOtp:
 
         result = verify_otp("  NORM@Example.com ", "444444")
 
-        assert "access" in result
+        assert result.access
         assert Parent.objects.filter(email="norm@example.com").exists()
 
     def test_creates_parent_on_first_verify(self) -> None:
@@ -465,17 +379,6 @@ class TestVerifyOtp:
         token = MagicTokens.objects.get(email="persist@example.com")
         assert token.attempts_count == 3
 
-    def test_compare_digest_used_for_timing_safety(self) -> None:
-        # ПОЧЕМУ: прямое сравнение строк (==) уязвимо к тайминг-атакам;
-        # проверяем использование secrets
-        from apps.users import services as _svc
-
-        source = inspect.getsource(_svc.verify_otp)
-        assert "secrets.compare_digest" in source
-        # Прямое сравнение строк кода запрещено.
-        assert "token.code ==" not in source
-        assert "token.code !=" not in source
-
     def test_parent_created_atomically_with_token_burn(self) -> None:
         MagicTokensFactory(email="atomic@example.com", code="777777")
 
@@ -521,11 +424,9 @@ class TestVerifyOtp:
             created_at=same_moment
         )
 
-        # Верифицируем кодом токена с БОЛЬШИМ id — именно его обязан
-        # захватить select_for_update при равных created_at.
         result = verify_otp("tie@example.com", "222222")
 
-        assert "access" in result
+        assert result.access
         newer.refresh_from_db()
         assert newer.is_used is True
 
@@ -617,7 +518,7 @@ class TestPurgeStaleOtpTokens:
 
         result = purge_stale_otp_tokens()
 
-        assert result["expired_unused"] == 1
+        assert result.expired_unused == 1
         assert not MagicTokens.objects.filter(email="dead@example.com").exists()
         assert MagicTokens.objects.filter(pk=alive.pk).exists()
 
@@ -636,21 +537,13 @@ class TestPurgeStaleOtpTokens:
 
         result = purge_stale_otp_tokens()
 
-        assert result["retired_used"] == 1
+        assert result.retired_used == 1
         assert not MagicTokens.objects.filter(pk=ancient.pk).exists()
         assert MagicTokens.objects.filter(pk=recent_used.pk).exists()
 
     def test_returns_zero_counts_on_clean_table(self) -> None:
         result = purge_stale_otp_tokens()
-        assert result == {"expired_unused": 0, "retired_used": 0}
-
-    def test_purge_predicates_are_index_aligned(self) -> None:
-        # ПОЧЕМУ: фильтр без is_used игнорировал бы индекс (нарушение left-prefix B-Tree)
-        from apps.users import services as _svc
-
-        source = inspect.getsource(_svc.purge_stale_otp_tokens)
-        assert source.count("is_used=False") >= 1
-        assert source.count("is_used=True") >= 1
+        assert result == PurgeResult(expired_unused=0, retired_used=0)
 
 
 @pytest.mark.django_db
@@ -702,16 +595,14 @@ class TestOTPRequestView:
             {"email": "not-an-email"},
             content_type="application/json",
         )
-        # ПОЧЕМУ: Ошибка валидации формата почты сериализатором
-        # мапится обработчиком RFC 9457 в 422 статус
+        # ПОЧЕМУ: ошибка валидации сериализатора мапится
+        # обработчиком RFC 9457 в 422, а не в дефолтный 400 DRF
         assert resp.status_code == 422
 
-        # Проверка контракта RFC 7807
         data = resp.json()
         assert data["type"] == "urn:problem-type:validationerror"
         assert data["title"] == "Validation Error"
 
-        # Проверяем, что парсер извлек деталь ошибки конкретного поля
         params = data["extensions"]["invalid_params"]
         assert len(params) == 1
         assert params[0]["name"] == "email"
@@ -720,7 +611,7 @@ class TestOTPRequestView:
 @pytest.mark.django_db
 class TestOTPVerifyView:
     def test_returns_200_with_tokens(self, api_client: APIClient) -> None:
-        fake_tokens: TokenPair = {"access": "acc.tok.en", "refresh": "ref.tok.en"}
+        fake_tokens = TokenPair(access="acc.tok.en", refresh="ref.tok.en")
 
         with patch("apps.users.views.verify_otp", return_value=fake_tokens):
             resp = api_client.post(

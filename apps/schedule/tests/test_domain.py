@@ -1,5 +1,3 @@
-"""Тесты домена «Расписание»: проекция сетки, маски, вместимость, N+1, API."""
-
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -38,8 +36,8 @@ pytestmark = pytest.mark.django_db
 MONDAY = date(2026, 7, 6)  # понедельник
 WEDNESDAY = MONDAY + timedelta(days=2)
 
-# Сервис масок запрещает ретро-даты, поэтому его тесты живут на ближайшем
-# БУДУЩЕМ понедельнике — иначе фиксированная дата протухнет и уронит CI.
+# ПОЧЕМУ: маски запрещают создание на прошедшие даты
+# используем плавающий будущий понедельник для защиты CI от падений со временем
 FUTURE_MONDAY = date.today() + timedelta(days=7 - date.today().weekday())
 FUTURE_WEDNESDAY = FUTURE_MONDAY + timedelta(days=2)
 
@@ -79,9 +77,7 @@ def test_build_week_grid_projects_active_schedules_onto_dates() -> None:
 
 def test_cancellation_mask_flags_slot_without_removing_it() -> None:
     schedule = _schedule_on(0, time(16), time(17))
-    ScheduleMaskFactory(
-        schedule=schedule, target_date=MONDAY
-    )  # тип по умолчанию — отмена
+    ScheduleMaskFactory(schedule=schedule, target_date=MONDAY)
 
     grid = build_week_grid(MONDAY)
 
@@ -174,7 +170,7 @@ def test_week_start_normalized_to_monday() -> None:
     grid = build_week_grid(WEDNESDAY)
 
     assert grid[0].schedule_id == schedule.pk
-    assert grid[0].date == MONDAY  # сетка недели, содержащей среду
+    assert grid[0].date == MONDAY
 
 
 def test_empty_schedule_returns_early_with_single_query(
@@ -217,13 +213,13 @@ def test_public_schedule_endpoint_matches_contract_shape() -> None:
     _schedule_on(0, time(16), time(17))
     request = APIRequestFactory().get(
         "/api/v1/public/schedule",
-        {"week_start": "2026-07-08"},  # среда
+        {"week_start": "2026-07-08"},
     )
 
     response = PublicScheduleView.as_view()(request)
 
     assert response.status_code == status.HTTP_200_OK
-    assert response.data["week_start"] == "2026-07-06"  # нормализована к понедельнику
+    assert response.data["week_start"] == "2026-07-06"
     assert response.data["week_end"] == "2026-07-12"
     slot = response.data["slots"][0]
     assert set(slot) == {
@@ -256,14 +252,12 @@ def test_public_schedule_rejects_malformed_week_start() -> None:
     response = client.get(
         "/api/v1/public/schedule/", {"week_start": "08.07.2026"}, format="json"
     )
-    # 422 VALIDATION_ERROR по контракту §0.3: маппинг DRF ValidationError → 422
-    # выполняет глобальный обработчик RFC 9457 в apps.core.exceptions.
     assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
 
 
-# --- Триггеры синхронизации денормализованных колонок (0003) ----------------
-# save() у Schedule удалён осознанно: гарантия целостности живёт в БД и обязана
-# переживать bulk-операции — именно их и проверяем.
+# ПОЧЕМУ: метод save() у модели Schedule удален осознанно
+# гарантия консистентности денормализованных колонок делегирована триггерам БД
+# тесты проверяют их срабатывание при bulk-операциях и QuerySet.update()
 
 
 def test_trigger_fills_denormalized_columns_on_bulk_create() -> None:
@@ -286,7 +280,6 @@ def test_trigger_resyncs_columns_on_queryset_update_of_time_slot() -> None:
     schedule = _schedule_on(0, time(16), time(17))
     other_slot = TimeSlotFactory(day_of_week=4, start_time=time(11), end_time=time(12))
 
-    # QuerySet.update() идёт мимо Model.save() — ловит именно триггер.
     Schedule.objects.filter(pk=schedule.pk).update(time_slot=other_slot)
 
     schedule.refresh_from_db()
@@ -300,7 +293,7 @@ def test_trigger_ignores_direct_writes_to_denormalized_columns() -> None:
     Schedule.objects.filter(pk=schedule.pk).update(day_of_week=6)
 
     schedule.refresh_from_db()
-    assert schedule.day_of_week == 0  # триггер перетёр мусор источником правды
+    assert schedule.day_of_week == 0
 
 
 def test_time_slot_change_propagates_to_schedules() -> None:
@@ -313,9 +306,6 @@ def test_time_slot_change_propagates_to_schedules() -> None:
     schedule.refresh_from_db()
     assert schedule.day_of_week == 2
     assert (schedule.start_time, schedule.end_time) == (time(8), time(9))
-
-
-# --- Сервис create_schedule_mask ---------------------------------------------
 
 
 def test_create_schedule_mask_creates_valid_cancellation() -> None:
@@ -360,7 +350,7 @@ def test_create_schedule_mask_rejects_cancellation_with_overrides() -> None:
 
 
 def test_create_schedule_mask_rejects_date_on_wrong_weekday() -> None:
-    schedule = _schedule_on(0, time(16), time(17))  # группа по понедельникам
+    schedule = _schedule_on(0, time(16), time(17))
 
     with pytest.raises(ValidationError) as excinfo:
         create_schedule_mask(
@@ -415,9 +405,6 @@ def test_create_schedule_mask_rejects_duplicate_for_same_date() -> None:
         )
 
 
-# --- Коллизии переносов: запрет двойного бронирования на дату ---------------
-
-
 def _reschedule_into(
     schedule: Schedule,
     *,
@@ -425,7 +412,6 @@ def _reschedule_into(
     new_room: Room | None = None,
     new_teacher: TeacherProfile | None = None,
 ) -> ScheduleMask:
-    """Перенос группы на понедельник 16:00–17:00 недели её ``target_date``."""
     return create_schedule_mask(
         schedule=schedule,
         target_date=(
@@ -444,7 +430,7 @@ def _reschedule_into(
 
 def test_reschedule_rejects_room_occupied_by_regular_schedule() -> None:
     room = RoomFactory()
-    _schedule_on(0, time(16), time(17), room=room)  # понедельник, кабинет занят
+    _schedule_on(0, time(16), time(17), room=room)
     tuesday_group = _schedule_on(1, time(16), time(17))
 
     with pytest.raises(ValidationError) as excinfo:
@@ -482,7 +468,7 @@ def test_reschedule_allowed_into_room_freed_by_cancellation() -> None:
 def test_reschedule_allowed_when_occupant_rescheduled_away() -> None:
     room = RoomFactory()
     monday_group = _schedule_on(0, time(16), time(17), room=room)
-    create_schedule_mask(  # хозяин кабинета уехал на 18:00 — пересечения нет
+    create_schedule_mask(
         schedule=monday_group,
         target_date=FUTURE_MONDAY,
         mask_type=MaskType.RESCHEDULE,
@@ -499,7 +485,7 @@ def test_reschedule_allowed_when_occupant_rescheduled_away() -> None:
 def test_reschedule_rejects_room_taken_by_another_masks_landing() -> None:
     room = RoomFactory()
     tuesday_group = _schedule_on(1, time(16), time(17))
-    _reschedule_into(tuesday_group, new_room=room)  # первый перенос занял кабинет
+    _reschedule_into(tuesday_group, new_room=room)
     thursday_group = _schedule_on(3, time(16), time(17))
 
     with pytest.raises(ValidationError) as excinfo:
@@ -510,9 +496,8 @@ def test_reschedule_rejects_room_taken_by_another_masks_landing() -> None:
 
 def test_reschedule_checks_occupancy_on_landing_date_not_weekday() -> None:
     room = RoomFactory()
-    # Регулярная сетка повторяется еженедельно: без отмены кабинет был бы занят
-    # хозяином и на следующей неделе. Отмена освобождает ТОЛЬКО конкретную дату
-    # приземления — именно на ней и проверяется занятость.
+    # ПОЧЕМУ: регулярная сетка бесконечна, отмена освобождает строго одну дату
+    # проверяем, что перенос валидирует коллизии именно на целевой день приземления
     monday_owner = _schedule_on(0, time(16), time(17), room=room)
     create_schedule_mask(
         schedule=monday_owner,

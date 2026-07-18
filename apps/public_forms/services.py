@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Final, TypedDict
+from dataclasses import dataclass
+from typing import Final
 
 import httpx
 from asgiref.sync import async_to_sync, sync_to_async
@@ -16,25 +17,23 @@ logger = logging.getLogger(__name__)
 
 HONEYPOT_FIELD: Final[str] = "website_url"
 
-_http_client: httpx.AsyncClient | None = None
-
 
 def get_http_client() -> httpx.AsyncClient:
-    # ПОЧЕМУ: общий клиент переиспользует пул соединений вместо
-    # TCP+TLS handshake на каждый запрос
-    global _http_client
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=settings.EXTERNAL_HTTP_TIMEOUT_SECONDS)
-    return _http_client
+    # ПОЧЕМУ: клиент живёт в рамках одного вызова — AsyncClient привязан
+    # к event loop'у момента создания; глобальный инстанс под WSGI
+    # (loop-на-запрос) ловит "attached to a different loop"
+    return httpx.AsyncClient(timeout=settings.EXTERNAL_HTTP_TIMEOUT_SECONDS)
 
 
-class CallbackSubmission(TypedDict):
+@dataclass(frozen=True, slots=True)
+class CallbackSubmission:
     name: str
     phone: str
     preferred_time_window: str
 
 
-class FeedbackSubmission(TypedDict):
+@dataclass(frozen=True, slots=True)
+class FeedbackSubmission:
     name: str
     email: str
     message: str
@@ -44,14 +43,15 @@ async def verify_captcha_token(token: str, remote_ip: str | None) -> bool:
     if not token:
         return False
     try:
-        response = await get_http_client().post(
-            settings.CAPTCHA_VERIFY_URL,
-            data={
-                "secret": settings.CAPTCHA_SECRET_KEY,
-                "response": token,
-                "remoteip": remote_ip or "",
-            },
-        )
+        async with get_http_client() as client:
+            response = await client.post(
+                settings.CAPTCHA_VERIFY_URL,
+                data={
+                    "secret": settings.CAPTCHA_SECRET_KEY,
+                    "response": token,
+                    "remoteip": remote_ip or "",
+                },
+            )
     except httpx.HTTPError:
         logger.warning("Провайдер капчи недоступен, токен отклонён")
         return False
@@ -82,9 +82,9 @@ def _create_callback(data: CallbackSubmission) -> CallbackRequest:
     # мгновенно, до завершения функции
     with transaction.atomic():
         instance = CallbackRequest.objects.create(
-            name=data["name"],
-            phone=data["phone"],
-            preferred_time_window=data["preferred_time_window"],
+            name=data.name,
+            phone=data.phone,
+            preferred_time_window=data.preferred_time_window,
         )
         _schedule_manager_notification(instance.pk, "callback")
     return instance
@@ -93,15 +93,15 @@ def _create_callback(data: CallbackSubmission) -> CallbackRequest:
 def _create_feedback(data: FeedbackSubmission) -> FeedbackRequest:
     with transaction.atomic():
         instance = FeedbackRequest.objects.create(
-            name=data["name"],
-            email=data["email"],
-            message=data["message"],
+            name=data.name,
+            email=data.email,
+            message=data.message,
         )
         _schedule_manager_notification(instance.pk, "feedback")
     return instance
 
 
-async def _passes_spam_gate(raw_data: dict[str, Any], remote_ip: str | None) -> bool:
+async def _passes_spam_gate(raw_data: dict[str, object], remote_ip: str | None) -> bool:
     if raw_data.get(HONEYPOT_FIELD):
         # ПОЧЕМУ: дропаем тихо — вьюха отдаст обычный успех,
         # и бот не узнает про ловушку
@@ -115,26 +115,26 @@ async def _passes_spam_gate(raw_data: dict[str, Any], remote_ip: str | None) -> 
 
 
 async def process_callback_submission(
-    raw_data: dict[str, Any], remote_ip: str | None
+    raw_data: dict[str, object], remote_ip: str | None
 ) -> CallbackRequest | None:
     if not await _passes_spam_gate(raw_data, remote_ip):
         return None
-    payload: CallbackSubmission = {
-        "name": raw_data["name"],
-        "phone": str(raw_data["phone"]),
-        "preferred_time_window": raw_data["preferred_time_window"],
-    }
+    payload = CallbackSubmission(
+        name=str(raw_data["name"]),
+        phone=str(raw_data["phone"]),
+        preferred_time_window=str(raw_data["preferred_time_window"]),
+    )
     return await sync_to_async(_create_callback)(payload)
 
 
 async def process_feedback_submission(
-    raw_data: dict[str, Any], remote_ip: str | None
+    raw_data: dict[str, object], remote_ip: str | None
 ) -> FeedbackRequest | None:
     if not await _passes_spam_gate(raw_data, remote_ip):
         return None
-    payload: FeedbackSubmission = {
-        "name": raw_data.get("name", ""),
-        "email": raw_data["email"],
-        "message": raw_data["message"],
-    }
+    payload = FeedbackSubmission(
+        name=str(raw_data.get("name") or ""),
+        email=str(raw_data["email"]),
+        message=str(raw_data["message"]),
+    )
     return await sync_to_async(_create_feedback)(payload)

@@ -73,7 +73,28 @@ services:
       redis:
         condition: service_healthy
     command: >
-      taskiq worker taskiq_config:broker --workers 2 --log-level INFO
+      taskiq worker config.worker:broker --workers 2 --log-level INFO
+
+  taskiq-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-yra}
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: local
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      taskiq scheduler config.worker:scheduler --log-level INFO
 
 volumes:
   postgres_data:

@@ -35,7 +35,6 @@ def _active_subscription(**kwargs):
 
 
 def _attended_attendance():
-    """Отметка ATTENDED со списанной фишкой и валидной цепочкой enrollment→slot."""
     attendance = AttendanceFactory(
         status=AttendanceStatus.ATTENDED,
         token_debited=True,
@@ -70,6 +69,28 @@ class TestBulkFreezeSubscriptions:
         assert result.errors == []
         assert first.expires_at == old_expiry + datetime.timedelta(days=7)
         assert second.expires_at == old_expiry + datetime.timedelta(days=7)
+
+    def test_locking_query_orders_rows_deterministically(self) -> None:
+        # ПОЧЕМУ: multi-row FOR UPDATE без ORDER BY лочит строки в порядке
+        # плана исполнения — два пересекающихся пакета заморозки получают
+        # ABBA-дедлок; фиксируем SQL-контракт захвата
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        first = _active_subscription()
+        second = _active_subscription()
+
+        with CaptureQueriesContext(connection) as ctx:
+            bulk_freeze_subscriptions(
+                subscription_ids=[second.pk, first.pk],
+                start_date=FREEZE_START,
+                end_date=FREEZE_END,
+                reason="Проверка порядка блокировок",
+            )
+
+        locking = [q["sql"] for q in ctx.captured_queries if "FOR UPDATE" in q["sql"]]
+        assert locking
+        assert all("ORDER BY" in sql for sql in locking)
 
     def test_skips_non_active_and_reports_error(self) -> None:
         active = _active_subscription()
