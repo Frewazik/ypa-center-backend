@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
 from typing import Protocol, runtime_checkable
 
@@ -16,6 +17,15 @@ class UnknownSlotError(Exception):
         self.slot_id = slot_id
 
 
+@dataclass(frozen=True, slots=True)
+class SlotTrialInfo:
+    # ПОЧЕМУ: пробное тарифицируется ценой кружка, а лимит «1 пробное на
+    # ребёнка» действует на уровне кружка — обе величины принадлежат чужому
+    # домену и добываются только через порт
+    activity_id: int
+    price_kopecks: int
+
+
 @runtime_checkable
 class SchedulePort(Protocol):
     # !!!: Вызывается внутри транзакции под advisory-локами.
@@ -25,6 +35,8 @@ class SchedulePort(Protocol):
     def get_slot_capacity(self, slot_id: int) -> int: ...
 
     def get_next_lesson_date(self, slot_id: int, on_or_after: date) -> date: ...
+
+    def get_slot_trial_info(self, slot_id: int) -> SlotTrialInfo: ...
 
 
 class ScheduleIntegrationSettings(BaseSettings):

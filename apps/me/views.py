@@ -14,6 +14,7 @@ from apps.me.serializers import (
     ChildSerializer,
     ProfileSerializer,
     SubscriptionViewSerializer,
+    TrialViewSerializer,
     UpcomingItemSerializer,
 )
 from apps.me.services import (
@@ -22,6 +23,7 @@ from apps.me.services import (
     build_upcoming_feed,
     create_child,
     list_parent_subscriptions,
+    list_parent_trials,
 )
 from apps.users.models import Parent, Student
 
@@ -83,6 +85,17 @@ class SubscriptionListView(APIView):
     def get(self, request: Request) -> Response:
         views = list_parent_subscriptions(_current_parent(request))
         return Response(SubscriptionViewSerializer(views, many=True).data)
+
+
+@extend_schema(
+    operation_id="me_trials",
+    summary="Пробные занятия детей родителя",
+    responses=TrialViewSerializer(many=True),
+)
+class TrialListView(APIView):
+    def get(self, request: Request) -> Response:
+        views = list_parent_trials(_current_parent(request))
+        return Response(TrialViewSerializer(views, many=True).data)
 
 
 @extend_schema(

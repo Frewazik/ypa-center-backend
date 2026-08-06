@@ -12,6 +12,7 @@ from typing import Literal, Protocol
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+import httpx
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PaymentStatus = Literal["pending", "waiting_for_capture", "succeeded", "canceled"]
@@ -68,8 +69,27 @@ class RefundInfo:
     status: RefundStatus
 
 
+@dataclass(frozen=True)
+class CreatedPayment:
+    id: str
+    status: PaymentStatus
+    confirmation_url: str
+
+
 class PaymentGateway(Protocol):
     def get_payment(self, payment_id: str) -> PaymentInfo: ...
+
+    def create_payment(
+        self,
+        *,
+        amount_kopecks: int,
+        transaction_id: str,
+        idempotence_key: str,
+        description: str,
+    ) -> CreatedPayment:
+        # ПОЧЕМУ: metadata.transaction_id — единственная связь платежа
+        # провайдера с нашей транзакцией при верификации вебхука
+        ...
 
     def create_refund(
         self, payment_id: str, amount_kopecks: int, idempotence_key: str
@@ -86,14 +106,69 @@ class YookassaSettings(BaseSettings):
     secret_key: str
     api_base_url: str = "https://api.yookassa.ru/v3"
     timeout_seconds: float = 5.0
+    return_url: str = "http://localhost:3000/checkout/result"
 
 
 class YookassaHttpGateway:
-    def __init__(self, settings: YookassaSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: YookassaSettings | None = None,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
         # ПОЧЕМУ ignore: shop_id/secret_key заполняет pydantic-settings из env
         self._settings = (
             settings if settings is not None else YookassaSettings()  # type: ignore[call-arg]
         )
+        # ПОЧЕМУ transport: единственная легальная точка подмены HTTP в тестах
+        # (httpx.MockTransport) — мокается сетевая граница, а не наш код
+        self._transport = transport
+
+    def create_payment(
+        self,
+        *,
+        amount_kopecks: int,
+        transaction_id: str,
+        idempotence_key: str,
+        description: str,
+    ) -> CreatedPayment:
+        body = {
+            "amount": {
+                "value": _kopecks_to_value(amount_kopecks),
+                "currency": "RUB",
+            },
+            "capture": True,
+            "confirmation": {
+                "type": "redirect",
+                "return_url": self._settings.return_url,
+            },
+            "description": description,
+            "metadata": {"transaction_id": transaction_id},
+        }
+        try:
+            with httpx.Client(
+                timeout=self._settings.timeout_seconds,
+                transport=self._transport,
+            ) as client:
+                response = client.post(
+                    f"{self._settings.api_base_url}/payments",
+                    json=body,
+                    auth=(self._settings.shop_id, self._settings.secret_key),
+                    headers={"Idempotence-Key": idempotence_key},
+                )
+        except httpx.HTTPError as exc:
+            raise GatewayNetworkError(
+                f"Сбой соединения с ЮКассой при создании платежа: {exc}."
+            ) from exc
+
+        if response.status_code >= 500:
+            raise GatewayNetworkError(
+                f"ЮКасса ответила HTTP {response.status_code} на создание платежа."
+            )
+        if response.status_code >= 400:
+            raise GatewayContractError(
+                f"ЮКасса отвергла создание платежа: HTTP {response.status_code}."
+            )
+        return _parse_created_payment_body(transaction_id, response.content)
 
     def get_payment(self, payment_id: str) -> PaymentInfo:
         if not _PAYMENT_ID_PATTERN.match(payment_id):
@@ -248,6 +323,48 @@ def _classify_http_error(payment_id: str, exc: urlerror.HTTPError) -> GatewayErr
 
 def _kopecks_to_value(amount_kopecks: int) -> str:
     return f"{amount_kopecks // 100}.{amount_kopecks % 100:02d}"
+
+
+def _parse_created_payment_body(transaction_id: str, raw_body: bytes) -> CreatedPayment:
+    try:
+        data = json.loads(raw_body)
+    except ValueError as exc:
+        raise GatewayContractError(
+            f"Битый JSON в ответе на создание платежа (транзакция {transaction_id})."
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise GatewayContractError(
+            f"Неожиданная форма ответа на создание платежа "
+            f"(транзакция {transaction_id})."
+        )
+
+    payment_id = data.get("id")
+    status = data.get("status")
+    if not isinstance(payment_id, str) or not payment_id:
+        raise GatewayContractError(
+            f"Создание платежа (транзакция {transaction_id}): нет id."
+        )
+    if not isinstance(status, str) or status not in _KNOWN_STATUSES:
+        raise GatewayContractError(
+            f"Создание платежа {payment_id}: неизвестный статус {status!r}."
+        )
+
+    confirmation = data.get("confirmation")
+    confirmation_url = (
+        confirmation.get("confirmation_url") if isinstance(confirmation, dict) else None
+    )
+    if not isinstance(confirmation_url, str) or not confirmation_url:
+        raise GatewayContractError(
+            f"Создание платежа {payment_id}: нет confirmation_url."
+        )
+
+    verified_status: PaymentStatus = status  # type: ignore[assignment]  # сужение проверено членством
+    return CreatedPayment(
+        id=payment_id,
+        status=verified_status,
+        confirmation_url=confirmation_url,
+    )
 
 
 def _parse_refund_body(payment_id: str, raw_body: bytes) -> RefundInfo:

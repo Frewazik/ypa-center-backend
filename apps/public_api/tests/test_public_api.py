@@ -412,3 +412,54 @@ class TestTeacherShowcaseFields:
         assert card["position"] == "Педагог Кружка Мышления"
         assert card["quote"].startswith("Думать - это навык.")
         assert card["bio"].startswith("Выпускник ФМШ")
+
+
+class TestCatalogSeatsIgnoreTrials:
+    # !!!: карточка каталога отвечает на вопрос «насколько укомплектована
+    # группа». Разовый пробный визитёр её не гасит — иначе десяток пробных
+    # на разные недели вешал бы фантомный sold-out на живой кружок
+
+    def test_future_trials_do_not_reduce_free_seats(
+        self, api_client: APIClient
+    ) -> None:
+        activity = ActivityFactory()
+        group = ScheduleFactory(activity=activity, max_capacity=3)
+        for week in range(1, 6):
+            EnrollmentFactory(
+                schedule=group,
+                trial=True,
+                trial_date=timezone.localdate() + datetime.timedelta(days=7 * week),
+                is_active=True,
+            )
+
+        response = api_client.get(_detail_url(activity.pk))
+
+        (group_payload,) = response.json()["groups"]
+        assert group_payload["seats_free"] == 3
+
+    def test_regular_enrollments_still_reduce_free_seats(
+        self, api_client: APIClient
+    ) -> None:
+        activity = ActivityFactory()
+        group = ScheduleFactory(activity=activity, max_capacity=3)
+        EnrollmentFactory(schedule=group, is_active=True)
+
+        response = api_client.get(_detail_url(activity.pk))
+
+        (group_payload,) = response.json()["groups"]
+        assert group_payload["seats_free"] == 2
+
+    def test_stale_hold_does_not_hold_the_seat(self, api_client: APIClient) -> None:
+        # ПОЧЕМУ: витрина раньше считала любой HELD без проверки TTL —
+        # брошенная корзина месячной давности гасила место навсегда
+        activity = ActivityFactory()
+        group = ScheduleFactory(activity=activity, max_capacity=3)
+        stale = EnrollmentFactory(schedule=group, status="HELD")
+        type(stale).objects.filter(pk=stale.pk).update(
+            created_at=timezone.now() - datetime.timedelta(hours=2)
+        )
+
+        response = api_client.get(_detail_url(activity.pk))
+
+        (group_payload,) = response.json()["groups"]
+        assert group_payload["seats_free"] == 3

@@ -12,8 +12,10 @@ from rest_framework.exceptions import ValidationError
 from apps.billing.models import (
     Enrollment,
     EnrollmentStatus,
+    EnrollmentType,
     Subscription,
     SubscriptionStatus,
+    TransactionStatus,
 )
 from apps.events.models import SEAT_BLOCKING_STATUSES, EventRegistration
 from apps.schedule.models import MaskType, ScheduleMask
@@ -22,7 +24,7 @@ from apps.users.models import Parent, Student
 UPCOMING_DEFAULT_WEEKS: Final[int] = 4
 UPCOMING_MAX_WEEKS: Final[int] = 8
 
-UpcomingKind: TypeAlias = Literal["SUBSCRIPTION_SESSION", "EVENT"]
+UpcomingKind: TypeAlias = Literal["SUBSCRIPTION_SESSION", "TRIAL", "EVENT"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +51,21 @@ class SubscriptionView:
     start_date: datetime.date | None
     expires_at: datetime.datetime | None
     slots: list[SubscriptionSlotView]
+
+
+@dataclass(frozen=True, slots=True)
+class TrialView:
+    id: int
+    student_id: int
+    student_name: str
+    activity_name: str
+    group_name: str
+    trial_date: datetime.date
+    start_time: datetime.time
+    end_time: datetime.time
+    status: str
+    cost: int | None
+    created_at: datetime.datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +163,9 @@ def build_upcoming_feed(
     enrollments = list(
         Enrollment.objects.filter(
             student__parent=parent,
+            # ПОЧЕМУ: недельная проекция только для регулярных записей —
+            # пробное живёт на конкретной дате и добавляется отдельно
+            type=EnrollmentType.REGULAR,
             status=EnrollmentStatus.ENROLLED,
             schedule__is_active=True,
         )
@@ -190,16 +210,96 @@ def build_upcoming_feed(
                     group_name=schedule.group_name,
                     title=None,
                     source_type="subscription",
-                    source_id=enrollment.subscription_id,
+                    # Сужение Optional: выборка ограничена REGULAR, у которых
+                    # абонемент обязателен по ck_billing_enrollment_type_shape
+                    source_id=cast(int, enrollment.subscription_id),
                     is_rescheduled=is_rescheduled,
                 )
             )
 
+    items.extend(_upcoming_trial_items(parent, start=start, end=end, child_id=child_id))
     if child_id is None:
         items.extend(_upcoming_event_items(parent, start=start, end=end))
 
     items.sort(key=lambda item: (item.date, item.start_time))
     return items
+
+
+def _upcoming_trial_items(
+    parent: Parent,
+    *,
+    start: datetime.date,
+    end: datetime.date,
+    child_id: int | None,
+) -> list[UpcomingItem]:
+    # ПОЧЕМУ: только оплаченные (ENROLLED) — неоплаченная 15-минутная бронь
+    # HELD может испариться и не должна попадать в календарь родителя
+    trials = (
+        Enrollment.objects.filter(
+            student__parent=parent,
+            type=EnrollmentType.TRIAL,
+            status=EnrollmentStatus.ENROLLED,
+            trial_date__gte=start,
+            trial_date__lt=end,
+        )
+        .select_related("student", "schedule__activity")
+        .filter(**({"student_id": child_id} if child_id is not None else {}))
+    )
+    return [
+        UpcomingItem(
+            kind="TRIAL",
+            date=cast(datetime.date, trial.trial_date),
+            start_time=trial.schedule.start_time,
+            end_time=trial.schedule.end_time,
+            student_id=trial.student.pk,
+            student_name=trial.student.full_name,
+            activity_name=trial.schedule.activity.name,
+            group_name=trial.schedule.group_name,
+            title=None,
+            source_type="trial",
+            source_id=trial.pk,
+            is_rescheduled=False,
+        )
+        for trial in trials
+    ]
+
+
+def list_parent_trials(parent: Parent) -> list[TrialView]:
+    # ПОЧЕМУ: cost — снапшот из транзакции покупки, а не текущая цена кружка;
+    # прайс мог измениться после оформления
+    trials = (
+        Enrollment.objects.filter(
+            student__parent=parent,
+            type=EnrollmentType.TRIAL,
+        )
+        .exclude(status=EnrollmentStatus.CANCELED)
+        .select_related("student", "schedule__activity")
+        .prefetch_related("transactions")
+        .order_by("-trial_date", "-id")
+    )
+    views: list[TrialView] = []
+    for trial in trials:
+        cost: int | None = None
+        for tx in trial.transactions.all():
+            if tx.status in (TransactionStatus.PENDING, TransactionStatus.SUCCEEDED):
+                cost = tx.amount
+                break
+        views.append(
+            TrialView(
+                id=trial.pk,
+                student_id=trial.student.pk,
+                student_name=trial.student.full_name,
+                activity_name=trial.schedule.activity.name,
+                group_name=trial.schedule.group_name,
+                trial_date=cast(datetime.date, trial.trial_date),
+                start_time=trial.schedule.start_time,
+                end_time=trial.schedule.end_time,
+                status=trial.status,
+                cost=cost,
+                created_at=trial.created_at,
+            )
+        )
+    return views
 
 
 def _upcoming_event_items(

@@ -24,6 +24,9 @@ from apps.billing.models import (
     Attendance,
     AttendanceCommentTag,
     AttendanceStatus,
+    Enrollment,
+    EnrollmentStatus,
+    EnrollmentType,
     Subscription,
     SubscriptionPlan,
     SubscriptionStatus,
@@ -143,6 +146,67 @@ class SubscriptionAdmin(ModelAdmin):
                 "opts": self.model._meta,
             },
         )
+
+
+@admin.register(Enrollment)
+class EnrollmentAdmin(ModelAdmin):
+    # ПОЧЕМУ read-only: записи создаются только чекаутом, статусы двигают
+    # сервисы (оплата/свипер) — ручная правка разъехалась бы со счётчиком мест
+    list_display = (
+        "id",
+        "display_type",
+        "student",
+        "schedule",
+        "trial_date",
+        "display_status",
+        "created_at",
+    )
+    list_filter = (
+        ("type", ChoicesDropdownFilter),
+        ("status", ChoicesDropdownFilter),
+        ("trial_date", RangeDateFilter),
+    )
+    list_select_related = ("student", "schedule__activity", "activity")
+    search_fields = (
+        "student__full_name",
+        "student__parent__email",
+        "student__parent__phone",
+    )
+    ordering = ("-created_at",)
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+    def has_change_permission(
+        self, request: HttpRequest, obj: Enrollment | None = None
+    ) -> bool:
+        return False
+
+    def has_delete_permission(
+        self, request: HttpRequest, obj: Enrollment | None = None
+    ) -> bool:
+        return False
+
+    @display(
+        description="Тип",
+        label={
+            EnrollmentType.TRIAL: "warning",
+            EnrollmentType.REGULAR: "info",
+        },
+    )
+    def display_type(self, obj: Enrollment) -> str:
+        return obj.type
+
+    @display(
+        description="Статус",
+        label={
+            EnrollmentStatus.ENROLLED: "success",
+            EnrollmentStatus.HELD: "warning",
+            EnrollmentStatus.CANCELED: "danger",
+        },
+    )
+    def display_status(self, obj: Enrollment) -> str:
+        return obj.status
 
 
 @admin.register(Attendance)

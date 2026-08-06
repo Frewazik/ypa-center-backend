@@ -4,6 +4,7 @@ import datetime
 import logging
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
@@ -12,6 +13,7 @@ from apps.billing.models import (
     AttendanceStatus,
     Enrollment,
     EnrollmentStatus,
+    EnrollmentType,
 )
 from apps.journal.models import Lesson
 from apps.schedule.models import MaskType, Schedule, ScheduleMask
@@ -31,15 +33,29 @@ def open_lesson(schedule_id: int, date: datetime.date) -> Lesson:
         )
     with transaction.atomic():
         lesson, _ = Lesson.objects.get_or_create(schedule=schedule, date=date)
+        # ПОЧЕМУ: пробный ученик попадает в журнал только на дату своего
+        # визита — регулярная запись материализуется на каждое занятие
         enrolled = Enrollment.objects.filter(
             schedule=schedule, status=EnrollmentStatus.ENROLLED
+        ).filter(
+            Q(type=EnrollmentType.REGULAR)
+            | Q(type=EnrollmentType.TRIAL, trial_date=date)
         )
-        for enrollment in enrolled:
-            Attendance.objects.get_or_create(
-                enrollment=enrollment,
-                date=date,
-                defaults={"status": AttendanceStatus.ATTENDED},
-            )
+        # ПОЧЕМУ bulk_create: get_or_create в цикле давал 2 запроса на ученика
+        # (SELECT + INSERT). ignore_conflicts опирается на
+        # uq_billing_attendance_per_enrollment_date — повторный вызов на уже
+        # открытом занятии не трогает выставленные учителем отметки
+        Attendance.objects.bulk_create(
+            [
+                Attendance(
+                    enrollment=enrollment,
+                    date=date,
+                    status=AttendanceStatus.ATTENDED,
+                )
+                for enrollment in enrolled
+            ],
+            ignore_conflicts=True,
+        )
     return lesson
 
 

@@ -4,6 +4,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import Mapping
+from typing import cast
 
 from asgiref.sync import async_to_sync
 from drf_spectacular.utils import extend_schema
@@ -19,25 +20,33 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.billing.adapters import YookassaHttpGateway
 from apps.billing.permissions import YookassaIPAllowlist
 from apps.billing.ports import resolve_schedule_port
 from apps.billing.serializers import (
     CheckoutResponseSerializer,
     CheckoutSubscriptionSerializer,
+    CheckoutTrialSerializer,
     YookassaWebhookSerializer,
 )
 from apps.billing.services import (
+    CheckoutResult,
     DuplicateEnrollmentError,
     IdempotencyKeyReusedError,
     NoAvailableSeatsError,
+    PaymentGatewayUnavailableError,
     PaymentInProgressError,
     PlanNotFoundError,
     PlanSlotsMismatchError,
     SlotNotFoundError,
     StudentNotOwnedError,
+    TrialDateUnavailableError,
+    TrialLimitExceededError,
     create_payment,
+    create_trial_payment,
 )
 from apps.billing.tasks import verify_and_process_payment
+from apps.users.models import Parent
 
 _IDEMPOTENCY_HEADER = "X-Idempotency-Key"
 _PAYMENT_EVENTS = frozenset(
@@ -69,9 +78,74 @@ class EnrollmentConflict(APIException):
     default_code = "STUDENT_ALREADY_ENROLLED"
 
 
-class CheckoutSubscriptionView(APIView):
+class TrialLimitConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "У ребёнка уже есть пробное занятие по этому кружку."
+    default_code = "TRIAL_LIMIT_EXCEEDED"
+
+
+class _CheckoutView(APIView):
     permission_classes = [IsAuthenticated]
 
+    def _require_idempotency_key(self, request: Request) -> str:
+        raw_key = request.headers.get(_IDEMPOTENCY_HEADER)
+        if not raw_key:
+            raise ValidationError(
+                {_IDEMPOTENCY_HEADER: "Заголовок обязателен для этой операции."},
+                code="IDEMPOTENCY_KEY_REQUIRED",
+            )
+        try:
+            return str(uuid.UUID(raw_key))
+        except ValueError as exc:
+            raise ValidationError(
+                {_IDEMPOTENCY_HEADER: "Значение должно быть валидным UUID."},
+                code="IDEMPOTENCY_KEY_MALFORMED",
+            ) from exc
+
+    def _resolve_parent_id(self, request: Request) -> int:
+        # !!!: ID родителя берется строго из контекста авторизации
+        # чтение из тела запроса запрещено для защиты от IDOR.
+        # AUTH_USER_MODEL == users.Parent, поэтому request.user и есть родитель;
+        # IsAuthenticated гарантирует, что это не AnonymousUser
+        return int(cast(Parent, request.user).pk)
+
+    def _checkout_response(self, result: CheckoutResult) -> Response:
+        response = CheckoutResponseSerializer(
+            {
+                "transaction_id": result.transaction_id,
+                "status": result.status,
+                "payment_url": result.payment_url,
+                "expires_at": result.expires_at,
+            }
+        )
+        return Response(response.data, status=status.HTTP_201_CREATED)
+
+    def _payment_in_progress_response(self, request: Request) -> Response:
+        # ПОЧЕМУ: стандартный DRF APIException не позволяет передать кастомные
+        # заголовки — формируем ответ вручную для возврата Retry-After
+        return _problem_response(
+            code=PaymentProcessingConflict.default_code,
+            title="Платёж уже обрабатывается",
+            detail=str(PaymentProcessingConflict.default_detail),
+            status_code=status.HTTP_409_CONFLICT,
+            instance=request.path,
+            headers={"Retry-After": "5"},
+        )
+
+    def _gateway_unavailable_response(self, request: Request) -> Response:
+        # ПОЧЕМУ: заказ аннулирован, резервация ключа снята — повтор с тем же
+        # Idempotency-Key безопасен, поэтому 503 с Retry-After, а не 500
+        return _problem_response(
+            code="PAYMENT_GATEWAY_UNAVAILABLE",
+            title="Платёжный шлюз недоступен",
+            detail="Не удалось создать платёж. Повторите запрос позже.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            instance=request.path,
+            headers={"Retry-After": "30"},
+        )
+
+
+class CheckoutSubscriptionView(_CheckoutView):
     @extend_schema(
         request=CheckoutSubscriptionSerializer,
         responses={status.HTTP_201_CREATED: CheckoutResponseSerializer},
@@ -97,6 +171,7 @@ class CheckoutSubscriptionView(APIView):
                 slot_ids=data["slot_ids"],
                 idempotency_key=idempotency_key,
                 request_fingerprint=fingerprint,
+                gateway=YookassaHttpGateway(),
                 schedule_port=resolve_schedule_port(),
                 use_deposit=data["use_deposit"],
             )
@@ -115,52 +190,71 @@ class CheckoutSubscriptionView(APIView):
         except IdempotencyKeyReusedError as exc:
             raise IdempotencyKeyConflict() from exc
         except PaymentInProgressError:
-            # ПОЧЕМУ: стандартный DRF APIException не позволяет передать кастомные заголовки
-            # формируем ответ вручную для возврата Retry-After
-            return _problem_response(
-                code=PaymentProcessingConflict.default_code,
-                title="Платёж уже обрабатывается",
-                detail=str(PaymentProcessingConflict.default_detail),
-                status_code=status.HTTP_409_CONFLICT,
-                instance=request.path,
-                headers={"Retry-After": "5"},
-            )
+            return self._payment_in_progress_response(request)
+        except PaymentGatewayUnavailableError:
+            return self._gateway_unavailable_response(request)
 
-        response = CheckoutResponseSerializer(
+        return self._checkout_response(result)
+
+
+class CheckoutTrialView(_CheckoutView):
+    @extend_schema(
+        request=CheckoutTrialSerializer,
+        responses={status.HTTP_201_CREATED: CheckoutResponseSerializer},
+        description="Идемпотентная запись на пробное занятие. "
+        f"Заголовок {_IDEMPOTENCY_HEADER} (UUID v4) обязателен. "
+        "Не более одного пробного на ребёнка по кружку. "
+        "Бесплатное пробное подтверждается сразу (CONFIRMED).",
+    )
+    def post(self, request: Request) -> Response:
+        idempotency_key = self._require_idempotency_key(request)
+        parent_id = self._resolve_parent_id(request)
+
+        serializer = CheckoutTrialSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        fingerprint = _request_fingerprint(
+            request.path,
             {
-                "transaction_id": result.transaction_id,
-                "status": result.status,
-                "payment_url": result.payment_url,
-                "expires_at": result.expires_at,
-            }
+                "student_id": data["student_id"],
+                "schedule_id": data["schedule_id"],
+                "trial_date": data["trial_date"].isoformat(),
+            },
+            parent_id,
         )
-        return Response(response.data, status=status.HTTP_201_CREATED)
 
-    def _require_idempotency_key(self, request: Request) -> str:
-        raw_key = request.headers.get(_IDEMPOTENCY_HEADER)
-        if not raw_key:
-            raise ValidationError(
-                {_IDEMPOTENCY_HEADER: "Заголовок обязателен для этой операции."},
-                code="IDEMPOTENCY_KEY_REQUIRED",
-            )
         try:
-            return str(uuid.UUID(raw_key))
-        except ValueError as exc:
-            raise ValidationError(
-                {_IDEMPOTENCY_HEADER: "Значение должно быть валидным UUID."},
-                code="IDEMPOTENCY_KEY_MALFORMED",
-            ) from exc
-
-    def _resolve_parent_id(self, request: Request) -> int:
-        # !!!: ID родителя берется строго из контекста авторизации
-        # чтение из тела запроса запрещено для защиты от IDOR
-        parent = getattr(request.user, "parent", None)
-        if parent is None:
-            raise PermissionDenied(
-                detail="У учётной записи нет профиля родителя.",
-                code="PARENT_PROFILE_REQUIRED",
+            result = create_trial_payment(
+                parent_id=parent_id,
+                student_id=data["student_id"],
+                schedule_id=data["schedule_id"],
+                trial_date=data["trial_date"],
+                idempotency_key=idempotency_key,
+                request_fingerprint=fingerprint,
+                gateway=YookassaHttpGateway(),
+                schedule_port=resolve_schedule_port(),
             )
-        return int(parent.pk)
+        except SlotNotFoundError as exc:
+            raise NotFound(detail=str(exc)) from exc
+        except StudentNotOwnedError as exc:
+            raise PermissionDenied(detail=str(exc), code="FORBIDDEN_RESOURCE") from exc
+        except TrialDateUnavailableError as exc:
+            raise ValidationError({"trial_date": str(exc)}) from exc
+        except TrialLimitExceededError as exc:
+            raise TrialLimitConflict(detail=str(exc)) from exc
+        except NoAvailableSeatsError as exc:
+            raise NoSeatsConflict(detail=str(exc)) from exc
+        except DuplicateEnrollmentError as exc:
+            raise EnrollmentConflict(detail=str(exc)) from exc
+        except IdempotencyKeyReusedError as exc:
+            raise IdempotencyKeyConflict() from exc
+        except PaymentInProgressError:
+            return self._payment_in_progress_response(request)
+        except PaymentGatewayUnavailableError:
+            return self._gateway_unavailable_response(request)
+
+        return self._checkout_response(result)
 
 
 class YookassaWebhookView(APIView):

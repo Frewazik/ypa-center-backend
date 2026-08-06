@@ -20,7 +20,11 @@ from apps.schedule.tests.factories import (
     SubscriptionFactory,
 )
 from apps.users.models import Parent, Student
-from apps.billing.models import SubscriptionStatus
+from apps.billing.models import (
+    SubscriptionStatus,
+    Transaction,
+    TransactionStatus,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -28,6 +32,7 @@ PROFILE_URL = "/api/v1/me/profile/"
 CHILDREN_URL = "/api/v1/me/children/"
 SUBSCRIPTIONS_URL = "/api/v1/me/subscriptions/"
 UPCOMING_URL = "/api/v1/me/upcoming/"
+TRIALS_URL = "/api/v1/me/trials/"
 
 
 @pytest.fixture
@@ -227,3 +232,94 @@ class TestUpcomingFeed:
 
         student_ids = {item["student_id"] for item in response.json()}
         assert student_ids == {first.pk}
+
+
+class TestTrials:
+    def test_trial_appears_in_list_with_cost_snapshot(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        student = StudentFactory(parent=parent)
+        schedule = ScheduleFactory(activity=ActivityFactory(name="Английский язык"))
+        trial = EnrollmentFactory(
+            student=student,
+            schedule=schedule,
+            trial=True,
+            trial_date=timezone.localdate() + datetime.timedelta(days=5),
+        )
+        Transaction.objects.create(
+            parent=parent,
+            enrollment=trial,
+            amount=120_000,
+            status=TransactionStatus.SUCCEEDED,
+        )
+
+        response = api_client.get(TRIALS_URL)
+
+        assert response.status_code == status.HTTP_200_OK
+        (item,) = response.json()
+        assert item["id"] == trial.pk
+        assert item["activity_name"] == "Английский язык"
+        assert item["student_id"] == student.pk
+        assert item["cost"] == 120_000
+        assert item["status"] == "ENROLLED"
+
+    def test_foreign_trial_is_invisible(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        EnrollmentFactory(trial=True)
+
+        assert api_client.get(TRIALS_URL).json() == []
+
+    def test_canceled_trial_is_hidden(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        student = StudentFactory(parent=parent)
+        EnrollmentFactory(student=student, trial=True, status="CANCELED")
+
+        assert api_client.get(TRIALS_URL).json() == []
+
+
+class TestUpcomingTrials:
+    def test_paid_trial_lands_in_feed_with_kind(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        student = StudentFactory(parent=parent)
+        trial_date = timezone.localdate() + datetime.timedelta(days=3)
+        EnrollmentFactory(student=student, trial=True, trial_date=trial_date)
+
+        response = api_client.get(UPCOMING_URL)
+
+        trials = [item for item in response.json() if item["kind"] == "TRIAL"]
+        assert len(trials) == 1
+        assert trials[0]["date"] == trial_date.isoformat()
+        assert trials[0]["source_type"] == "trial"
+        assert trials[0]["student_id"] == student.pk
+
+    def test_unpaid_hold_is_not_shown(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        student = StudentFactory(parent=parent)
+        EnrollmentFactory(
+            student=student,
+            trial=True,
+            status="HELD",
+            trial_date=timezone.localdate() + datetime.timedelta(days=3),
+        )
+
+        response = api_client.get(UPCOMING_URL)
+
+        assert [item for item in response.json() if item["kind"] == "TRIAL"] == []
+
+    def test_trial_survives_child_filter(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        student = StudentFactory(parent=parent)
+        EnrollmentFactory(
+            student=student,
+            trial=True,
+            trial_date=timezone.localdate() + datetime.timedelta(days=2),
+        )
+
+        response = api_client.get(UPCOMING_URL, {"child_id": student.pk})
+
+        assert [item["kind"] for item in response.json()] == ["TRIAL"]

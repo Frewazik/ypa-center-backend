@@ -26,12 +26,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/.venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
 
 COPY . .
 
-RUN python manage.py collectstatic --noinput
+RUN SECRET_KEY=dummy_key_for_build python manage.py collectstatic --noinput
 
 EXPOSE 8000
 
 CMD ["python", "-m", "gunicorn", "config.wsgi:application", \
      "--bind", "0.0.0.0:8000", "--workers", "2", "--threads", "4"]
+
+ENV PATH="/app/.venv/bin:$PATH"

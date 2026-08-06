@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 from django.db import connection, transaction
 
-from apps.core.locks import advisory_xact_lock, text_lock_key, try_advisory_xact_lock
+from apps.core.locks import (
+    advisory_xact_lock,
+    advisory_xact_lock_many,
+    text_lock_key,
+    try_advisory_xact_lock,
+)
+
+if TYPE_CHECKING:
+    from pytest_django import DjangoAssertNumQueries
 
 _INT8_MAX = 2**63 - 1
 
@@ -63,3 +73,42 @@ class TestAdvisoryXactLock:
             row = cursor.fetchone()
         assert row is not None
         assert row[0] == 0
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAdvisoryXactLockMany:
+    def _held(self, namespace: int) -> list[int]:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT objid FROM pg_locks "
+                "WHERE locktype = 'advisory' AND classid = %s ORDER BY objid",
+                [namespace],
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+    def test_locks_whole_set_in_single_statement(
+        self,
+        django_assert_num_queries: DjangoAssertNumQueries,
+    ) -> None:
+        # !!!: один statement на весь набор — иначе горячий контур чекаута
+        # держал бы блокировки на N сетевых round-trip'ах
+        with transaction.atomic():
+            with django_assert_num_queries(1):
+                advisory_xact_lock_many(303, [11, 22, 33])
+            assert self._held(303) == [11, 22, 33]
+
+        assert self._held(303) == []
+
+    def test_empty_set_touches_no_db(
+        self,
+        django_assert_num_queries: DjangoAssertNumQueries,
+    ) -> None:
+        with django_assert_num_queries(0):
+            advisory_xact_lock_many(304, [])
+
+    def test_matches_per_key_locking(self) -> None:
+        # Пакетный захват обязан быть неотличим от поштучного
+        with transaction.atomic():
+            advisory_xact_lock_many(305, [7, 8])
+            advisory_xact_lock(305, 9)
+            assert self._held(305) == [7, 8, 9]

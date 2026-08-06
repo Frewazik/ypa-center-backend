@@ -46,6 +46,22 @@ class SubscriptionViewSerializer(serializers.Serializer):
     slots = SubscriptionSlotViewSerializer(many=True, read_only=True)
 
 
+class TrialViewSerializer(serializers.Serializer):
+    id = serializers.IntegerField(read_only=True)
+    student_id = serializers.IntegerField(read_only=True)
+    student_name = serializers.CharField(read_only=True)
+    activity_name = serializers.CharField(read_only=True)
+    group_name = serializers.CharField(read_only=True, allow_blank=True)
+    trial_date = serializers.DateField(read_only=True)
+    start_time = serializers.TimeField(read_only=True, format=TIME_FORMAT)
+    end_time = serializers.TimeField(read_only=True, format=TIME_FORMAT)
+    status = serializers.CharField(read_only=True)
+    # ПОЧЕМУ: null — если платёжная транзакция была аннулирована/потеряна,
+    # цену показывать не из чего
+    cost = serializers.IntegerField(read_only=True, allow_null=True)
+    created_at = serializers.DateTimeField(read_only=True)
+
+
 class UpcomingItemSerializer(serializers.Serializer):
     kind = serializers.CharField(read_only=True)
     date = serializers.DateField(read_only=True)

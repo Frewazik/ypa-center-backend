@@ -11,10 +11,15 @@ from typing import Literal
 
 from django.db import IntegrityError
 from django.db import transaction as db_transaction
-from django.db.models import Q
+from django.db.models import Count, Q
 from django.utils import timezone
 
-from apps.billing.adapters import GatewayContractError, PaymentGateway, PaymentInfo
+from apps.billing.adapters import (
+    GatewayContractError,
+    GatewayError,
+    PaymentGateway,
+    PaymentInfo,
+)
 from apps.billing.models import (
     Attendance,
     AttendanceStatus,
@@ -22,6 +27,7 @@ from apps.billing.models import (
     DepositEntryReason,
     Enrollment,
     EnrollmentStatus,
+    EnrollmentType,
     IdempotencyRecord,
     ParentDeposit,
     Subscription,
@@ -32,7 +38,8 @@ from apps.billing.models import (
     TransactionStatus,
 )
 from apps.billing.ports import SchedulePort, UnknownSlotError
-from apps.core.locks import advisory_xact_lock
+from apps.billing.selectors import active_seat_q
+from apps.core.locks import advisory_xact_lock, advisory_xact_lock_many
 from apps.users.models import Student
 
 logger = logging.getLogger(__name__)
@@ -111,6 +118,14 @@ class IdempotencyKeyReusedError(BillingError):
 class PaymentInProgressError(BillingError):
     def __init__(self, key: str) -> None:
         super().__init__(f"Платёж по ключу {key} уже обрабатывается.")
+        self.key = key
+
+
+class PaymentGatewayUnavailableError(BillingError):
+    # ПОЧЕМУ: заказ уже аннулирован и резервация ключа снята — клиент может
+    # безопасно повторить запрос с тем же Idempotency-Key
+    def __init__(self, key: str) -> None:
+        super().__init__(f"Шлюз не создал платёж по ключу {key}; заказ аннулирован.")
         self.key = key
 
 
@@ -221,6 +236,24 @@ class EnrollmentNotEnrolledError(BillingError):
         self.status = status
 
 
+class TrialLimitExceededError(BillingError):
+    # ПОЧЕМУ: инвариант №5 — максимум 1 пробное на ребёнка по кружку
+    def __init__(self, student_id: int, activity_id: int) -> None:
+        super().__init__(
+            f"У ребёнка id={student_id} уже есть пробное по кружку id={activity_id}."
+        )
+        self.student_id = student_id
+        self.activity_id = activity_id
+
+
+class TrialDateUnavailableError(BillingError):
+    def __init__(self, slot_id: int, trial_date: date, reason: str) -> None:
+        super().__init__(f"Слот id={slot_id}, дата {trial_date.isoformat()}: {reason}")
+        self.slot_id = slot_id
+        self.trial_date = trial_date
+        self.reason = reason
+
+
 CheckoutStatus = Literal["PENDING_PAYMENT", "CONFIRMED"]
 
 
@@ -232,15 +265,16 @@ class CheckoutResult:
     expires_at: datetime | None
 
 
-_MOCK_PAYMENT_URL_TEMPLATE = (
-    "https://yookassa.ru/checkout/payments/mock-{transaction_id}"
-)
 _EXPECTED_CURRENCY = "RUB"
 _IN_PROGRESS_STATUS = 202
 _SUCCESS_STATUS = 201
 _RESERVATION_TTL = timedelta(minutes=15)
 _PENDING_TRANSACTION_TTL = timedelta(minutes=15)
 _TTL_EXPIRED_REASON = "TTL_EXPIRED"
+_CHECKOUT_ABORTED_REASON = "CHECKOUT_ABORTED"
+# ПОЧЕМУ: если по аннулированному заказу всё же придёт успешный платёж
+# (клиент оплатил по устаревшей ссылке), обе причины ведут в возврат
+_REFUNDABLE_CANCEL_REASONS = frozenset({_TTL_EXPIRED_REASON, _CHECKOUT_ABORTED_REASON})
 _SLOT_LOCK_CLASS = 815_001
 
 # ПОЧЕМУ: лимит выборки защищает воркер от OOM Death Loop
@@ -254,6 +288,11 @@ _REFUND_CLAIM_TTL = timedelta(minutes=10)
 
 # ПОЧЕМУ: дефолтное значение для снапшота, бизнес-правила могут меняться,
 # поэтому токены жестко фиксируются в БД на момент покупки
+# ПОЧЕМУ: абонемент действует месяц от первого занятия, но точное окно
+# известно только при подтверждении оплаты. Пять недель гарантированно
+# накрывают этот месяц, куда бы ни попало первое занятие
+_SUBSCRIPTION_SEAT_HORIZON = timedelta(weeks=5)
+
 _TOKENS_PER_SLOT = 4
 
 # ПОЧЕМУ: Контракт §2.1
@@ -283,7 +322,13 @@ def debit_token(attendance_id: int) -> None:
         if enrollment.status != EnrollmentStatus.ENROLLED:
             raise EnrollmentNotEnrolledError(enrollment.pk, enrollment.status)
 
+        # ПОЧЕМУ: пробное оплачено разовой транзакцией, фишек у него нет —
+        # отметка посещения фиксируется без движения баланса
+        if enrollment.subscription_id is None:
+            return
+
         subscription = enrollment.subscription
+        assert subscription is not None  # сужение для mypy: проверено выше
         now = timezone.now()
         is_expired = (
             subscription.expires_at is not None and subscription.expires_at < now
@@ -318,6 +363,7 @@ def create_payment(
     idempotency_key: str,
     request_fingerprint: str,
     *,
+    gateway: PaymentGateway,
     schedule_port: SchedulePort,
     use_deposit: bool = False,
 ) -> CheckoutResult:
@@ -338,30 +384,9 @@ def create_payment(
     if not Student.objects.filter(pk=student_id, parent_id=parent_id).exists():
         raise StudentNotOwnedError(student_id)
 
-    now = timezone.now()
-    lock_token = uuid.uuid4()
-    record, created = IdempotencyRecord.objects.get_or_create(
-        key=idempotency_key,
-        defaults={
-            "request_fingerprint": request_fingerprint,
-            "response_status": _IN_PROGRESS_STATUS,
-            "response_body": {},
-            "locked_until": now + _RESERVATION_TTL,
-            "lock_token": lock_token,
-        },
-    )
-    if not created:
-        if record.request_fingerprint != request_fingerprint:
-            raise IdempotencyKeyReusedError(idempotency_key)
-        if record.response_status != _IN_PROGRESS_STATUS:
-            return _result_from_record(record)
-        reclaimed = IdempotencyRecord.objects.filter(
-            key=idempotency_key,
-            response_status=_IN_PROGRESS_STATUS,
-            locked_until__lt=now,
-        ).update(locked_until=now + _RESERVATION_TTL, lock_token=lock_token)
-        if reclaimed == 0:
-            raise PaymentInProgressError(idempotency_key)
+    replay, lock_token = _reserve_idempotency(idempotency_key, request_fingerprint)
+    if replay is not None:
+        return replay
 
     try:
         with db_transaction.atomic():
@@ -373,23 +398,40 @@ def create_payment(
                 base_session_price=plan.base_session_price,
             )
 
+            # !!!: локи берутся на весь набор ДО любых проверок и строго в
+            # порядке возрастания slot_id (normalized_slot_ids отсортирован
+            # выше). Разный порядок захвата в параллельных корзинах с
+            # пересекающимися слотами — гарантированный дедлок на advisory-локах
+            _lock_slots_for_booking(normalized_slot_ids)
+
+            # ПОЧЕМУ: partial-индекс БД не вычисляет динамический now(),
+            # чистим протухшие HELD вручную для разблокировки ретрая клиента.
+            # Один UPDATE на весь набор вместо N
             hold_expired_before = timezone.now() - _PENDING_TRANSACTION_TTL
+            Enrollment.objects.filter(
+                schedule_id__in=normalized_slot_ids,
+                status=EnrollmentStatus.HELD,
+                created_at__lt=hold_expired_before,
+            ).update(status=EnrollmentStatus.CANCELED)
+
+            capacities: dict[int, int] = {}
             for slot_id in normalized_slot_ids:
-                _lock_slot_for_booking(slot_id)
-                # ПОЧЕМУ: partial-индекс БД не вычисляет динамический now(),
-                # чистим протухшие HELD вручную для разблокировки ретрая клиента
-                Enrollment.objects.filter(
-                    schedule_id=slot_id,
-                    status=EnrollmentStatus.HELD,
-                    created_at__lt=hold_expired_before,
-                ).update(status=EnrollmentStatus.CANCELED)
                 try:
-                    capacity = schedule_port.get_slot_capacity(slot_id)
+                    capacities[slot_id] = schedule_port.get_slot_capacity(slot_id)
                 except UnknownSlotError as exc:
                     raise SlotNotFoundError(slot_id) from exc
-                if _occupied_seats(slot_id) >= capacity:
+
+            # ПОЧЕМУ батч: занятость всех слотов набора считается двумя
+            # запросами вместо 2N — локи не простаивают на пачке round-trip'ов
+            occupied = _occupied_seats_bulk(normalized_slot_ids)
+            for slot_id in normalized_slot_ids:
+                if occupied.get(slot_id, 0) >= capacities[slot_id]:
                     raise NoAvailableSeatsError(slot_id)
+
+            for slot_id in normalized_slot_ids:
                 try:
+                    # ПОЧЕМУ не bulk_create: INSERT — неизбежная работа, а
+                    # поштучный вызов сохраняет точную атрибуцию конфликта
                     Enrollment.objects.create(
                         student_id=student_id,
                         subscription=subscription,
@@ -432,52 +474,301 @@ def create_payment(
                     transaction=tx,
                 )
 
-            payment_url: str | None
-            invoice_expires_at: datetime | None
-            checkout_status: CheckoutStatus
             if tx.amount == 0:
                 _fulfill_prepaid_order(tx, schedule_port)
-                payment_url = None
-                checkout_status = "CONFIRMED"
-                invoice_expires_at = None
-            else:
-                payment_url = _issue_payment_url(tx.pk)
-                checkout_status = "PENDING_PAYMENT"
-                invoice_expires_at = tx.created_at + _PENDING_TRANSACTION_TTL
-            result = CheckoutResult(
-                transaction_id=tx.pk,
-                status=checkout_status,
-                payment_url=payment_url,
-                expires_at=invoice_expires_at,
+                result = CheckoutResult(
+                    transaction_id=tx.pk,
+                    status="CONFIRMED",
+                    payment_url=None,
+                    expires_at=None,
+                )
+                _finalize_idempotency_record(idempotency_key, lock_token, result)
+                return result
+    except _IdempotencyLockLostError:
+        return _recover_lost_idempotency(idempotency_key)
+    except Exception:
+        _release_reservation(idempotency_key, lock_token)
+        raise
+
+    # ПОЧЕМУ: сетевой вызов к шлюзу вынесен за границы транзакции — advisory-локи
+    # слотов и коннект из пула БД не удерживаются на время HTTP (контракт
+    # apps.billing.ports запрещает I/O под транзакцией)
+    try:
+        payment = gateway.create_payment(
+            amount_kopecks=tx.amount,
+            transaction_id=str(tx.pk),
+            idempotence_key=f"payment-{tx.pk}",
+            description=f"Абонемент «{plan.name}»",
+        )
+    except GatewayError as exc:
+        # Заказ уже закоммичен — аннулируем компенсацией, а не откатом
+        logger.warning(
+            "Checkout %s: шлюз не создал платёж (%s); заказ аннулирован.",
+            tx.pk,
+            exc,
+        )
+        _void_unpaid_order(tx.pk)
+        _release_reservation(idempotency_key, lock_token)
+        raise PaymentGatewayUnavailableError(idempotency_key) from exc
+
+    result = CheckoutResult(
+        transaction_id=tx.pk,
+        status="PENDING_PAYMENT",
+        payment_url=payment.confirmation_url,
+        expires_at=tx.created_at + _PENDING_TRANSACTION_TTL,
+    )
+    try:
+        with db_transaction.atomic():
+            Transaction.objects.filter(
+                pk=tx.pk, status=TransactionStatus.PENDING
+            ).update(external_id=payment.id)
+            _finalize_idempotency_record(idempotency_key, lock_token, result)
+    except _IdempotencyLockLostError:
+        # Гонка проиграна конкуренту, перехватившему протухший лок: наш заказ
+        # обязан быть аннулирован, клиенту возвращается результат победителя
+        _void_unpaid_order(tx.pk)
+        return _recover_lost_idempotency(idempotency_key)
+    except Exception:
+        _void_unpaid_order(tx.pk)
+        _release_reservation(idempotency_key, lock_token)
+        raise
+
+    return result
+
+
+def _reserve_idempotency(
+    key: str, fingerprint: str
+) -> tuple[CheckoutResult | None, uuid.UUID]:
+    # ПОЧЕМУ: общий пролог всех чекаутов — get_or_create резервации,
+    # replay финализированного ответа, перехват протухшего лока (fencing)
+    now = timezone.now()
+    lock_token = uuid.uuid4()
+    record, created = IdempotencyRecord.objects.get_or_create(
+        key=key,
+        defaults={
+            "request_fingerprint": fingerprint,
+            "response_status": _IN_PROGRESS_STATUS,
+            "response_body": {},
+            "locked_until": now + _RESERVATION_TTL,
+            "lock_token": lock_token,
+        },
+    )
+    if not created:
+        if record.request_fingerprint != fingerprint:
+            raise IdempotencyKeyReusedError(key)
+        if record.response_status != _IN_PROGRESS_STATUS:
+            return _result_from_record(record), lock_token
+        reclaimed = IdempotencyRecord.objects.filter(
+            key=key,
+            response_status=_IN_PROGRESS_STATUS,
+            locked_until__lt=now,
+        ).update(locked_until=now + _RESERVATION_TTL, lock_token=lock_token)
+        if reclaimed == 0:
+            raise PaymentInProgressError(key)
+    return None, lock_token
+
+
+def _finalize_idempotency_record(
+    key: str, lock_token: uuid.UUID, result: CheckoutResult
+) -> None:
+    finalized = IdempotencyRecord.objects.filter(
+        key=key,
+        response_status=_IN_PROGRESS_STATUS,
+        lock_token=lock_token,
+    ).update(
+        response_status=_SUCCESS_STATUS,
+        response_body={
+            "payment_url": result.payment_url,
+            "transaction_id": str(result.transaction_id),
+            "status": result.status,
+            "expires_at": (
+                result.expires_at.isoformat() if result.expires_at is not None else None
+            ),
+        },
+        locked_until=None,
+        lock_token=None,
+    )
+    if finalized == 0:
+        raise _IdempotencyLockLostError(key)
+
+
+def _recover_lost_idempotency(key: str) -> CheckoutResult:
+    current = IdempotencyRecord.objects.filter(key=key).first()
+    if current is not None and current.response_status == _SUCCESS_STATUS:
+        return _result_from_record(current)
+    raise PaymentInProgressError(key) from None
+
+
+def _void_unpaid_order(transaction_id: uuid.UUID) -> None:
+    # ПОЧЕМУ: причина из _REFUNDABLE_CANCEL_REASONS — если провайдер всё же
+    # проведёт оплату по аннулированному заказу, _apply_success отправит возврат
+    with db_transaction.atomic():
+        tx = (
+            Transaction.objects.select_for_update()
+            .filter(pk=transaction_id, status=TransactionStatus.PENDING)
+            .first()
+        )
+        if tx is None:
+            return
+        tx.status = TransactionStatus.CANCELED
+        tx.metadata = {**tx.metadata, "canceled_reason": _CHECKOUT_ABORTED_REASON}
+        tx.save(update_fields=["status", "metadata"])
+        _release_order_resources(tx)
+
+
+def create_trial_payment(
+    parent_id: int,
+    student_id: int,
+    schedule_id: int,
+    trial_date: date,
+    idempotency_key: str,
+    request_fingerprint: str,
+    *,
+    gateway: PaymentGateway,
+    schedule_port: SchedulePort,
+) -> CheckoutResult:
+    # ПОЧЕМУ: защита от IDOR — принадлежность ребёнка плательщику
+    if not Student.objects.filter(pk=student_id, parent_id=parent_id).exists():
+        raise StudentNotOwnedError(student_id)
+    if trial_date < timezone.localdate():
+        raise TrialDateUnavailableError(
+            schedule_id, trial_date, "дата пробного уже в прошлом."
+        )
+
+    replay, lock_token = _reserve_idempotency(idempotency_key, request_fingerprint)
+    if replay is not None:
+        return replay
+
+    try:
+        with db_transaction.atomic():
+            _lock_slot_for_booking(schedule_id)
+            hold_expired_before = timezone.now() - _PENDING_TRANSACTION_TTL
+            Enrollment.objects.filter(
+                schedule_id=schedule_id,
+                status=EnrollmentStatus.HELD,
+                created_at__lt=hold_expired_before,
+            ).update(status=EnrollmentStatus.CANCELED)
+
+            try:
+                trial_info = schedule_port.get_slot_trial_info(schedule_id)
+                capacity = schedule_port.get_slot_capacity(schedule_id)
+                next_lesson = schedule_port.get_next_lesson_date(
+                    schedule_id, trial_date
+                )
+            except UnknownSlotError as exc:
+                raise SlotNotFoundError(schedule_id) from exc
+            # ПОЧЕМУ: дата валидна, только если ближайшее занятие «на дату или
+            # позже» — ровно эта дата; отмены и переносы масок учтены портом
+            if next_lesson != trial_date:
+                raise TrialDateUnavailableError(
+                    schedule_id,
+                    trial_date,
+                    "на эту дату занятие группы не проводится.",
+                )
+
+            # Быстрая проверка лимита до capacity-работы; гонку двух параллельных
+            # покупок на разных слотах одного кружка ловит partial-unique в БД
+            if Enrollment.objects.filter(
+                student_id=student_id,
+                activity_id=trial_info.activity_id,
+                type=EnrollmentType.TRIAL,
+                status__in=(EnrollmentStatus.HELD, EnrollmentStatus.ENROLLED),
+            ).exists():
+                raise TrialLimitExceededError(student_id, trial_info.activity_id)
+
+            if _occupied_seats(schedule_id, on_date=trial_date) >= capacity:
+                raise NoAvailableSeatsError(schedule_id)
+
+            try:
+                # ПОЧЕМУ вложенный atomic: savepoint позволяет классифицировать
+                # IntegrityError запросами — без него транзакция уже abort-нута
+                with db_transaction.atomic():
+                    enrollment = Enrollment.objects.create(
+                        student_id=student_id,
+                        subscription=None,
+                        schedule_id=schedule_id,
+                        activity_id=trial_info.activity_id,
+                        type=EnrollmentType.TRIAL,
+                        trial_date=trial_date,
+                        status=EnrollmentStatus.HELD,
+                    )
+            except IntegrityError as exc:
+                if Enrollment.objects.filter(
+                    student_id=student_id,
+                    activity_id=trial_info.activity_id,
+                    type=EnrollmentType.TRIAL,
+                    status__in=(EnrollmentStatus.HELD, EnrollmentStatus.ENROLLED),
+                ).exists():
+                    raise TrialLimitExceededError(
+                        student_id, trial_info.activity_id
+                    ) from exc
+                raise DuplicateEnrollmentError(student_id, schedule_id) from exc
+
+            tx = Transaction.objects.create(
+                parent_id=parent_id,
+                enrollment=enrollment,
+                amount=trial_info.price_kopecks,
+                status=TransactionStatus.PENDING,
+                selected_slot_ids=[schedule_id],
+                metadata={"kind": "trial", "trial_date": trial_date.isoformat()},
             )
 
-            finalized = IdempotencyRecord.objects.filter(
-                key=idempotency_key,
-                response_status=_IN_PROGRESS_STATUS,
-                lock_token=lock_token,
-            ).update(
-                response_status=_SUCCESS_STATUS,
-                response_body={
-                    "payment_url": result.payment_url,
-                    "transaction_id": str(result.transaction_id),
-                    "status": result.status,
-                    "expires_at": (
-                        result.expires_at.isoformat()
-                        if result.expires_at is not None
-                        else None
-                    ),
-                },
-                locked_until=None,
-                lock_token=None,
-            )
-            if finalized == 0:
-                raise _IdempotencyLockLostError(idempotency_key)
+            if tx.amount == 0:
+                # ПОЧЕМУ: бесплатное пробное подтверждается без похода в кассу —
+                # симметрично бесплатным ивентам и депозитному абонементу
+                tx.status = TransactionStatus.SUCCEEDED
+                tx.metadata = {**tx.metadata, "free_trial": True}
+                tx.save(update_fields=["status", "metadata"])
+                enrollment.status = EnrollmentStatus.ENROLLED
+                enrollment.save(update_fields=["status"])
+                result = CheckoutResult(
+                    transaction_id=tx.pk,
+                    status="CONFIRMED",
+                    payment_url=None,
+                    expires_at=None,
+                )
+                _finalize_idempotency_record(idempotency_key, lock_token, result)
+                return result
     except _IdempotencyLockLostError:
-        current = IdempotencyRecord.objects.filter(key=idempotency_key).first()
-        if current is not None and current.response_status == _SUCCESS_STATUS:
-            return _result_from_record(current)
-        raise PaymentInProgressError(idempotency_key) from None
+        return _recover_lost_idempotency(idempotency_key)
     except Exception:
+        _release_reservation(idempotency_key, lock_token)
+        raise
+
+    try:
+        payment = gateway.create_payment(
+            amount_kopecks=tx.amount,
+            transaction_id=str(tx.pk),
+            idempotence_key=f"payment-{tx.pk}",
+            description=f"Пробное занятие {trial_date.isoformat()}",
+        )
+    except GatewayError as exc:
+        logger.warning(
+            "Trial checkout %s: шлюз не создал платёж (%s); заказ аннулирован.",
+            tx.pk,
+            exc,
+        )
+        _void_unpaid_order(tx.pk)
+        _release_reservation(idempotency_key, lock_token)
+        raise PaymentGatewayUnavailableError(idempotency_key) from exc
+
+    result = CheckoutResult(
+        transaction_id=tx.pk,
+        status="PENDING_PAYMENT",
+        payment_url=payment.confirmation_url,
+        expires_at=tx.created_at + _PENDING_TRANSACTION_TTL,
+    )
+    try:
+        with db_transaction.atomic():
+            Transaction.objects.filter(
+                pk=tx.pk, status=TransactionStatus.PENDING
+            ).update(external_id=payment.id)
+            _finalize_idempotency_record(idempotency_key, lock_token, result)
+    except _IdempotencyLockLostError:
+        _void_unpaid_order(tx.pk)
+        return _recover_lost_idempotency(idempotency_key)
+    except Exception:
+        _void_unpaid_order(tx.pk)
         _release_reservation(idempotency_key, lock_token)
         raise
 
@@ -527,22 +818,82 @@ def _lock_slot_for_booking(slot_id: int) -> None:
     advisory_xact_lock(_SLOT_LOCK_CLASS, slot_id)
 
 
-def _occupied_seats(slot_id: int, *, exclude_enrollment_pk: int | None = None) -> int:
-    # ПОЧЕМУ: физическая вместимость учитывает как купленные места (ENROLLED),
-    # так и временно заблокированные транзакциями в процессе оплаты (HELD)
-    hold_alive_after = timezone.now() - _PENDING_TRANSACTION_TTL
-    seats = Enrollment.objects.filter(schedule_id=slot_id).filter(
-        Q(status=EnrollmentStatus.ENROLLED)
-        | Q(status=EnrollmentStatus.HELD, created_at__gte=hold_alive_after)
+def _lock_slots_for_booking(slot_ids: Sequence[int]) -> None:
+    # !!!: slot_ids обязаны быть отсортированы — порядок захвата определяет
+    # отсутствие дедлока между пересекающимися корзинами
+    advisory_xact_lock_many(_SLOT_LOCK_CLASS, slot_ids)
+
+
+def _occupied_seats_bulk(
+    slot_ids: Sequence[int],
+    *,
+    on_date: date | None = None,
+    exclude_enrollment_pks: Sequence[int] | None = None,
+) -> dict[int, int]:
+    # !!!: занятость места имеет ось времени. Постоянная запись держит место на
+    # КАЖДОМ занятии слота, пробное — ровно на одной дате. Складывать их плоским
+    # count() нельзя: десять пробных на десять разных недель «съели» бы всю
+    # группу навсегда, хотя физически в каждый день занят один стул.
+    #
+    # on_date задана (покупка/подтверждение пробного) — занятость строго этого
+    # дня. on_date не задана (абонемент, покрывающий ~месяц занятий) — пик:
+    # постоянные плюс самый загруженный пробными день горизонта, потому что
+    # абонемент обязан иметь место на каждом занятии, а не в среднем.
+    #
+    # ПОЧЕМУ батч: вызывается под захваченными advisory-локами. Поштучный
+    # подсчёт держал бы локи на 2N сетевых round-trip'ах вместо двух
+    if not slot_ids:
+        return {}
+
+    base = Enrollment.objects.filter(schedule_id__in=slot_ids).filter(active_seat_q())
+    if exclude_enrollment_pks:
+        base = base.exclude(pk__in=exclude_enrollment_pks)
+
+    occupied: dict[int, int] = dict(
+        base.filter(type=EnrollmentType.REGULAR)
+        .values("schedule_id")
+        .annotate(taken=Count("id"))
+        .values_list("schedule_id", "taken")
     )
-    if exclude_enrollment_pk is not None:
-        seats = seats.exclude(pk=exclude_enrollment_pk)
-    return seats.count()
+
+    trials = base.filter(type=EnrollmentType.TRIAL)
+    if on_date is not None:
+        for slot_id, taken in (
+            trials.filter(trial_date=on_date)
+            .values("schedule_id")
+            .annotate(taken=Count("id"))
+            .values_list("schedule_id", "taken")
+        ):
+            occupied[slot_id] = occupied.get(slot_id, 0) + taken
+        return occupied
+
+    today = timezone.localdate()
+    peaks: dict[int, int] = {}
+    for slot_id, _trial_date, taken in (
+        trials.filter(
+            trial_date__gte=today,
+            trial_date__lt=today + _SUBSCRIPTION_SEAT_HORIZON,
+        )
+        .values("schedule_id", "trial_date")
+        .annotate(taken=Count("id"))
+        .values_list("schedule_id", "trial_date", "taken")
+    ):
+        peaks[slot_id] = max(peaks.get(slot_id, 0), taken)
+    for slot_id, peak in peaks.items():
+        occupied[slot_id] = occupied.get(slot_id, 0) + peak
+    return occupied
 
 
-def _issue_payment_url(transaction_id: uuid.UUID) -> str:
-    # TODO: мок ссылки на оплату; заменить на Payment.create ЮКассы (итерация интеграции).
-    return _MOCK_PAYMENT_URL_TEMPLATE.format(transaction_id=transaction_id)
+def _occupied_seats(
+    slot_id: int,
+    *,
+    on_date: date | None = None,
+    exclude_enrollment_pk: int | None = None,
+) -> int:
+    excluded = [exclude_enrollment_pk] if exclude_enrollment_pk is not None else None
+    return _occupied_seats_bulk(
+        [slot_id], on_date=on_date, exclude_enrollment_pks=excluded
+    ).get(slot_id, 0)
 
 
 def _release_reservation(idempotency_key: str, lock_token: uuid.UUID) -> int:
@@ -595,10 +946,11 @@ def _apply_success(
         if tx.status != TransactionStatus.PENDING:
             if (
                 tx.status == TransactionStatus.CANCELED
-                and tx.metadata.get("canceled_reason") == _TTL_EXPIRED_REASON
+                and tx.metadata.get("canceled_reason") in _REFUNDABLE_CANCEL_REASONS
                 and not tx.metadata.get("compensation_required")
             ):
-                # ПОЧЕМУ: вебхук опоздал, свипер уже снял бронь по TTL, инициируем возврат
+                # ПОЧЕМУ: вебхук опоздал, заказ уже аннулирован (TTL-свипер или
+                # аварийное прерывание checkout) — инициируем возврат
                 tx.external_id = info.id
                 tx.save(update_fields=["external_id"])
                 _mark_for_compensation(tx, {"reason": "PAYMENT_SUCCEEDED_AFTER_EXPIRY"})
@@ -619,6 +971,8 @@ def _apply_success(
             deferred = AmountMismatchError(
                 info.id, tx.amount, info.amount_kopecks, info.currency
             )
+        elif tx.enrollment_id is not None:
+            deferred = _apply_trial_success(info, tx, schedule_port)
         else:
             data_error = _validate_success_payload(tx, info.id)
             if data_error is not None:
@@ -717,6 +1071,62 @@ def _apply_success(
         raise deferred
 
 
+def _apply_trial_success(
+    info: PaymentInfo, tx: Transaction, schedule_port: SchedulePort
+) -> BillingError | None:
+    # !!!: вызывается строго под select_for_update по tx из _apply_success.
+    # ПОЧЕМУ повторная проверка мест: бронь (HELD) могла протухнуть
+    # за время оплаты, а место — уйти конкуренту
+    tx.status = TransactionStatus.SUCCEEDED
+    tx.external_id = info.id
+    tx.save(update_fields=["status", "external_id"])
+
+    # !!!: порядок захвата (advisory-лок слота → строка Enrollment) обязан
+    # совпадать с _try_enroll_held_seats, иначе вебхуки пробного и абонемента
+    # по одному слоту ловят взаимный дедлок. schedule_id читаем без лока
+    schedule_id: int = Enrollment.objects.values_list("schedule_id", flat=True).get(
+        pk=tx.enrollment_id
+    )
+    _lock_slot_for_booking(schedule_id)
+    enrollment = Enrollment.objects.select_for_update().get(pk=tx.enrollment_id)
+
+    if enrollment.status != EnrollmentStatus.HELD:
+        _mark_for_compensation(
+            tx, {"reason": "HOLD_LOST", "enrollment_id": enrollment.pk}
+        )
+        _release_order_resources(tx)
+        return SeatsTakenAfterPaymentError(info.id, 0, "HOLD_LOST")
+
+    try:
+        capacity = schedule_port.get_slot_capacity(enrollment.schedule_id)
+    except UnknownSlotError:
+        _mark_for_compensation(
+            tx, {"reason": "SLOT_REMOVED", "enrollment_id": enrollment.pk}
+        )
+        _release_order_resources(tx)
+        return SeatsTakenAfterPaymentError(info.id, 0, "SLOT_REMOVED")
+
+    taken_by_others = _occupied_seats(
+        enrollment.schedule_id,
+        on_date=enrollment.trial_date,
+        exclude_enrollment_pk=enrollment.pk,
+    )
+    if taken_by_others >= capacity:
+        _mark_for_compensation(
+            tx,
+            {
+                "reason": "SEATS_TAKEN_AFTER_PAYMENT",
+                "enrollment_id": enrollment.pk,
+            },
+        )
+        _release_order_resources(tx)
+        return SeatsTakenAfterPaymentError(info.id, 0, "SEATS_TAKEN_AFTER_PAYMENT")
+
+    enrollment.status = EnrollmentStatus.ENROLLED
+    enrollment.save(update_fields=["status"])
+    return None
+
+
 def _mark_for_compensation(tx: Transaction, extra: dict[str, object]) -> None:
     tx.requires_compensation = True
     tx.metadata = {**tx.metadata, "compensation_required": True, **extra}
@@ -743,8 +1153,7 @@ def _try_enroll_held_seats(
     # ПОЧЕМУ: перед финальным зачислением обязательна повторная проверка мест,
     # так как бронь (HELD) могла протухнуть за время проведения платежа
     ordered = sorted(slot_ids)
-    for slot_id in ordered:
-        _lock_slot_for_booking(slot_id)
+    _lock_slots_for_booking(ordered)
 
     # ПОЧЕМУ: multi-row FOR UPDATE без ORDER BY лочит строки в порядке плана;
     # два конкурентных захвата пересекающихся наборов — готовый ABBA-дедлок
@@ -759,16 +1168,25 @@ def _try_enroll_held_seats(
         .order_by("pk")
     }
 
+    if any(own_by_slot.get(slot_id) is None for slot_id in ordered):
+        return "HOLD_LOST"
+
+    capacities: dict[int, int] = {}
     for slot_id in ordered:
-        held = own_by_slot.get(slot_id)
-        if held is None:
-            return "HOLD_LOST"
         try:
-            capacity = schedule_port.get_slot_capacity(slot_id)
+            capacities[slot_id] = schedule_port.get_slot_capacity(slot_id)
         except UnknownSlotError:
             return "SLOT_REMOVED"
-        taken_by_others = _occupied_seats(slot_id, exclude_enrollment_pk=held.pk)
-        if taken_by_others >= capacity:
+
+    # ПОЧЕМУ батч: локи на все слоты уже взяты выше, занятость считается
+    # двумя запросами на весь набор. Исключаем собственные брони целиком —
+    # каждая принадлежит ровно одному слоту набора
+    taken = _occupied_seats_bulk(
+        ordered,
+        exclude_enrollment_pks=[held.pk for held in own_by_slot.values()],
+    )
+    for slot_id in ordered:
+        if taken.get(slot_id, 0) >= capacities[slot_id]:
             return "SEATS_TAKEN_AFTER_PAYMENT"
 
     for enrollment in own_by_slot.values():
@@ -788,6 +1206,12 @@ def _release_order_resources(tx: Transaction) -> None:
         Subscription.objects.filter(
             pk=tx.subscription_id, status=SubscriptionStatus.PENDING
         ).update(status=SubscriptionStatus.CANCELED)
+    if tx.enrollment_id is not None:
+        # Пробное: снятие брони освобождает и лимит «1 пробное на кружок»
+        Enrollment.objects.filter(
+            pk=tx.enrollment_id,
+            status__in=(EnrollmentStatus.HELD, EnrollmentStatus.ENROLLED),
+        ).update(status=EnrollmentStatus.CANCELED)
     _return_deposit_hold(tx)
 
 
@@ -1045,7 +1469,11 @@ def issue_pending_refunds(
             continue
 
         tx = Transaction.objects.get(pk=tx_id)
-        if tx.external_id is None:
+        # ПОЧЕМУ: external_id проставляется уже на чекауте (платёж заведён у
+        # провайдера), поэтому сам по себе он больше не доказывает, что деньги
+        # получены. Факт оплаты подтверждает только уход из PENDING: вебхук
+        # переводит транзакцию в SUCCEEDED/FAILED, поздний успех — в CANCELED
+        if tx.external_id is None or tx.status == TransactionStatus.PENDING:
             _quarantine_refund(
                 tx_id, "платёж не подтверждён провайдером — возвращать нечего"
             )
@@ -1241,6 +1669,10 @@ def refund_token(attendance_id: int) -> None:
             return
 
         subscription = attendance.enrollment.subscription
+        # ПОЧЕМУ: у пробного нет абонемента и фишек — списания не было,
+        # возвращать нечего (сюда попасть можно только при порче данных)
+        if subscription is None:
+            return
         # ПОЧЕМУ: возврат на не-ACTIVE запрещен — sweep_expired_subscriptions
         # уже обнулил остатки и начислил несгораемый остаток на депозит,
         # инкремент remaining_tokens задним числом разъехался бы с учетом
@@ -1252,12 +1684,12 @@ def refund_token(attendance_id: int) -> None:
 
         try:
             slot = SubscriptionSlot.objects.select_for_update(of=("self",)).get(
-                subscription_id=attendance.enrollment.subscription_id,
+                subscription_id=subscription.pk,
                 slot_id=attendance.enrollment.schedule_id,
             )
         except SubscriptionSlot.DoesNotExist as exc:
             raise SlotBalanceNotFoundError(
-                attendance.enrollment.subscription_id,
+                subscription.pk,
                 attendance.enrollment.schedule_id,
             ) from exc
 

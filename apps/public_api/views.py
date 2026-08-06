@@ -12,6 +12,7 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 
 from apps.billing.models import EnrollmentStatus, SubscriptionPlan
+from apps.billing.selectors import regular_seat_q
 from apps.catalog.models import Activity
 from apps.content.models import GalleryImage
 from apps.core.caching import cached_payload, payload_cache_key
@@ -34,9 +35,11 @@ CACHE_TTL_EVENTS_SECONDS: Final[int] = 60
 
 
 def _seat_holding_filter() -> Q:
-    # ПОЧЕМУ: HELD тоже держит место (Enrollment.occupies_seat) — считать
-    # только ENROLLED значит показать свободным место в неоплаченной брони
-    return Q(enrollment__status__in=(EnrollmentStatus.HELD, EnrollmentStatus.ENROLLED))
+    # ПОЧЕМУ только постоянные записи: карточка каталога отвечает на вопрос
+    # «насколько укомплектована группа», и разовый пробный визитёр её не
+    # гасит — иначе десяток пробных на разные недели вешал бы на кружок
+    # фантомный sold-out. Точную занятость на дату считает чекаут
+    return regular_seat_q("enrollment__")
 
 
 def _active_groups_queryset() -> QuerySet[Schedule]:

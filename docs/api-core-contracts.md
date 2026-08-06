@@ -15,11 +15,18 @@
 
 ## Статус реализации
 
-Ядро реализовано по этому контракту: OTP-вход, чекаут абонемента с Idempotency-Key,
-вебхук ЮКассы, публичная витрина, ЛК, RFC 9457. Три осознанных отклонения:
+Ядро реализовано по этому контракту: OTP-вход, чекаут абонемента и пробного
+с Idempotency-Key, вебхук ЮКассы, публичная витрина, ЛК, RFC 9457.
+Два осознанных отклонения:
 
-- **Пробные занятия** (`POST /checkout/trial`) — не реализованы, этап отложен
-  владельцем проекта; контракт сохранён на будущее.
+- **Пробные занятия** (`POST /checkout/trial`) — реализованы. Запись — это
+  `enrollment` с `type=TRIAL`, `trial_date` и денормализованным `activity_id`;
+  лимит «1 пробное на ребёнка по кружку» держит partial-unique
+  `uniq_trial_per_student_per_activity`, форму строки — `ck_billing_enrollment_type_shape`.
+  Цена берётся из `catalog.Activity.price` через `SchedulePort.get_slot_trial_info`.
+  Бесплатное пробное подтверждается сразу (`CONFIRMED`), платное — через тот же
+  шлюз и вебхук, что абонемент. Список — `GET /api/v1/me/trials`,
+  в ленте ЛК — `kind=TRIAL`. Превышение лимита → `409 TRIAL_LIMIT_EXCEEDED`.
 - **Оплата ивентов** (`POST /checkout/event`) — вместо онлайн-оплаты сделана гостевая
   регистрация `POST /api/v1/public/events/{id}/register/` со статусом
   `PENDING_PAYMENT` и оплатой на месте; бронь освобождается свипером через 30 минут.
@@ -517,6 +524,7 @@ POST /api/v1/webhooks/yookassa
 | GET   | `/api/v1/me/profile` | да | — |
 | GET   | `/api/v1/me/subscriptions` | да | — |
 | GET   | `/api/v1/me/upcoming` | да | — |
+| GET   | `/api/v1/me/trials` | да | — |
 | POST  | `/api/v1/checkout/subscription` | да | да |
 | POST  | `/api/v1/checkout/trial` | да | да |
 | POST  | `/api/v1/checkout/event` | — | да |

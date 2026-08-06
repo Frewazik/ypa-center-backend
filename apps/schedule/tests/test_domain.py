@@ -513,3 +513,64 @@ def test_reschedule_checks_occupancy_on_landing_date_not_weekday() -> None:
     )
 
     assert mask.pk is not None
+
+
+class TestGridSeatTimeAxis:
+    # !!!: недельная сетка спрашивает «сколько мест на ЭТОМ занятии».
+    # Пробное держит место ровно один день, поэтому сравнивается равенством
+    # с датой строки (WeekSessionDate), а не считается плоско
+
+    def test_trial_occupies_seat_only_on_its_own_date(self) -> None:
+        schedule = _schedule_on(0, time(16), time(17))
+        EnrollmentFactory(
+            schedule=schedule, trial=True, trial_date=MONDAY, is_active=True
+        )
+
+        this_week = build_week_grid(MONDAY)[0]
+        next_week = build_week_grid(MONDAY + timedelta(days=7))[0]
+
+        assert this_week.capacity_taken == 1
+        assert next_week.capacity_taken == 0
+
+    def test_trials_on_distinct_weeks_do_not_stack(self) -> None:
+        # Регресс на фантомный sold-out: три пробных на три разные недели —
+        # это один занятый стул в каждую из них, а не три в одну
+        schedule = _schedule_on(0, time(16), time(17), max_capacity=2)
+        for week in range(3):
+            EnrollmentFactory(
+                schedule=schedule,
+                trial=True,
+                trial_date=MONDAY + timedelta(days=7 * week),
+                is_active=True,
+            )
+
+        for week in range(3):
+            slot = build_week_grid(MONDAY + timedelta(days=7 * week))[0]
+            assert slot.capacity_taken == 1
+            assert slot.capacity_free == 1
+
+    def test_regular_enrollment_occupies_every_week(self) -> None:
+        schedule = _schedule_on(0, time(16), time(17))
+        EnrollmentFactory(schedule=schedule, is_active=True)
+
+        assert build_week_grid(MONDAY)[0].capacity_taken == 1
+        assert build_week_grid(MONDAY + timedelta(days=70))[0].capacity_taken == 1
+
+    def test_trials_stay_within_two_query_budget(
+        self,
+        django_assert_num_queries: DjangoAssertNumQueries,
+    ) -> None:
+        # ПОЧЕМУ: точный подсчёт по дате обязан оставаться двумя условными
+        # агрегатами в том же JOIN — ни оконных функций, ни второго прохода
+        schedules = ScheduleFactory.create_batch(10)
+        for schedule in schedules:
+            session_date = MONDAY + timedelta(days=schedule.time_slot.day_of_week)
+            EnrollmentFactory(schedule=schedule, is_active=True)
+            EnrollmentFactory(
+                schedule=schedule, trial=True, trial_date=session_date, is_active=True
+            )
+
+        with django_assert_num_queries(2):
+            grid = build_week_grid(MONDAY)
+
+        assert all(slot.capacity_taken == 2 for slot in grid)

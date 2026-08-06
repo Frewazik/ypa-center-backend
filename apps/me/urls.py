@@ -7,6 +7,7 @@ from apps.me.views import (
     ChildUpdateView,
     ProfileView,
     SubscriptionListView,
+    TrialListView,
     UpcomingFeedView,
 )
 
@@ -17,5 +18,6 @@ urlpatterns = [
     path("children/", ChildCreateView.as_view(), name="child-create"),
     path("children/<int:pk>/", ChildUpdateView.as_view(), name="child-update"),
     path("subscriptions/", SubscriptionListView.as_view(), name="subscriptions"),
+    path("trials/", TrialListView.as_view(), name="trials"),
     path("upcoming/", UpcomingFeedView.as_view(), name="upcoming"),
 ]

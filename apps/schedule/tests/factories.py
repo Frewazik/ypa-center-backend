@@ -147,7 +147,18 @@ class EnrollmentFactory(factory.django.DjangoModelFactory):
     student = factory.SubFactory(StudentFactory)
     subscription = factory.SubFactory(SubscriptionFactory)
     schedule = factory.SubFactory(ScheduleFactory)
+    type = "REGULAR"
     status = "ENROLLED"
+
+    class Params:
+        # ПОЧЕМУ trait: форма строки пробного охраняется CHECK-констрейнтом —
+        # абонемент обязан быть пустым, дата и кружок заполнены
+        trial = factory.Trait(
+            type="TRIAL",
+            subscription=None,
+            trial_date=factory.LazyFunction(datetime.date.today),
+            activity=factory.LazyAttribute(lambda o: o.schedule.activity),
+        )
 
     @classmethod
     def _adjust_kwargs(cls, **kwargs):

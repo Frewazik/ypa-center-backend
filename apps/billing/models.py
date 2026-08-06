@@ -176,6 +176,16 @@ class Transaction(models.Model):
         default=dict,
         blank=True,
     )
+    # ПОЧЕМУ: транзакция пробного не связана с абонементом — вебхук находит,
+    # что подтверждать, по прямой ссылке на бронь (у абонемента здесь NULL)
+    enrollment = models.ForeignKey(
+        "Enrollment",
+        on_delete=models.PROTECT,
+        related_name="transactions",
+        null=True,
+        blank=True,
+        verbose_name="Запись (пробное)",
+    )
     # ПОЧЕМУ: вынесено из metadata в отдельную колонку, поиск должников по JSONB даст Seq Scan
     requires_compensation = models.BooleanField("Требуется возврат", default=False)
     # ПОЧЕМУ: lease-резервация возврата (claim check) — параллельный тик
@@ -216,6 +226,11 @@ class EnrollmentStatus(models.TextChoices):
     CANCELED = "CANCELED", "Отменена"
 
 
+class EnrollmentType(models.TextChoices):
+    REGULAR = "REGULAR", "Постоянная (абонемент)"
+    TRIAL = "TRIAL", "Пробное занятие"
+
+
 class Enrollment(models.Model):
     student = models.ForeignKey(
         "users.Student",
@@ -223,10 +238,14 @@ class Enrollment(models.Model):
         related_name="enrollments",
         verbose_name="Ребёнок",
     )
+    # ПОЧЕМУ nullable: у пробного нет абонемента; форма строки охраняется
+    # ck_billing_enrollment_type_shape
     subscription = models.ForeignKey(
         Subscription,
         on_delete=models.PROTECT,
         related_name="enrollments",
+        null=True,
+        blank=True,
         verbose_name="Абонемент",
     )
     schedule = models.ForeignKey(
@@ -234,6 +253,26 @@ class Enrollment(models.Model):
         on_delete=models.PROTECT,
         related_name="enrollment",
         verbose_name="Группа",
+    )
+    type = models.CharField(
+        "Тип записи",
+        max_length=20,
+        choices=EnrollmentType.choices,
+        default=EnrollmentType.REGULAR,
+    )
+    # ПОЧЕМУ: пробное — разовый визит на конкретную календарную дату,
+    # в отличие от регулярной записи, живущей в абсолютной сетке
+    trial_date = models.DateField("Дата пробного", null=True, blank=True)
+    # ПОЧЕМУ денормализация: лимит «1 пробное на ребёнка по кружку» действует
+    # на уровне кружка, а запись ссылается на слот; без своей колонки
+    # partial-unique в БД невозможен (schema-audit R7)
+    activity = models.ForeignKey(
+        "catalog.Activity",
+        on_delete=models.PROTECT,
+        related_name="trial_enrollments",
+        null=True,
+        blank=True,
+        verbose_name="Кружок (для пробного)",
     )
     status = models.CharField(
         "Статус",
@@ -257,10 +296,52 @@ class Enrollment(models.Model):
                 ),
                 name="uq_billing_active_enrollment_per_student_slot",
             ),
+            # ПОЧЕМУ: инвариант №5 (project-context §13) — максимум 1 пробное
+            # на ребёнка по кружку. CANCELED не в условии: сорванная оплата
+            # не должна сжигать лимит навсегда
+            models.UniqueConstraint(
+                fields=["student", "activity"],
+                condition=Q(
+                    type=EnrollmentType.TRIAL,
+                    status__in=(EnrollmentStatus.HELD, EnrollmentStatus.ENROLLED),
+                ),
+                name="uniq_trial_per_student_per_activity",
+            ),
+            # ПОЧЕМУ: форма строки по типу — пробное обязано иметь дату и кружок
+            # и не иметь абонемента; регулярная запись — ровно наоборот
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        type=EnrollmentType.TRIAL,
+                        trial_date__isnull=False,
+                        activity__isnull=False,
+                        subscription__isnull=True,
+                    )
+                    | Q(
+                        type=EnrollmentType.REGULAR,
+                        trial_date__isnull=True,
+                        subscription__isnull=False,
+                    )
+                ),
+                name="ck_billing_enrollment_type_shape",
+            ),
+        ]
+        indexes = [
+            # ПОЧЕМУ partial: пробных на порядки меньше регулярных записей,
+            # а занятость всегда спрашивают парой (слот, дата) и только по
+            # живым броням — узкий индекс вместо сканирования всех записей
+            models.Index(
+                fields=["schedule", "trial_date"],
+                condition=Q(
+                    type=EnrollmentType.TRIAL,
+                    status__in=(EnrollmentStatus.HELD, EnrollmentStatus.ENROLLED),
+                ),
+                name="ix_enroll_trial_slot_date",
+            ),
         ]
 
     def __str__(self) -> str:
-        return f"Enrollment #{self.pk} ({self.status})"
+        return f"Enrollment #{self.pk} ({self.type}, {self.status})"
 
     @property
     def is_active(self) -> bool:

@@ -21,6 +21,14 @@ class CheckoutSubscriptionSerializer(serializers.Serializer):
         return value
 
 
+class CheckoutTrialSerializer(serializers.Serializer):
+    student_id = serializers.IntegerField(min_value=1)
+    schedule_id = serializers.IntegerField(min_value=1)
+    # ПОЧЕМУ: у пробного, в отличие от абонемента, дата настоящая календарная,
+    # а не паттерн сетки (checkout-flow.md §2)
+    trial_date = serializers.DateField()
+
+
 class CheckoutResponseSerializer(serializers.Serializer):
     transaction_id = serializers.UUIDField()
     status = serializers.ChoiceField(choices=("PENDING_PAYMENT", "CONFIRMED"))

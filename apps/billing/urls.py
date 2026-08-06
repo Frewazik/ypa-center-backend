@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from django.urls import path
 
-from apps.billing.views import CheckoutSubscriptionView, YookassaWebhookView
+from apps.billing.views import (
+    CheckoutSubscriptionView,
+    CheckoutTrialView,
+    YookassaWebhookView,
+)
 
 app_name = "billing"
 
@@ -15,6 +19,11 @@ urlpatterns = [
         "checkout/subscription",
         CheckoutSubscriptionView.as_view(),
         name="checkout-subscription",
+    ),
+    path(
+        "checkout/trial",
+        CheckoutTrialView.as_view(),
+        name="checkout-trial",
     ),
     path(
         "webhooks/yookassa",

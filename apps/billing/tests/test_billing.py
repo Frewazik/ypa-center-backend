@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import date, time, timedelta
+from datetime import date, datetime, time, timedelta
 from threading import Barrier, Event, Lock, Thread
 
 import factory
@@ -13,10 +13,11 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.test import APIRequestFactory, force_authenticate
-from apps.schedule.tests.factories import ScheduleFactory
+from apps.schedule.models import Schedule
 
 from apps.billing import services as billing_services
 from apps.billing.adapters import (
+    CreatedPayment,
     GatewayContractError,
     GatewayError,
     GatewayNetworkError,
@@ -41,7 +42,7 @@ from apps.billing.models import (
     Transaction,
     TransactionStatus,
 )
-from apps.billing.ports import UnknownSlotError
+from apps.billing.ports import SlotTrialInfo, UnknownSlotError
 from apps.billing.services import (
     AmountMismatchError,
     CheckoutResult,
@@ -158,34 +159,37 @@ class ParentDepositFactory(factory.django.DjangoModelFactory):
     balance = 0
 
 
-@pytest.fixture(autouse=True)
-def _seed_schedules(db) -> None:
-    # ПОЧЕМУ: удовлетворяет строгие ограничения ForeignKey на уровне БД
-    for slot_id in [100, 101, 102, 103, 104, 105, 106, 777]:
-        ScheduleFactory(id=slot_id)
-
-
-@dataclass
-class _AuthStub:
-    parent: Parent | None
-    is_authenticated: bool = True
-
-    @property
-    def pk(self) -> int:
-        return self.parent.pk if self.parent else 1
-
-
 @dataclass
 class FakeGateway:
+    # ПОЧЕМУ: FakeGateway подменяет строго внешнюю HTTP-границу (API ЮКассы);
+    # собственный код (auth, порт расписания) в тестах не мокается
     payments: dict[str, PaymentInfo] = field(default_factory=dict)
     refund_calls: list[tuple[str, int, str]] = field(default_factory=list)
     failing_refund_ids: set[str] = field(default_factory=set)
+    created_payments: list[tuple[str, int, str]] = field(default_factory=list)
 
     def get_payment(self, payment_id: str) -> PaymentInfo:
         found = self.payments.get(payment_id)
         if found is None:
             raise PaymentNotFoundError(payment_id)
         return found
+
+    def create_payment(
+        self,
+        *,
+        amount_kopecks: int,
+        transaction_id: str,
+        idempotence_key: str,
+        description: str,
+    ) -> CreatedPayment:
+        self.created_payments.append((transaction_id, amount_kopecks, idempotence_key))
+        return CreatedPayment(
+            id=f"yk-{transaction_id}",
+            status="pending",
+            confirmation_url=(
+                f"https://yookassa.ru/checkout/payments/{transaction_id}"
+            ),
+        )
 
     def create_refund(
         self, payment_id: str, amount_kopecks: int, idempotence_key: str
@@ -203,6 +207,16 @@ class RaisingGateway:
     def get_payment(self, payment_id: str) -> PaymentInfo:
         raise self.error_factory("сбой шлюза")
 
+    def create_payment(
+        self,
+        *,
+        amount_kopecks: int,
+        transaction_id: str,
+        idempotence_key: str,
+        description: str,
+    ) -> CreatedPayment:
+        raise self.error_factory("сбой шлюза")
+
     def create_refund(
         self, payment_id: str, amount_kopecks: int, idempotence_key: str
     ) -> RefundInfo:
@@ -214,6 +228,8 @@ class FakeSchedulePort:
     capacities: dict[int, int] = field(default_factory=dict)
     lesson_dates: dict[int, date] = field(default_factory=dict)
     default_capacity: int = 10
+    default_trial_price: int = 120_000
+    trial_infos: dict[int, SlotTrialInfo] = field(default_factory=dict)
     strict: bool = False  # True → неизвестный слот падает UnknownSlotError
 
     def get_slot_capacity(self, slot_id: int) -> int:
@@ -230,11 +246,27 @@ class FakeSchedulePort:
             raise UnknownSlotError(slot_id)
         return on_or_after + timedelta(days=1)
 
+    def get_slot_trial_info(self, slot_id: int) -> SlotTrialInfo:
+        if slot_id in self.trial_infos:
+            return self.trial_infos[slot_id]
+        if self.strict:
+            raise UnknownSlotError(slot_id)
+        # ПОЧЕМУ Schedule из БД: activity_id обязан указывать на живую строку
+        # catalog.Activity — Enrollment.activity под FK PROTECT
+        schedule = Schedule.objects.get(pk=slot_id)
+        return SlotTrialInfo(
+            activity_id=schedule.activity_id, price_kopecks=self.default_trial_price
+        )
+
 
 def _port(**capacities: int) -> FakeSchedulePort:
     return FakeSchedulePort(
         capacities={int(k.removeprefix("s")): v for k, v in capacities.items()}
     )
+
+
+def _gw() -> FakeGateway:
+    return FakeGateway()
 
 
 def _checkout(
@@ -246,6 +278,7 @@ def _checkout(
     key: str | None = None,
     fingerprint: str = _FP,
     port: FakeSchedulePort | None = None,
+    gateway: FakeGateway | None = None,
     use_deposit: bool = False,
 ) -> CheckoutResult:
     the_parent = parent if parent is not None else ParentFactory()
@@ -262,6 +295,7 @@ def _checkout(
         slot_ids,
         key if key is not None else str(uuid.uuid4()),
         fingerprint,
+        gateway=gateway if gateway is not None else _gw(),
         schedule_port=port if port is not None else FakeSchedulePort(),
         use_deposit=use_deposit,
     )
@@ -273,6 +307,31 @@ def _make_pending_payment(slot_ids: list[int]) -> Transaction:
     before = set(Transaction.objects.values_list("pk", flat=True))
     _checkout(slot_ids)
     return Transaction.objects.exclude(pk__in=before).get()
+
+
+def _make_refundable_payment(
+    slot_ids: list[int],
+    *,
+    claimed_until: datetime | None = None,
+    created_at: datetime | None = None,
+) -> Transaction:
+    # ПОЧЕМУ: возврат возможен только по фактически оплаченной транзакции.
+    # PENDING означает, что провайдер оплату не подтверждал: платёж заведён
+    # на чекауте, но денег нет — возвращать нечего
+    tx = _make_pending_payment(slot_ids)
+    fields: dict[str, object] = {
+        "external_id": f"yk-{tx.pk}",
+        "status": TransactionStatus.SUCCEEDED,
+        "requires_compensation": True,
+        "metadata": {"compensation_required": True},
+    }
+    if claimed_until is not None:
+        fields["compensation_claimed_until"] = claimed_until
+    if created_at is not None:
+        fields["created_at"] = created_at
+    Transaction.objects.filter(pk=tx.pk).update(**fields)
+    tx.refresh_from_db()
+    return tx
 
 
 def _gateway_for(
@@ -399,10 +458,24 @@ class TestCreatePayment:
         port = FakeSchedulePort()
 
         first = create_payment(
-            parent.pk, plan.pk, student.pk, [101, 102], key, _FP, schedule_port=port
+            parent.pk,
+            plan.pk,
+            student.pk,
+            [101, 102],
+            key,
+            _FP,
+            gateway=_gw(),
+            schedule_port=port,
         )
         second = create_payment(
-            parent.pk, plan.pk, student.pk, [101, 102], key, _FP, schedule_port=port
+            parent.pk,
+            plan.pk,
+            student.pk,
+            [101, 102],
+            key,
+            _FP,
+            gateway=_gw(),
+            schedule_port=port,
         )
 
         # ПОЧЕМУ: replay восстанавливает полный контрактный ответ (F9), а не только URL
@@ -486,6 +559,7 @@ class TestCreatePayment:
                 [101, 102, 103, 104, 105, 106],
                 str(uuid.uuid4()),
                 _FP,
+                gateway=_gw(),
                 schedule_port=FakeSchedulePort(),
             )
 
@@ -507,6 +581,7 @@ class TestCreatePayment:
                 [101, 101],
                 str(uuid.uuid4()),
                 _FP,
+                gateway=_gw(),
                 schedule_port=FakeSchedulePort(),
             )
 
@@ -526,6 +601,7 @@ class TestCreatePayment:
             [101],
             key,
             "fingerprint-a",
+            gateway=_gw(),
             schedule_port=port,
         )
 
@@ -537,6 +613,7 @@ class TestCreatePayment:
                 [102],
                 key,
                 "fingerprint-b",
+                gateway=_gw(),
                 schedule_port=port,
             )
 
@@ -602,6 +679,7 @@ class TestCreatePayment:
                 [101],
                 key,
                 _FP,
+                gateway=_gw(),
                 schedule_port=ExplodingPort(),
             )
 
@@ -609,7 +687,14 @@ class TestCreatePayment:
         assert Transaction.objects.count() == 0
 
         retry = create_payment(
-            parent.pk, plan.pk, student.pk, [101], key, _FP, schedule_port=port
+            parent.pk,
+            plan.pk,
+            student.pk,
+            [101],
+            key,
+            _FP,
+            gateway=_gw(),
+            schedule_port=port,
         )
         assert retry.payment_url is not None
         assert retry.payment_url.startswith("https://yookassa.ru/")
@@ -637,6 +722,7 @@ class TestCreatePaymentConcurrency:
                     [101],
                     key,
                     _FP,
+                    gateway=_gw(),
                     schedule_port=port,
                 )
             except PaymentInProgressError:
@@ -684,8 +770,10 @@ class TestIdempotencyFencingRace:
     def test_resurrected_owner_cannot_double_charge_after_reclaim(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # !!!: эмуляция зависания воркера дольше TTL с перехватом лока конкурентом
-        # проснувшийся воркер обязан откатить свои мутации и вернуть URL победителя
+        # !!!: эмуляция зависания воркера дольше TTL с перехватом лока конкурентом.
+        # Сетевой вызов к шлюзу идёт после коммита заказа, поэтому проснувшийся
+        # владелец не может откатить мутации — он обязан аннулировать свой заказ
+        # компенсацией и вернуть клиенту результат победителя
         parent = ParentFactory()
         student = StudentFactory(parent=parent)
         plan = SubscriptionPlanFactory(slots_count=1)
@@ -696,24 +784,36 @@ class TestIdempotencyFencingRace:
         gate = Event()
         call_lock = Lock()
         call_counter = {"n": 0}
-        real_issue = billing_services._issue_payment_url
+        base_gateway = FakeGateway()
 
-        def slow_first_issue(transaction_id: uuid.UUID) -> str:
-            with call_lock:
-                call_counter["n"] += 1
-                is_first = call_counter["n"] == 1
-            if is_first:
-                owner_inside.set()
-                assert gate.wait(timeout=10), "конкурент не отпустил владельца"
-            return real_issue(transaction_id)
+        class GatingGateway(FakeGateway):
+            # Первый вызов create_payment (владелец) зависает на внешней
+            # HTTP-границе до отмашки; конкурент проходит без задержки
+            def create_payment(
+                self,
+                *,
+                amount_kopecks: int,
+                transaction_id: str,
+                idempotence_key: str,
+                description: str,
+            ) -> CreatedPayment:
+                with call_lock:
+                    call_counter["n"] += 1
+                    is_first = call_counter["n"] == 1
+                if is_first:
+                    owner_inside.set()
+                    assert gate.wait(timeout=10), "конкурент не отпустил владельца"
+                return base_gateway.create_payment(
+                    amount_kopecks=amount_kopecks,
+                    transaction_id=transaction_id,
+                    idempotence_key=idempotence_key,
+                    description=description,
+                )
 
-        monkeypatch.setattr(billing_services, "_issue_payment_url", slow_first_issue)
+        gateway = GatingGateway()
         # ПОЧЕМУ: TTL=0 заставляет лок владельца мгновенно протухнуть
         # позволяя конкуренту легитимно перехватить обработку
         monkeypatch.setattr(billing_services, "_RESERVATION_TTL", timedelta(0))
-        monkeypatch.setattr(
-            billing_services, "_lock_slot_for_booking", lambda slot_id: None
-        )
 
         owner_result: dict[str, CheckoutResult] = {}
 
@@ -726,6 +826,7 @@ class TestIdempotencyFencingRace:
                     [101],
                     key,
                     _FP,
+                    gateway=gateway,
                     schedule_port=port,
                 )
             finally:
@@ -743,6 +844,7 @@ class TestIdempotencyFencingRace:
             [101],
             key,
             _FP,
+            gateway=gateway,
             schedule_port=port,
         )
 
@@ -753,10 +855,23 @@ class TestIdempotencyFencingRace:
         # проигравший процесс восстанавливает данные из сохраненной записи
         assert owner_result["url"].payment_url == competitor.payment_url
         assert owner_result["url"].transaction_id == competitor.transaction_id
-        assert Transaction.objects.count() == 1
-        assert Subscription.objects.count() == 1
-        assert Enrollment.objects.count() == 1
         assert IdempotencyRecord.objects.get(key=key).response_status == 201
+
+        # Заказ победителя жив, заказ проигравшего аннулирован без следов брони
+        winner_tx = Transaction.objects.get(pk=competitor.transaction_id)
+        loser_tx = Transaction.objects.exclude(pk=competitor.transaction_id).get()
+        assert winner_tx.status == TransactionStatus.PENDING
+        assert loser_tx.status == TransactionStatus.CANCELED
+        assert loser_tx.metadata["canceled_reason"] == "CHECKOUT_ABORTED"
+        assert Enrollment.objects.filter(status=EnrollmentStatus.HELD).count() == 1
+        assert (
+            Enrollment.objects.get(status=EnrollmentStatus.HELD).subscription_id
+            == winner_tx.subscription_id
+        )
+        assert (
+            Subscription.objects.get(pk=loser_tx.subscription_id).status
+            == SubscriptionStatus.CANCELED
+        )
 
 
 @pytest.mark.django_db
@@ -1136,12 +1251,15 @@ class TestLateSuccessCompensationFlow:
         assert gateway.refund_calls == [(payment_id, tx.amount, f"refund-{tx.pk}")]
 
     def test_refund_skipped_when_payment_never_confirmed(self) -> None:
-        # ПОЧЕМУ: транзакции без external_id не существуют на стороне провайдера
-        # инициировать возврат через API в таком случае бессмысленно
+        # ПОЧЕМУ: платёж заведён у провайдера на чекауте, но остался неоплаченным
+        # (транзакция всё ещё PENDING) — возвращать нечего, деньги не получены
         tx = _make_pending_payment([101])
         Transaction.objects.filter(pk=tx.pk).update(
             requires_compensation=True, metadata={"compensation_required": True}
         )
+        tx.refresh_from_db()
+        assert tx.external_id is not None
+        assert tx.status == TransactionStatus.PENDING
         gateway = FakeGateway()
 
         assert issue_pending_refunds(gateway=gateway) == 0
@@ -1152,15 +1270,29 @@ class TestLateSuccessCompensationFlow:
         assert tx.requires_compensation is False
         assert tx.metadata["refund_status"] == "failed"
 
+    def test_refund_skipped_when_payment_id_missing(self) -> None:
+        # ПОЧЕМУ: страховка на случай порчи данных — транзакции без external_id
+        # у провайдера не существует, дёргать по ней возврат бессмысленно
+        tx = _make_pending_payment([101])
+        Transaction.objects.filter(pk=tx.pk).update(
+            external_id=None,
+            status=TransactionStatus.SUCCEEDED,
+            requires_compensation=True,
+            metadata={"compensation_required": True},
+        )
+        gateway = FakeGateway()
+
+        assert issue_pending_refunds(gateway=gateway) == 0
+        assert gateway.refund_calls == []
+        tx.refresh_from_db()
+        assert tx.requires_compensation is False
+        assert tx.metadata["refund_status"] == "failed"
+
     def test_active_claim_blocks_parallel_tick_before_network_call(self) -> None:
         # ПОЧЕМУ: claim check — конкурентный тик (дубль крона, ручной запуск)
         # не должен дойти до create_refund, пока lease первого воркера жив
-        tx = _make_pending_payment([101])
-        Transaction.objects.filter(pk=tx.pk).update(
-            external_id=f"yk-{tx.pk}",
-            requires_compensation=True,
-            metadata={"compensation_required": True},
-            compensation_claimed_until=timezone.now() + timedelta(minutes=5),
+        tx = _make_refundable_payment(
+            [101], claimed_until=timezone.now() + timedelta(minutes=5)
         )
         gateway = FakeGateway()
 
@@ -1172,12 +1304,8 @@ class TestLateSuccessCompensationFlow:
     def test_expired_claim_is_reclaimed(self) -> None:
         # ПОЧЕМУ: воркер, убитый после сетевого вызова, не хоронит возврат —
         # истёкший lease перехватывается, дубль гасится Idempotence-Key
-        tx = _make_pending_payment([101])
-        Transaction.objects.filter(pk=tx.pk).update(
-            external_id=f"yk-{tx.pk}",
-            requires_compensation=True,
-            metadata={"compensation_required": True},
-            compensation_claimed_until=timezone.now() - timedelta(seconds=1),
+        tx = _make_refundable_payment(
+            [101], claimed_until=timezone.now() - timedelta(seconds=1)
         )
         gateway = FakeGateway()
 
@@ -1189,12 +1317,7 @@ class TestLateSuccessCompensationFlow:
         assert tx.metadata["refund_status"] == "succeeded"
 
     def test_successful_refund_releases_claim(self) -> None:
-        tx = _make_pending_payment([101])
-        Transaction.objects.filter(pk=tx.pk).update(
-            external_id=f"yk-{tx.pk}",
-            requires_compensation=True,
-            metadata={"compensation_required": True},
-        )
+        tx = _make_refundable_payment([101])
         gateway = FakeGateway()
 
         assert issue_pending_refunds(gateway=gateway) == 1
@@ -1207,12 +1330,7 @@ class TestLateSuccessCompensationFlow:
         monkeypatch.setattr(billing_services, "_REFUND_CHUNK_SIZE", 1)
         gateway = FakeGateway()
         for slot in (101, 102):
-            tx = _make_pending_payment([slot])
-            Transaction.objects.filter(pk=tx.pk).update(
-                external_id=f"yk-{tx.pk}",
-                requires_compensation=True,
-                metadata={"compensation_required": True},
-            )
+            _make_refundable_payment([slot])
 
         first_tick = issue_pending_refunds(gateway=gateway)
         second_tick = issue_pending_refunds(gateway=gateway)
@@ -1347,7 +1465,7 @@ class TestYookassaWebhookView:
 class TestCheckoutViewSecurity:
     def _post(
         self,
-        user: _AuthStub,
+        user: Parent | None,
         body: dict[str, int | list[int] | bool],
         key: str | None = None,
     ) -> Response:
@@ -1359,26 +1477,29 @@ class TestCheckoutViewSecurity:
                 "X-Idempotency-Key": key if key is not None else str(uuid.uuid4())
             },
         )
-        force_authenticate(request, user=user)
+        if user is not None:
+            force_authenticate(request, user=user)
         return CheckoutSubscriptionView.as_view()(request)
 
-    def _stub_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _stub_boundaries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # ПОЧЕМУ: подменяются только внешние границы (HTTP ЮКассы) и порт —
+        # аутентификация проходит через реальный users.Parent
         monkeypatch.setattr(
             "apps.billing.views.resolve_schedule_port", FakeSchedulePort
         )
+        monkeypatch.setattr("apps.billing.views.YookassaHttpGateway", FakeGateway)
 
     def test_parent_id_in_body_is_ignored_owner_taken_from_auth(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        self._stub_port(monkeypatch)
+        self._stub_boundaries(monkeypatch)
         owner = ParentFactory()
         student = StudentFactory(parent=owner)
         victim = ParentFactory()
         plan = SubscriptionPlanFactory(slots_count=1)
-        user = _AuthStub(parent=owner)
 
         response = self._post(
-            user,
+            owner,
             {
                 "plan_id": plan.pk,
                 "student_id": student.pk,
@@ -1394,14 +1515,13 @@ class TestCheckoutViewSecurity:
     def test_foreign_student_in_body_gets_403(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        self._stub_port(monkeypatch)
+        self._stub_boundaries(monkeypatch)
         owner = ParentFactory()
         foreign_student = StudentFactory()
         plan = SubscriptionPlanFactory(slots_count=1)
-        user = _AuthStub(parent=owner)
 
         response = self._post(
-            user,
+            owner,
             {"plan_id": plan.pk, "student_id": foreign_student.pk, "slot_ids": [101]},
         )
 
@@ -1409,34 +1529,30 @@ class TestCheckoutViewSecurity:
         assert Transaction.objects.count() == 0
         assert Enrollment.objects.count() == 0
 
-    def test_user_without_parent_profile_gets_403(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._stub_port(monkeypatch)
+    def test_anonymous_request_gets_401(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._stub_boundaries(monkeypatch)
         plan = SubscriptionPlanFactory(slots_count=1)
-        user = _AuthStub(parent=None)
 
         response = self._post(
-            user, {"plan_id": plan.pk, "student_id": 1, "slot_ids": [101]}
+            None, {"plan_id": plan.pk, "student_id": 1, "slot_ids": [101]}
         )
 
-        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
         assert Subscription.objects.count() == 0
 
     def test_missing_idempotency_header_rejected(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        self._stub_port(monkeypatch)
+        self._stub_boundaries(monkeypatch)
         owner = ParentFactory()
         student = StudentFactory(parent=owner)
         plan = SubscriptionPlanFactory(slots_count=1)
-        user = _AuthStub(parent=owner)
         request = APIRequestFactory().post(
             "/api/v1/checkout/subscription",
             {"plan_id": plan.pk, "student_id": student.pk, "slot_ids": [101]},
             format="json",
         )
-        force_authenticate(request, user=user)
+        force_authenticate(request, user=owner)
 
         response = CheckoutSubscriptionView.as_view()(request)
 
@@ -1614,15 +1730,10 @@ class TestDepositHoldReturn:
 @pytest.mark.django_db
 class TestRefundQueueDiscipline:
     def _flagged(self, slot: int, created_shift_min: int) -> Transaction:
-        tx = _make_pending_payment([slot])
-        Transaction.objects.filter(pk=tx.pk).update(
-            external_id=f"yk-{tx.pk}",
-            requires_compensation=True,
-            metadata={"compensation_required": True},
+        return _make_refundable_payment(
+            [slot],
             created_at=timezone.now() - timedelta(minutes=created_shift_min),
         )
-        tx.refresh_from_db()
-        return tx
 
     def test_queue_is_fifo_by_created_at(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(billing_services, "_REFUND_CHUNK_SIZE", 1)
@@ -2030,6 +2141,7 @@ class TestPaymentInProgressEnvelope:
         monkeypatch.setattr(
             "apps.billing.views.resolve_schedule_port", FakeSchedulePort
         )
+        monkeypatch.setattr("apps.billing.views.YookassaHttpGateway", FakeGateway)
         owner = ParentFactory()
         student = StudentFactory(parent=owner)
         plan = SubscriptionPlanFactory(slots_count=1)
@@ -2055,7 +2167,7 @@ class TestPaymentInProgressEnvelope:
             format="json",
             headers={"X-Idempotency-Key": key},
         )
-        force_authenticate(request, user=_AuthStub(parent=owner))
+        force_authenticate(request, user=owner)
 
         response = CheckoutSubscriptionView.as_view()(request)
         response.render()
@@ -2090,17 +2202,22 @@ class TestEvictionReleaseDeadlock:
         sweeper_holds_deposit = Event()
         errors: list[Exception] = []
 
-        original_occupied = billing_services._occupied_seats
+        original_occupied = billing_services._occupied_seats_bulk
 
         def pausing_occupied(
-            slot_id: int, *, exclude_enrollment_pk: int | None = None
-        ) -> int:
+            slot_ids: list[int],
+            *,
+            on_date: date | None = None,
+            exclude_enrollment_pks: list[int] | None = None,
+        ) -> dict[int, int]:
             # ПОЧЕМУ: эмулируем задержку после захвата лока на Enrollment
             # для проверки поведения ожидающего sweeper-а
             checkout_evicted.set()
             sweeper_holds_deposit.wait(timeout=2)
             return original_occupied(
-                slot_id, exclude_enrollment_pk=exclude_enrollment_pk
+                slot_ids,
+                on_date=on_date,
+                exclude_enrollment_pks=exclude_enrollment_pks,
             )
 
         original_return_hold = billing_services._return_deposit_hold
@@ -2110,7 +2227,7 @@ class TestEvictionReleaseDeadlock:
             sweeper_holds_deposit.set()
             assert checkout_evicted.wait(timeout=15)
 
-        monkeypatch.setattr(billing_services, "_occupied_seats", pausing_occupied)
+        monkeypatch.setattr(billing_services, "_occupied_seats_bulk", pausing_occupied)
         monkeypatch.setattr(
             billing_services, "_return_deposit_hold", signalling_return_hold
         )

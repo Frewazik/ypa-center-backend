@@ -10,10 +10,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeAlias
 
 from django.core.exceptions import ValidationError
-from django.db import IntegrityError, transaction
-from django.db.models import Count, Q
+from django.db import IntegrityError, models, transaction
+from django.db.models import Count, F, Func, Q, Value
 from django.utils import timezone
 
+from apps.billing.selectors import regular_seat_q, trial_seat_q
 from apps.core.locks import advisory_xact_lock
 from apps.schedule.models import DayOfWeek, MaskType, Room, Schedule, ScheduleMask
 
@@ -21,6 +22,24 @@ if TYPE_CHECKING:
     from apps.users.models import TeacherProfile
 
 RESCHEDULE_REASON = "Перенос"
+
+
+class WeekSessionDate(Func):
+    # ПОЧЕМУ: в PostgreSQL date + integer = сдвиг в днях, поэтому дата занятия
+    # строки сетки выражается скаляром `week_start + day_of_week`. Это снимает
+    # нужду в оконной функции: у строки недельной сетки ровно одна дата, и
+    # пробное сравнивается с ней равенством, а не агрегируется по дням.
+    # week_start уходит биндом, а не в текст запроса
+
+    arg_joiner = " + "
+    template = "(%(expressions)s)"
+    output_field = models.DateField()
+
+    def __init__(self, week_start: datetime.date) -> None:
+        super().__init__(
+            Value(week_start, output_field=models.DateField()),
+            F("day_of_week"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +162,6 @@ def _validate_mask_target(schedule: Schedule, target_date: datetime.date) -> Non
             {"schedule": "Маска на неактивную группу не имеет смысла."},
             code="invalid",
         )
-    # Денормализованное поле свежепрочитанной строки — без JOIN и без N+1.
     if target_date.weekday() != schedule.day_of_week:
         raise ValidationError(
             {
@@ -303,12 +321,20 @@ def build_week_grid(week_start: datetime.date) -> list[WeekSlot]:
     schedules = list(
         Schedule.objects.filter(is_active=True, activity__is_active=True)
         .select_related("activity", "teacher__user", "room")
+        # FIXME: capacity_taken считает по базовой сетке, игнорируя даты
+        # приземления RESCHEDULE-масок
         # ПОЧЕМУ ignore: capacity_taken объявлен на модели ради типизации
         # потребителей; django-stubs считает annotate() переопределением
         .annotate(  # type: ignore[no-redef]
-            capacity_taken=Count(
+            # Постоянные записи держат место всегда, пробные — только в свой
+            # день. Оба COUNT(*) FILTER считаются одним проходом по тому же
+            # JOIN: ни второго запроса, ни сортировки, ни партиционирования
+            capacity_taken=Count("enrollment", filter=regular_seat_q("enrollment__"))
+            + Count(
                 "enrollment",
-                filter=Q(enrollment__status__in=["HELD", "ENROLLED"]),
+                filter=trial_seat_q(
+                    "enrollment__", on_date=WeekSessionDate(week_start)
+                ),
             )
         )
     )
