@@ -26,3 +26,23 @@ class OTPRequestPerEmailThrottle(SimpleRateThrottle):
 
 class OTPVerifyPerIPThrottle(AnonRateThrottle):
     scope = "otp_verify_ip"
+
+
+class AuthTokenRefreshThrottle(SimpleRateThrottle):
+    scope = "auth_token_refresh"
+
+    def get_cache_key(self, request: Request, view: APIView) -> str | None:
+        return self.cache_format % {
+            "scope": self.scope,
+            "ident": self.get_ident(request),
+        }
+
+
+class AuthLogoutThrottle(SimpleRateThrottle):
+    scope = "auth_logout"
+
+    def get_cache_key(self, request: Request, view: APIView) -> str | None:
+        return self.cache_format % {
+            "scope": self.scope,
+            "ident": self.get_ident(request),
+        }

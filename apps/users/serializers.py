@@ -21,3 +21,9 @@ class OTPVerifySerializer(serializers.Serializer[None]):
             "invalid": "Код должен содержать ровно 6 цифр.",
         },
     )
+
+
+class LogoutSerializer(serializers.Serializer[None]):
+    refresh = serializers.CharField(
+        help_text="Refresh-токен для аннулирования",
+    )

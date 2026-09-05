@@ -2,7 +2,12 @@ from django.contrib import admin
 from django.urls import include, path
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
-from apps.users.views import OTPRequestView, OTPVerifyView
+from apps.users.views import (
+    AuthTokenRefreshView,
+    LogoutView,
+    OTPRequestView,
+    OTPVerifyView,
+)
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -14,6 +19,12 @@ urlpatterns = [
     ),
     path("api/v1/auth/otp/request/", OTPRequestView.as_view(), name="otp_request"),
     path("api/v1/auth/otp/verify/", OTPVerifyView.as_view(), name="otp_verify"),
+    path(
+        "api/v1/auth/token/refresh/",
+        AuthTokenRefreshView.as_view(),
+        name="token_refresh",
+    ),
+    path("api/v1/auth/logout/", LogoutView.as_view(), name="logout"),
     path("api/v1/public/", include("apps.schedule.urls")),
     path("api/v1/public/", include("apps.public_forms.urls", namespace="public_forms")),
     path("api/v1/public/", include("apps.public_api.urls", namespace="public_api")),

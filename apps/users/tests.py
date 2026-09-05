@@ -10,6 +10,7 @@ import factory
 import pytest
 from django.utils import timezone
 from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 
 from apps.users.constants import (
     OTP_COOLDOWN_SECONDS,
@@ -303,6 +304,17 @@ class TestVerifyOtp:
 
         token.refresh_from_db()
         assert token.is_used is True
+
+    def test_tokens_are_valid_and_decodable(self) -> None:
+        MagicTokensFactory(email="decode@example.com", code="654321")
+        result = verify_otp("decode@example.com", "654321")
+
+        access = AccessToken(result.access)
+        refresh = RefreshToken(result.refresh)
+        parent = Parent.objects.get(email="decode@example.com")
+
+        assert str(access["user_id"]) == str(parent.pk)
+        assert str(refresh["user_id"]) == str(parent.pk)
 
     def test_normalizes_email_before_lookup(self) -> None:
         # ПОЧЕМУ: проверяем поиск токена по канонической форме,
@@ -676,3 +688,140 @@ class TestOTPVerifyView:
 
         params = data["extensions"]["invalid_params"]
         assert any(p["name"] == "code" for p in params)
+
+
+@pytest.mark.django_db
+class TestAuthTokenRefreshView:
+    def test_refresh_with_valid_token_returns_new_pair_and_authorizes_profile(
+        self, api_client: APIClient
+    ) -> None:
+        parent = ParentFactory(email="refresh_user@example.com")
+        refresh = RefreshToken.for_user(parent)
+
+        resp = api_client.post(
+            "/api/v1/auth/token/refresh/",
+            {"refresh": str(refresh)},
+            content_type="application/json",
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "access" in data
+        assert "refresh" in data
+        assert data["refresh"] != str(refresh)
+
+        # Проверяем, что новый access валиден и авторизует защищенный эндпоинт
+        new_access = data["access"]
+        profile_resp = api_client.get(
+            "/api/v1/me/profile/",
+            HTTP_AUTHORIZATION=f"Bearer {new_access}",
+        )
+        assert profile_resp.status_code == 200
+        assert profile_resp.json()["email"] == "refresh_user@example.com"
+
+    def test_refresh_rotation_blacklists_old_token(self, api_client: APIClient) -> None:
+        parent = ParentFactory(email="rotation@example.com")
+        old_refresh = str(RefreshToken.for_user(parent))
+
+        # Первый refresh успешен
+        resp1 = api_client.post(
+            "/api/v1/auth/token/refresh/",
+            {"refresh": old_refresh},
+            content_type="application/json",
+        )
+        assert resp1.status_code == 200
+
+        # Повторный запрос со старым refresh заблокирован (блэклист)
+        resp2 = api_client.post(
+            "/api/v1/auth/token/refresh/",
+            {"refresh": old_refresh},
+            content_type="application/json",
+        )
+        assert resp2.status_code == 401
+
+    def test_refresh_with_invalid_token_returns_401(
+        self, api_client: APIClient
+    ) -> None:
+        resp = api_client.post(
+            "/api/v1/auth/token/refresh/",
+            {"refresh": "invalid.jwt.token"},
+            content_type="application/json",
+        )
+        assert resp.status_code == 401
+
+
+@pytest.mark.django_db
+class TestAuthLogoutView:
+    def test_logout_blacklists_refresh_token(self, api_client: APIClient) -> None:
+        parent = ParentFactory(email="logout_user@example.com")
+        refresh = RefreshToken.for_user(parent)
+
+        resp = api_client.post(
+            "/api/v1/auth/logout/",
+            {"refresh": str(refresh)},
+            content_type="application/json",
+        )
+        assert resp.status_code == 205
+
+        # Тот же refresh в /token/refresh/ обязан вернуть 401
+        refresh_resp = api_client.post(
+            "/api/v1/auth/token/refresh/",
+            {"refresh": str(refresh)},
+            content_type="application/json",
+        )
+        assert refresh_resp.status_code == 401
+
+    def test_logout_with_already_blacklisted_or_invalid_token_returns_401(
+        self, api_client: APIClient
+    ) -> None:
+        parent = ParentFactory(email="dup_logout@example.com")
+        refresh = RefreshToken.for_user(parent)
+
+        # Первый logout успешен
+        resp1 = api_client.post(
+            "/api/v1/auth/logout/",
+            {"refresh": str(refresh)},
+            content_type="application/json",
+        )
+        assert resp1.status_code == 205
+
+        # Второй logout с тем же токеном возвращает 401 (RFC 9457)
+        resp2 = api_client.post(
+            "/api/v1/auth/logout/",
+            {"refresh": str(refresh)},
+            content_type="application/json",
+        )
+        assert resp2.status_code == 401
+        data = resp2.json()
+        assert data["type"] == "urn:problem-type:invalidtoken"
+        assert data["status"] == 401
+        assert "detail" in data
+
+    def test_logout_validation_error_on_missing_refresh(
+        self, api_client: APIClient
+    ) -> None:
+        resp = api_client.post(
+            "/api/v1/auth/logout/",
+            {},
+            content_type="application/json",
+        )
+        assert resp.status_code == 422
+        data = resp.json()
+        assert data["type"] == "urn:problem-type:validationerror"
+        params = data["extensions"]["invalid_params"]
+        assert any(p["name"] == "refresh" for p in params)
+
+
+@pytest.mark.django_db
+class TestAccessTokenExpiration:
+    def test_expired_access_token_rejected_on_profile(
+        self, api_client: APIClient
+    ) -> None:
+        parent = ParentFactory(email="expired_access@example.com")
+        access = AccessToken.for_user(parent)
+        access.set_exp(lifetime=-timedelta(seconds=1))
+
+        resp = api_client.get(
+            "/api/v1/me/profile/",
+            HTTP_AUTHORIZATION=f"Bearer {str(access)}",
+        )
+        assert resp.status_code == 401

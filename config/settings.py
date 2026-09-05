@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 import sys
 from typing import Literal
@@ -73,6 +74,7 @@ INSTALLED_APPS = [
     "django.contrib.postgres",
     "rest_framework",
     "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
     "phonenumber_field",
     "simple_history",
@@ -171,6 +173,8 @@ if _enable_throttling:
         "otp_request_ip": "5/hour",
         "otp_request_email": "5/hour",
         "otp_verify_ip": "10/min",
+        "auth_token_refresh": "60/min",
+        "auth_logout": "60/min",
     }
 else:
     _throttle_classes = []
@@ -183,6 +187,8 @@ else:
         "otp_request_ip": None,
         "otp_request_email": None,
         "otp_verify_ip": None,
+        "auth_token_refresh": None,
+        "auth_logout": None,
     }
 
 REST_FRAMEWORK = {
@@ -196,6 +202,13 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_CLASSES": _throttle_classes,
     "DEFAULT_THROTTLE_RATES": _throttle_rates,
     "EXCEPTION_HANDLER": "apps.core.exceptions.problem_detail_exception_handler",
+}
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=30),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
 }
 
 SPECTACULAR_SETTINGS = {
