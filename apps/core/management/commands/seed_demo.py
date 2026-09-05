@@ -152,7 +152,13 @@ _ACTIVITIES: list[_ActivitySeed] = [
             "объяснять, почему деталь стоит именно тут. Раз в семестр — внутренний "
             "конкурс проектов, где дети защищают свою работу перед родителями."
         ),
-        "features": ["инженерия", "программирование", "LEGO", "Arduino", "конструирование"],
+        "features": [
+            "инженерия",
+            "программирование",
+            "LEGO",
+            "Arduino",
+            "конструирование",
+        ],
         "tags": [
             "Проектное обучение — свой робот на каждый блок",
             "LEGO и Arduino в одной программе",
@@ -173,7 +179,12 @@ _ACTIVITIES: list[_ActivitySeed] = [
             "по чётким уровням — от starter до elementary. Родители получают короткий "
             "отчёт по итогам каждого месяца: что ребёнок уже умеет сказать сам."
         ),
-        "features": ["языки", "английский", "разговорная практика", "международные программы"],
+        "features": [
+            "языки",
+            "английский",
+            "разговорная практика",
+            "международные программы",
+        ],
         "tags": [
             "Группы строго по возрасту",
             "Учебники Cambridge",
@@ -350,7 +361,9 @@ class Command(BaseCommand):
         for activity_idx, slots in enumerate(_ACTIVITY_SLOTS):
             activity = activities[activity_idx]
             teacher = teachers[activity_idx]
-            for group_idx, (day, start, end, room_idx, age_min, age_max) in enumerate(slots):
+            for group_idx, (day, start, end, room_idx, age_min, age_max) in enumerate(
+                slots
+            ):
                 time_slot, _ = TimeSlot.objects.get_or_create(
                     day_of_week=day, start_time=start, end_time=end
                 )
@@ -436,7 +449,9 @@ class Command(BaseCommand):
                 message="Подскажите, есть ли места в группу робототехники по субботам?",
             )
 
-    def _seed_family(self, activities: list[Activity], groups: list[Schedule]) -> Parent:
+    def _seed_family(
+        self, activities: list[Activity], groups: list[Schedule]
+    ) -> Parent:
         parent = Parent.objects.filter(email=DEMO_PARENT_EMAIL).first()
         if parent is None:
             parent = Parent.objects.create_user(
@@ -491,7 +506,9 @@ class Command(BaseCommand):
                 )
             # Занятие на сегодня, чтобы журнал в админке не был пустым
             Lesson.objects.get_or_create(
-                schedule=demo_groups[0], date=today, defaults={"topic": "Вводное занятие"}
+                schedule=demo_groups[0],
+                date=today,
+                defaults={"topic": "Вводное занятие"},
             )
         return parent
 
