@@ -7,6 +7,7 @@ from django.db.models import Count, Prefetch, Q, QuerySet
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics
+from rest_framework.pagination import LimitOffsetPagination
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -185,19 +186,36 @@ class PublicTeacherListView(generics.ListAPIView[TeacherProfile]):
         )
 
 
+class GalleryPagination(LimitOffsetPagination):
+    # ПОЧЕМУ default_limit=None: без ?limit клиент получает полный список,
+    # как раньше (главная берёт первые N сама). С ?limit=N&offset=M —
+    # постраничная подгрузка для страницы /gallery
+    default_limit = None
+    max_limit = 60
+
+
 @extend_schema(
     operation_id="public_gallery_list",
     summary="Опубликованные фото галереи",
-    responses=GalleryImagePublicSerializer(many=True),
+    description=(
+        "Без query-параметров — весь список массивом (обратная совместимость). "
+        "С ?limit=N (опц. &offset=M) — постраничная выдача в конверте "
+        "{count, next, previous, results} для подгрузки по кнопке/скроллу."
+    ),
 )
 class PublicGalleryListView(generics.ListAPIView[GalleryImage]):
     permission_classes = (AllowAny,)
     authentication_classes = ()
     serializer_class = GalleryImagePublicSerializer
-    pagination_class = None
+    pagination_class = GalleryPagination
     queryset = GalleryImage.objects.filter(is_published=True)
 
     def get(self, request: Request, *args: object, **kwargs: object) -> Response:
+        # Пагинированные запросы не кэшируем: комбинаций limit/offset много,
+        # а payload_cache_key намеренно игнорирует query string. Запрос
+        # дешёвый — одна проиндексированная выборка по (order, id)
+        if "limit" in request.query_params:
+            return super().get(request, *args, **kwargs)
         return cached_payload(
             key=payload_cache_key("gallery", request),
             ttl_seconds=CACHE_TTL_SHOWCASE_SECONDS,
