@@ -21,6 +21,7 @@ from apps.schedule.tests.factories import (
 )
 from apps.users.models import Parent, Student
 from apps.billing.models import SubscriptionStatus
+from apps.billing.tests.factories import SubscriptionSlotFactory
 
 pytestmark = pytest.mark.django_db
 
@@ -138,7 +139,18 @@ class TestSubscriptions:
         subscription = SubscriptionFactory(
             parent=parent, status=SubscriptionStatus.ACTIVE
         )
-        schedule = ScheduleFactory(activity=ActivityFactory(name="Шахматы"))
+        schedule = ScheduleFactory(
+            activity=ActivityFactory(name="Шахматы"),
+            time_slot__day_of_week=5,
+            time_slot__start_time=datetime.time(16, 0),
+            time_slot__end_time=datetime.time(17, 0),
+        )
+        SubscriptionSlotFactory(
+            subscription=subscription,
+            slot_id=schedule.pk,
+            granted_tokens=8,
+            remaining_tokens=6,
+        )
         EnrollmentFactory(student=student, subscription=subscription, schedule=schedule)
         SubscriptionFactory()
 
@@ -147,9 +159,31 @@ class TestSubscriptions:
         assert response.status_code == status.HTTP_200_OK
         payload = response.json()
         assert len(payload) == 1
-        assert payload[0]["display_id"] == f"#SUB-{subscription.pk}"
-        assert payload[0]["student_name"] == "Иванов Иван"
-        assert payload[0]["slots"][0]["activity_name"] == "Шахматы"
+        sub_data = payload[0]
+        assert sub_data["id"] == subscription.pk
+        assert sub_data["display_id"] == f"#SUB-{subscription.pk}"
+        assert sub_data["status"] == "ACTIVE"
+        assert sub_data["student_name"] == "Иванов Иван"
+        assert sub_data["total_remaining"] == 6
+
+        assert len(sub_data["slots"]) == 1
+        slot = sub_data["slots"][0]
+        assert slot["schedule_id"] == schedule.pk
+        assert slot["activity_name"] == "Шахматы"
+        assert slot["group_name"] == schedule.group_name
+        assert slot["schedule"] == "СБ 16:00-17:00"
+        assert slot["remaining_sessions"] == 6
+        assert slot["total_sessions"] == 8
+
+        # Убранные поля не должны возвращаться
+        for removed_field in (
+            "day_of_week",
+            "start_time",
+            "end_time",
+            "student_id",
+            "student_name",
+        ):
+            assert removed_field not in slot
 
 
 class TestUpcomingFeed:

@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
+from apps.billing.models import SubscriptionStatus
 from apps.users.models import Parent, Student
 
 TIME_FORMAT = "%H:%M"
+
+_NON_DRAFT_STATUS_CHOICES = [
+    c for c in SubscriptionStatus.choices if c[0] != SubscriptionStatus.DRAFT
+]
 
 
 class ChildSerializer(serializers.ModelSerializer[Student]):
@@ -26,23 +31,24 @@ class SubscriptionSlotViewSerializer(serializers.Serializer):
     schedule_id = serializers.IntegerField(read_only=True)
     activity_name = serializers.CharField(read_only=True)
     group_name = serializers.CharField(read_only=True, allow_blank=True)
-    day_of_week = serializers.IntegerField(read_only=True)
-    start_time = serializers.TimeField(read_only=True, format=TIME_FORMAT)
-    end_time = serializers.TimeField(read_only=True, format=TIME_FORMAT)
-    student_id = serializers.IntegerField(read_only=True)
-    student_name = serializers.CharField(read_only=True)
+    schedule = serializers.CharField(read_only=True)
     remaining_sessions = serializers.IntegerField(read_only=True)
+    total_sessions = serializers.IntegerField(read_only=True)
 
 
 class SubscriptionViewSerializer(serializers.Serializer):
     id = serializers.IntegerField(read_only=True)
     display_id = serializers.CharField(read_only=True)
-    status = serializers.CharField(read_only=True)
+    status = serializers.ChoiceField(
+        choices=_NON_DRAFT_STATUS_CHOICES,
+        read_only=True,
+    )
     student_name = serializers.CharField(read_only=True, allow_blank=True)
     purchase_price = serializers.IntegerField(read_only=True)
     created_at = serializers.DateTimeField(read_only=True)
     start_date = serializers.DateField(read_only=True, allow_null=True)
     expires_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    total_remaining = serializers.IntegerField(read_only=True)
     slots = SubscriptionSlotViewSerializer(many=True, read_only=True)
 
 
