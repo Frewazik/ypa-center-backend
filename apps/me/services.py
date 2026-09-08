@@ -100,9 +100,6 @@ def list_parent_subscriptions(parent: Parent) -> list[SubscriptionView]:
     views: list[SubscriptionView] = []
     for subscription in subscriptions:
         slots_by_schedule = {slot.slot_id: slot for slot in subscription.slots.all()}
-        total_remaining = sum(
-            slot.remaining_tokens for slot in subscription.slots.all()
-        )
         slot_views: list[SubscriptionSlotView] = []
         student_name = ""
         for enrollment in subscription.enrollments.all():
@@ -123,6 +120,7 @@ def list_parent_subscriptions(parent: Parent) -> list[SubscriptionView]:
                     total_sessions=slot.granted_tokens if slot is not None else 0,
                 )
             )
+        total_remaining = sum(sv.remaining_sessions for sv in slot_views)
         views.append(
             SubscriptionView(
                 id=subscription.pk,

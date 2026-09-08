@@ -20,7 +20,7 @@ from apps.schedule.tests.factories import (
     SubscriptionFactory,
 )
 from apps.users.models import Parent, Student
-from apps.billing.models import SubscriptionStatus
+from apps.billing.models import EnrollmentStatus, SubscriptionStatus
 from apps.billing.tests.factories import SubscriptionSlotFactory
 
 pytestmark = pytest.mark.django_db
@@ -184,6 +184,61 @@ class TestSubscriptions:
             "student_name",
         ):
             assert removed_field not in slot
+
+    def test_canceled_enrollment_slot_not_counted_in_total_remaining(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        student = StudentFactory(parent=parent, full_name="Иванов Иван")
+        subscription = SubscriptionFactory(
+            parent=parent, status=SubscriptionStatus.ACTIVE
+        )
+        active_schedule = ScheduleFactory(activity=ActivityFactory(name="Шахматы"))
+        canceled_schedule = ScheduleFactory(
+            activity=ActivityFactory(name="Робототехника")
+        )
+
+        # Активный слот: 4 фишки
+        SubscriptionSlotFactory(
+            subscription=subscription,
+            slot_id=active_schedule.pk,
+            granted_tokens=4,
+            remaining_tokens=4,
+        )
+        EnrollmentFactory(
+            student=student,
+            subscription=subscription,
+            schedule=active_schedule,
+            status=EnrollmentStatus.ENROLLED,
+        )
+
+        # Отменённый слот: в слоте БД осталось 2 фишки, но запись отменена
+        SubscriptionSlotFactory(
+            subscription=subscription,
+            slot_id=canceled_schedule.pk,
+            granted_tokens=4,
+            remaining_tokens=2,
+        )
+        EnrollmentFactory(
+            student=student,
+            subscription=subscription,
+            schedule=canceled_schedule,
+            status=EnrollmentStatus.CANCELED,
+        )
+
+        response = api_client.get(SUBSCRIPTIONS_URL)
+
+        assert response.status_code == status.HTTP_200_OK
+        payload = response.json()
+        assert len(payload) == 1
+        sub_data = payload[0]
+
+        # В slots только активная запись
+        assert len(sub_data["slots"]) == 1
+        assert sub_data["slots"][0]["schedule_id"] == active_schedule.pk
+        assert sub_data["slots"][0]["remaining_sessions"] == 4
+
+        # total_remaining сходится с суммой по видимым слотам (4, а не 4 + 2 = 6)
+        assert sub_data["total_remaining"] == 4
 
 
 class TestUpcomingFeed:
