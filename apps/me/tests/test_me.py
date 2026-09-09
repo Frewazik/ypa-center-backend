@@ -258,9 +258,16 @@ class TestUpcomingFeed:
         assert len(sessions) == 2
         assert sessions[0]["activity_name"] == "Шахматы"
         assert all(
-            datetime.date.fromisoformat(item["date"]).weekday() == schedule.day_of_week
+            datetime.datetime.strptime(item["date"], "%d.%m.%Y").weekday()
+            == schedule.day_of_week
             for item in sessions
         )
+        expected_time = (
+            f"{schedule.start_time:%H:%M}-{schedule.end_time:%H:%M}"
+            if schedule.end_time
+            else f"{schedule.start_time:%H:%M}"
+        )
+        assert sessions[0]["time"] == expected_time
 
     def test_cancellation_mask_hides_session(
         self, api_client: APIClient, parent: Parent
@@ -278,7 +285,7 @@ class TestUpcomingFeed:
         response = api_client.get(UPCOMING_URL, {"weeks": 1})
 
         dates = {item["date"] for item in response.json()}
-        assert first_session.isoformat() not in dates
+        assert first_session.strftime("%d.%m.%Y") not in dates
 
     def test_event_matched_by_phone(
         self, api_client: APIClient, parent: Parent
