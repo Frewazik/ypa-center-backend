@@ -227,6 +227,37 @@ class TestRequestOtp:
         email_arg = mock_task.kiq.await_args.args[0]
         assert email_arg == "task@example.com"
 
+    def test_queue_failure_does_not_raise_and_keeps_token(
+        self, django_capture_on_commit_callbacks: CaptureOnCommitCallbacks
+    ) -> None:
+        # ПОЧЕМУ: регрессия на баг из прод-инцидента — SendTaskError
+        # (протухшее соединение брокера в sync-раннере) пробрасывался из
+        # on_commit-колбэка наружу, и вьюха отдавала 500 вместо 202,
+        # хотя MagicTokens уже был закоммичен.
+        with patch("apps.users.services.send_otp_email_task") as mock_task:
+            mock_task.kiq = AsyncMock(side_effect=RuntimeError("Event loop is closed"))
+            with django_capture_on_commit_callbacks(execute=True):
+                request_otp("queuefail@example.com")  # не должно бросить
+
+        assert (
+            MagicTokens.objects.filter(
+                email="queuefail@example.com", is_used=False
+            ).count()
+            == 1
+        )
+
+    def test_queue_failure_resets_broker_connection_pool(
+        self, django_capture_on_commit_callbacks: CaptureOnCommitCallbacks
+    ) -> None:
+        # ПОЧЕМУ: без сброса пула следующий запрос переиспользует сокет
+        # из закрытого event loop'а и падает с той же ошибкой снова
+        with patch("apps.users.services.send_otp_email_task") as mock_task:
+            mock_task.kiq = AsyncMock(side_effect=RuntimeError("Event loop is closed"))
+            with django_capture_on_commit_callbacks(execute=True):
+                request_otp("poolreset@example.com")
+
+        mock_task.broker.connection_pool.reset.assert_called_once()
+
     def test_raises_cooldown_within_interval(self) -> None:
         with patch("apps.users.services.send_otp_email_task") as mock_task:
             mock_task.kiq = AsyncMock()
