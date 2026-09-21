@@ -64,6 +64,7 @@ class WeekSlot:
     activity_id: int
     activity_name: str
     activity_slug: str
+    group_name: str
     teacher_id: int | None
     teacher_full_name: str | None
     room_id: int | None
@@ -469,6 +470,7 @@ def _build_slot(
         activity_id=activity.pk,
         activity_name=activity.name,
         activity_slug=activity.slug,
+        group_name=schedule.group_name,
         teacher_id=teacher.pk if teacher is not None else None,
         teacher_full_name=_teacher_full_name(teacher),
         room_id=room.pk if room is not None else None,

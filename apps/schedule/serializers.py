@@ -74,6 +74,7 @@ class WeekSlotSerializer(serializers.Serializer):
     day_of_week = serializers.IntegerField(read_only=True)
     start_time = serializers.TimeField(read_only=True, format=TIME_FORMAT)
     end_time = serializers.TimeField(read_only=True, format=TIME_FORMAT)
+    group_name = serializers.CharField(read_only=True)
     activity = serializers.SerializerMethodField()
     teacher = serializers.SerializerMethodField()
     room = serializers.SerializerMethodField()

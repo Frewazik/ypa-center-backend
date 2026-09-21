@@ -68,7 +68,17 @@ async def verify_captcha_token(token: str, remote_ip: str | None) -> bool:
 
 
 def _enqueue_notification(request_id: int, form_type: FormType) -> None:
-    async_to_sync(notify_managers_task.kiq)(request_id, form_type)
+    try:
+        async_to_sync(notify_managers_task.kiq)(request_id, form_type)
+    except Exception:
+        # ПОЧЕМУ: сбой очереди уведомлений не должен ломать уже сохранённую заявку клиенту
+        logger.exception("Не удалось отправить задачу уведомления менеджеров в очередь")
+    finally:
+        # ПОЧЕМУ: async_to_sync закрывает созданный локальный event loop.
+        # Без сброса пула следующий запрос попытается переиспользовать сокет
+        # из закрытого loop'а и упадёт с 'Event loop is closed'
+        if hasattr(notify_managers_task.broker, "connection_pool"):
+            notify_managers_task.broker.connection_pool.reset()
 
 
 def _schedule_manager_notification(request_id: int, form_type: FormType) -> None:

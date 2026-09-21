@@ -7,12 +7,10 @@ from rest_framework.views import APIView
 
 class OTPRequestPerIPThrottle(AnonRateThrottle):
     scope = "otp_request_ip"
-    rate = "5/hour"
 
 
 class OTPRequestPerEmailThrottle(SimpleRateThrottle):
     scope = "otp_request_email"
-    rate = "5/hour"
 
     def get_cache_key(self, request: Request, view: APIView) -> str | None:
         email = request.data.get("email")
@@ -28,4 +26,23 @@ class OTPRequestPerEmailThrottle(SimpleRateThrottle):
 
 class OTPVerifyPerIPThrottle(AnonRateThrottle):
     scope = "otp_verify_ip"
-    rate = "10/min"
+
+
+class AuthTokenRefreshThrottle(SimpleRateThrottle):
+    scope = "auth_token_refresh"
+
+    def get_cache_key(self, request: Request, view: APIView) -> str | None:
+        return self.cache_format % {
+            "scope": self.scope,
+            "ident": self.get_ident(request),
+        }
+
+
+class AuthLogoutThrottle(SimpleRateThrottle):
+    scope = "auth_logout"
+
+    def get_cache_key(self, request: Request, view: APIView) -> str | None:
+        return self.cache_format % {
+            "scope": self.scope,
+            "ident": self.get_ident(request),
+        }

@@ -30,7 +30,7 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 COPY . .
 
-RUN SECRET_KEY=dummy_key_for_build python manage.py collectstatic --noinput
+RUN SECRET_KEY=build-time-placeholder python manage.py collectstatic --noinput
 
 EXPOSE 8000
 

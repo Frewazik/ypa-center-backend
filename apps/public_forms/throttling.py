@@ -4,7 +4,7 @@ from apps.core.throttling import ClientIPRateThrottle
 
 
 class PublicFormIPThrottle(ClientIPRateThrottle):
-    rate = "3/min"
+    pass
 
 
 class CallbackIPThrottle(PublicFormIPThrottle):

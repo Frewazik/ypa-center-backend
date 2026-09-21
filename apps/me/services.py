@@ -27,17 +27,17 @@ UPCOMING_MAX_WEEKS: Final[int] = 8
 UpcomingKind: TypeAlias = Literal["SUBSCRIPTION_SESSION", "TRIAL", "EVENT"]
 
 
+_WEEKDAY_ABBR_RU: Final = ("ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС")
+
+
 @dataclass(frozen=True, slots=True)
 class SubscriptionSlotView:
     schedule_id: int
     activity_name: str
     group_name: str
-    day_of_week: int
-    start_time: datetime.time
-    end_time: datetime.time
-    student_id: int
-    student_name: str
+    schedule: str
     remaining_sessions: int
+    total_sessions: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +50,7 @@ class SubscriptionView:
     created_at: datetime.datetime
     start_date: datetime.date | None
     expires_at: datetime.datetime | None
+    total_remaining: int
     slots: list[SubscriptionSlotView]
 
 
@@ -115,27 +116,28 @@ def list_parent_subscriptions(parent: Parent) -> list[SubscriptionView]:
 
     views: list[SubscriptionView] = []
     for subscription in subscriptions:
-        remaining_by_schedule = {
-            slot.slot_id: slot.remaining_tokens for slot in subscription.slots.all()
-        }
+        slots_by_schedule = {slot.slot_id: slot for slot in subscription.slots.all()}
         slot_views: list[SubscriptionSlotView] = []
         student_name = ""
         for enrollment in subscription.enrollments.all():
             schedule = enrollment.schedule
             student_name = enrollment.student.full_name
+            slot = slots_by_schedule.get(schedule.pk)
+            schedule_str = (
+                f"{_WEEKDAY_ABBR_RU[schedule.day_of_week]} "
+                f"{schedule.start_time:%H:%M}-{schedule.end_time:%H:%M}"
+            )
             slot_views.append(
                 SubscriptionSlotView(
                     schedule_id=schedule.pk,
                     activity_name=schedule.activity.name,
                     group_name=schedule.group_name,
-                    day_of_week=schedule.day_of_week,
-                    start_time=schedule.start_time,
-                    end_time=schedule.end_time,
-                    student_id=enrollment.student.pk,
-                    student_name=enrollment.student.full_name,
-                    remaining_sessions=remaining_by_schedule.get(schedule.pk, 0),
+                    schedule=schedule_str,
+                    remaining_sessions=slot.remaining_tokens if slot is not None else 0,
+                    total_sessions=slot.granted_tokens if slot is not None else 0,
                 )
             )
+        total_remaining = sum(sv.remaining_sessions for sv in slot_views)
         views.append(
             SubscriptionView(
                 id=subscription.pk,
@@ -146,6 +148,7 @@ def list_parent_subscriptions(parent: Parent) -> list[SubscriptionView]:
                 created_at=subscription.created_at,
                 start_date=subscription.start_date,
                 expires_at=subscription.expires_at,
+                total_remaining=total_remaining,
                 slots=slot_views,
             )
         )

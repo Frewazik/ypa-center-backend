@@ -21,10 +21,12 @@ from apps.schedule.tests.factories import (
 )
 from apps.users.models import Parent, Student
 from apps.billing.models import (
+    EnrollmentStatus,
     SubscriptionStatus,
     Transaction,
     TransactionStatus,
 )
+from apps.billing.tests.factories import SubscriptionSlotFactory
 
 pytestmark = pytest.mark.django_db
 
@@ -143,7 +145,18 @@ class TestSubscriptions:
         subscription = SubscriptionFactory(
             parent=parent, status=SubscriptionStatus.ACTIVE
         )
-        schedule = ScheduleFactory(activity=ActivityFactory(name="Шахматы"))
+        schedule = ScheduleFactory(
+            activity=ActivityFactory(name="Шахматы"),
+            time_slot__day_of_week=5,
+            time_slot__start_time=datetime.time(16, 0),
+            time_slot__end_time=datetime.time(17, 0),
+        )
+        SubscriptionSlotFactory(
+            subscription=subscription,
+            slot_id=schedule.pk,
+            granted_tokens=8,
+            remaining_tokens=6,
+        )
         EnrollmentFactory(student=student, subscription=subscription, schedule=schedule)
         SubscriptionFactory()
 
@@ -152,9 +165,86 @@ class TestSubscriptions:
         assert response.status_code == status.HTTP_200_OK
         payload = response.json()
         assert len(payload) == 1
-        assert payload[0]["display_id"] == f"#SUB-{subscription.pk}"
-        assert payload[0]["student_name"] == "Иванов Иван"
-        assert payload[0]["slots"][0]["activity_name"] == "Шахматы"
+        sub_data = payload[0]
+        assert sub_data["id"] == subscription.pk
+        assert sub_data["display_id"] == f"#SUB-{subscription.pk}"
+        assert sub_data["status"] == "ACTIVE"
+        assert sub_data["student_name"] == "Иванов Иван"
+        assert sub_data["total_remaining"] == 6
+
+        assert len(sub_data["slots"]) == 1
+        slot = sub_data["slots"][0]
+        assert slot["schedule_id"] == schedule.pk
+        assert slot["activity_name"] == "Шахматы"
+        assert slot["group_name"] == schedule.group_name
+        assert slot["schedule"] == "СБ 16:00-17:00"
+        assert slot["remaining_sessions"] == 6
+        assert slot["total_sessions"] == 8
+
+        # Убранные поля не должны возвращаться
+        for removed_field in (
+            "day_of_week",
+            "start_time",
+            "end_time",
+            "student_id",
+            "student_name",
+        ):
+            assert removed_field not in slot
+
+    def test_canceled_enrollment_slot_not_counted_in_total_remaining(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        student = StudentFactory(parent=parent, full_name="Иванов Иван")
+        subscription = SubscriptionFactory(
+            parent=parent, status=SubscriptionStatus.ACTIVE
+        )
+        active_schedule = ScheduleFactory(activity=ActivityFactory(name="Шахматы"))
+        canceled_schedule = ScheduleFactory(
+            activity=ActivityFactory(name="Робототехника")
+        )
+
+        # Активный слот: 4 фишки
+        SubscriptionSlotFactory(
+            subscription=subscription,
+            slot_id=active_schedule.pk,
+            granted_tokens=4,
+            remaining_tokens=4,
+        )
+        EnrollmentFactory(
+            student=student,
+            subscription=subscription,
+            schedule=active_schedule,
+            status=EnrollmentStatus.ENROLLED,
+        )
+
+        # Отменённый слот: в слоте БД осталось 2 фишки, но запись отменена
+        SubscriptionSlotFactory(
+            subscription=subscription,
+            slot_id=canceled_schedule.pk,
+            granted_tokens=4,
+            remaining_tokens=2,
+        )
+        EnrollmentFactory(
+            student=student,
+            subscription=subscription,
+            schedule=canceled_schedule,
+            status=EnrollmentStatus.CANCELED,
+        )
+
+        response = api_client.get(SUBSCRIPTIONS_URL)
+
+        assert response.status_code == status.HTTP_200_OK
+        payload = response.json()
+        assert len(payload) == 1
+        sub_data = payload[0]
+
+        # В slots только активная запись
+        assert len(sub_data["slots"]) == 1
+        assert sub_data["slots"][0]["schedule_id"] == active_schedule.pk
+        assert sub_data["slots"][0]["remaining_sessions"] == 4
+
+        # total_remaining сходится с суммой по видимым слотам (4, а не 4 + 2 = 6)
+        assert sub_data["total_remaining"] == 4
 
 
 class TestUpcomingFeed:
@@ -174,9 +264,16 @@ class TestUpcomingFeed:
         assert len(sessions) == 2
         assert sessions[0]["activity_name"] == "Шахматы"
         assert all(
-            datetime.date.fromisoformat(item["date"]).weekday() == schedule.day_of_week
+            datetime.datetime.strptime(item["date"], "%d.%m.%Y").weekday()
+            == schedule.day_of_week
             for item in sessions
         )
+        expected_time = (
+            f"{schedule.start_time:%H:%M}-{schedule.end_time:%H:%M}"
+            if schedule.end_time
+            else f"{schedule.start_time:%H:%M}"
+        )
+        assert sessions[0]["time"] == expected_time
 
     def test_cancellation_mask_hides_session(
         self, api_client: APIClient, parent: Parent
@@ -194,7 +291,7 @@ class TestUpcomingFeed:
         response = api_client.get(UPCOMING_URL, {"weeks": 1})
 
         dates = {item["date"] for item in response.json()}
-        assert first_session.isoformat() not in dates
+        assert first_session.strftime("%d.%m.%Y") not in dates
 
     def test_event_matched_by_phone(
         self, api_client: APIClient, parent: Parent

@@ -1,15 +1,24 @@
 from __future__ import annotations
 
-from drf_spectacular.utils import OpenApiResponse, extend_schema
-from rest_framework import exceptions, status
+from drf_spectacular.utils import OpenApiResponse, extend_schema, inline_serializer
+from rest_framework import exceptions, serializers, status
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenRefreshView
 
 from apps.users.constants import OTP_CODE_TTL_SECONDS, OTP_COOLDOWN_SECONDS
-from apps.users.serializers import OTPRequestSerializer, OTPVerifySerializer
+from apps.users.serializers import (
+    LogoutSerializer,
+    OTPRequestSerializer,
+    OTPVerifySerializer,
+)
 from apps.users.throttling import (
+    AuthLogoutThrottle,
+    AuthTokenRefreshThrottle,
     OTPRequestPerEmailThrottle,
     OTPRequestPerIPThrottle,
     OTPVerifyPerIPThrottle,
@@ -108,3 +117,49 @@ class OTPVerifyView(APIView):
             {"access": tokens.access, "refresh": tokens.refresh},
             status=status.HTTP_200_OK,
         )
+
+
+@extend_schema(
+    responses={
+        200: inline_serializer(
+            "TokenRefreshResponse",
+            fields={
+                "access": serializers.CharField(),
+                "refresh": serializers.CharField(),
+            },
+        ),
+        401: OpenApiResponse(description="Невалидный или истёкший refresh-токен"),
+    },
+    summary="Обновление access-токена",
+    tags=["auth"],
+)
+class AuthTokenRefreshView(TokenRefreshView):
+    permission_classes = ()
+    throttle_classes = [AuthTokenRefreshThrottle]
+
+
+class LogoutView(APIView):
+    permission_classes = [AllowAny]
+    throttle_classes = [AuthLogoutThrottle]
+
+    @extend_schema(
+        request=LogoutSerializer,
+        responses={
+            205: OpenApiResponse(description="Успешный выход, токен аннулирован"),
+            400: OpenApiResponse(description="Ошибка валидации формата полей"),
+            401: OpenApiResponse(description="Невалидный или истёкший токен"),
+        },
+        summary="Выход из системы (аннулирование refresh-токена)",
+        tags=["auth"],
+    )
+    def post(self, request: Request) -> Response:
+        serializer = LogoutSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            token = RefreshToken(serializer.validated_data["refresh"])
+            token.blacklist()
+        except TokenError:
+            raise InvalidToken("Неверный или истёкший refresh-токен.")
+
+        return Response(status=status.HTTP_205_RESET_CONTENT)

@@ -228,6 +228,7 @@ def test_public_schedule_endpoint_matches_contract_shape() -> None:
         "day_of_week",
         "start_time",
         "end_time",
+        "group_name",
         "activity",
         "teacher",
         "room",
