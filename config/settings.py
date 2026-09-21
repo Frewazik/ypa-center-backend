@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
+import sys
 from typing import Literal
 
 import dj_database_url
@@ -22,6 +24,7 @@ class Settings(BaseSettings):
         default=["localhost", "127.0.0.1", "127.0.0.1:8000"]
     )
     ENVIRONMENT: Literal["local", "staging", "production"] = "local"
+    ENABLE_THROTTLING: bool | None = None
 
     DATABASE_URL: str = Field(
         default="postgresql://postgres:postgres@localhost:5432/yra"
@@ -41,6 +44,11 @@ class Settings(BaseSettings):
     EMAIL_HOST_USER: str = ""
     EMAIL_HOST_PASSWORD: str = ""
     EMAIL_USE_TLS: bool = False
+
+    CAPTCHA_VERIFY_URL: str = (
+        "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+    )
+    CAPTCHA_SECRET_KEY: str = "1x0000000000000000000000000000000AA"
 
 
 # ПОЧЕМУ ignore: обязательные поля заполняет pydantic-settings из env/.env,
@@ -66,6 +74,7 @@ INSTALLED_APPS = [
     "django.contrib.postgres",
     "rest_framework",
     "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
     "phonenumber_field",
     "simple_history",
@@ -143,6 +152,45 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
 
+_is_testing = "pytest" in sys.modules or any("pytest" in arg for arg in sys.argv)
+_enable_throttling = (
+    _env.ENABLE_THROTTLING
+    if _env.ENABLE_THROTTLING is not None
+    else (_env.ENVIRONMENT in ("staging", "production") or _is_testing)
+)
+
+if _enable_throttling:
+    _throttle_classes = [
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
+    ]
+    _throttle_rates: dict[str, str | None] = {
+        "anon": "1000/hour",
+        "user": "5000/hour",
+        "public_forms_callback": "3/min",
+        "public_forms_feedback": "3/min",
+        "events_registration": "3/min",
+        "otp_request_ip": "5/hour",
+        "otp_request_email": "5/hour",
+        "otp_verify_ip": "10/min",
+        "auth_token_refresh": "60/min",
+        "auth_logout": "60/min",
+    }
+else:
+    _throttle_classes = []
+    _throttle_rates = {
+        "anon": None,
+        "user": None,
+        "public_forms_callback": None,
+        "public_forms_feedback": None,
+        "events_registration": None,
+        "otp_request_ip": None,
+        "otp_request_email": None,
+        "otp_verify_ip": None,
+        "auth_token_refresh": None,
+        "auth_logout": None,
+    }
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
@@ -151,16 +199,16 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticated",
     ],
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
-    "DEFAULT_THROTTLE_CLASSES": [
-        "rest_framework.throttling.AnonRateThrottle",
-        "rest_framework.throttling.UserRateThrottle",
-    ],
-    # TODO: лимиты задушат SPA; переписать на ScopedThrottles после тестов
-    "DEFAULT_THROTTLE_RATES": {
-        "anon": "100/hour",
-        "user": "1000/hour",
-    },
+    "DEFAULT_THROTTLE_CLASSES": _throttle_classes,
+    "DEFAULT_THROTTLE_RATES": _throttle_rates,
     "EXCEPTION_HANDLER": "apps.core.exceptions.problem_detail_exception_handler",
+}
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=30),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
 }
 
 SPECTACULAR_SETTINGS = {
@@ -213,8 +261,8 @@ EMAIL_HOST_PASSWORD = _env.EMAIL_HOST_PASSWORD
 EMAIL_USE_TLS = _env.EMAIL_USE_TLS
 AUTH_USER_MODEL = "users.Parent"
 
-CAPTCHA_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
-CAPTCHA_SECRET_KEY = "dummy-secret-key"
+CAPTCHA_VERIFY_URL = _env.CAPTCHA_VERIFY_URL
+CAPTCHA_SECRET_KEY = _env.CAPTCHA_SECRET_KEY
 # ПОЧЕМУ: public_forms читает этот таймаут для httpx; без него проверка
 # капчи падала бы в AttributeError на первом же запросе
 EXTERNAL_HTTP_TIMEOUT_SECONDS = 5.0

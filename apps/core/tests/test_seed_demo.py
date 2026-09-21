@@ -15,11 +15,12 @@ pytestmark = pytest.mark.django_db
 
 
 class TestSeedDemo:
-    def test_populates_showcase_and_family(self) -> None:
+    def test_populates_showcase_and_family(self, settings) -> None:
+        settings.DEBUG = True
         call_command("seed_demo")
 
         assert Activity.objects.count() == 4
-        assert Schedule.objects.count() == 8
+        assert Schedule.objects.count() == 12
         assert SubscriptionPlan.objects.count() == 6
         assert Event.objects.filter(is_published=True).count() == 2
 
@@ -32,12 +33,13 @@ class TestSeedDemo:
         assert admin.is_superuser
         assert admin.check_password("admin123")
 
-    def test_second_run_is_idempotent(self) -> None:
+    def test_second_run_is_idempotent(self, settings) -> None:
+        settings.DEBUG = True
         call_command("seed_demo")
         call_command("seed_demo")
 
         assert Activity.objects.count() == 4
-        assert Schedule.objects.count() == 8
+        assert Schedule.objects.count() == 12
         assert SubscriptionPlan.objects.count() == 6
         assert Subscription.objects.filter(parent__email="parent@demo.ru").count() == 1
 
@@ -48,6 +50,7 @@ class TestSeedDemo:
             with pytest.raises(CommandError):
                 call_command("seed_demo")
 
-    def test_no_admin_flag_skips_superuser(self) -> None:
+    def test_no_admin_flag_skips_superuser(self, settings) -> None:
+        settings.DEBUG = True
         call_command("seed_demo", "--no-admin")
         assert not Parent.objects.filter(email="admin@demo.ru").exists()

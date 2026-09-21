@@ -34,6 +34,8 @@ DEMO_ADMIN_PASSWORD = "admin123"  # noqa: S105 — демо-стенд, не с�
 DEMO_PARENT_EMAIL = "parent@demo.ru"
 TEACHER_GROUP_NAME = "Учителя"
 
+_ROOM_NAMES: tuple[str, ...] = ("Жёлтый кабинет", "Синий кабинет", "Зелёный кабинет")
+
 
 class _TeacherSeed(TypedDict):
     email: str
@@ -41,6 +43,7 @@ class _TeacherSeed(TypedDict):
     middle_name: str
     position: str
     quote: str
+    bio: str
 
 
 class _ActivitySeed(TypedDict):
@@ -48,9 +51,13 @@ class _ActivitySeed(TypedDict):
     slug: str
     price: int
     short: str
+    description: str
     tags: list[str]
+    features: list[str]
 
 
+# ПОЧЕМУ: индекс в списке = индекс в _ACTIVITIES и в _ACTIVITY_SLOTS —
+# один преподаватель ведёт один кружок, без модульной раскидки как раньше
 _TEACHERS: list[_TeacherSeed] = [
     {
         "email": "e.smirnova@demo.ru",
@@ -58,6 +65,13 @@ _TEACHERS: list[_TeacherSeed] = [
         "middle_name": "Викторовна",
         "position": "Педагог ментальной арифметики",
         "quote": "Счёт в уме — это гимнастика для мозга.",
+        "bio": (
+            "Преподаёт ментальную арифметику больше 7 лет, обучалась методике соробана "
+            "в сертифицированной школе. Считает, что главный результат курса — не "
+            "скорость счёта, а умение ребёнка удерживать внимание на задаче до конца, "
+            "не отвлекаясь. Следит, чтобы каждый продвигался в своём темпе, без "
+            "сравнения с другими детьми в группе."
+        ),
     },
     {
         "email": "d.orlov@demo.ru",
@@ -65,6 +79,13 @@ _TEACHERS: list[_TeacherSeed] = [
         "middle_name": "Сергеевич",
         "position": "Преподаватель робототехники",
         "quote": "Сначала ломаем, потом чиним — так и учимся.",
+        "bio": (
+            "Инженер по образованию, до преподавания несколько лет работал на "
+            "производстве автоматизированных систем. В работе с детьми делает ставку "
+            "на живой эксперимент: если конструкция развалилась — это повод "
+            "разобраться, почему, а не повод расстроиться. Ведёт занятия так, чтобы "
+            "к концу блока у каждого ребёнка был собственный работающий проект."
+        ),
     },
     {
         "email": "a.kim@demo.ru",
@@ -72,6 +93,27 @@ _TEACHERS: list[_TeacherSeed] = [
         "middle_name": "Александровна",
         "position": "Преподаватель английского",
         "quote": "Язык — это игра, в которую играют каждый день.",
+        "bio": (
+            "Преподаёт английский детям больше 6 лет, работала также с "
+            "билингвальными группами. Убеждена, что страх ошибиться — главный тормоз "
+            "в изучении языка, поэтому на занятиях нет оценок за произношение — только "
+            "поддержка и повтор. Регулярно обновляет программу под интересы "
+            "конкретной группы — от мультфильмов до настольных игр на английском."
+        ),
+    },
+    {
+        "email": "i.volkov@demo.ru",
+        "full_name": "Волков Игорь",
+        "middle_name": "Петрович",
+        "position": "Тренер по шахматам",
+        "quote": "Шахматы учат проигрывать достойно — это половина успеха в жизни.",
+        "bio": (
+            "Кандидат в мастера спорта по шахматам, судья второй категории, "
+            "тренирует детей больше 10 лет. Считает, что шахматы — не про "
+            "запоминание дебютов, а про привычку думать на несколько ходов вперёд "
+            "и спокойно разбирать свои ошибки после партии. Дважды в год вывозит "
+            "учеников на городские турниры среди детских клубов."
+        ),
     },
 ]
 
@@ -80,43 +122,133 @@ _ACTIVITIES: list[_ActivitySeed] = [
         "name": "Ментальная арифметика",
         "slug": "mentalnaya-arifmetika",
         "price": 120_000,
-        "short": "Устный счёт, память и концентрация для детей 6–12 лет.",
-        "tags": ["математика", "логика"],
+        "short": "Устный счёт на соробане, память и концентрация для детей 6–12 лет.",
+        "description": (
+            "Дети считают на соробане — японских счётах, а затем учатся представлять "
+            "его в уме и считать без косточек. Это не про быстрый счёт ради счёта: "
+            "тренируются одновременно оба полушария, развивается память, внимание и "
+            "усидчивость. Группы маленькие — до 8 человек, педагог успевает разобрать "
+            "ошибку каждого. Раз в два месяца — контрольный срез, чтобы родители "
+            "видели реальный прогресс, а не просто посещаемость."
+        ),
+        "features": ["математика", "логика", "память", "концентрация", "устный счёт"],
+        "tags": [
+            "Соробан и мысленный счёт",
+            "Мини-группы до 8 человек",
+            "Контрольные срезы раз в 2 месяца",
+            "Домашние задания с разбором ошибок",
+        ],
     },
     {
         "name": "Робототехника",
         "slug": "robototehnika",
         "price": 150_000,
         "short": "Конструируем и программируем роботов на LEGO и Arduino.",
-        "tags": ["инженерия", "программирование"],
+        "description": (
+            "От первых механизмов на LEGO до программирования Arduino — дети проходят "
+            "путь от конструктора до работающего устройства своими руками. Каждый блок "
+            "занятий заканчивается собственным проектом: миксером, роботом-манипулятором "
+            "или светофором с датчиком. Учим не просто повторять инструкцию, а "
+            "объяснять, почему деталь стоит именно тут. Раз в семестр — внутренний "
+            "конкурс проектов, где дети защищают свою работу перед родителями."
+        ),
+        "features": [
+            "инженерия",
+            "программирование",
+            "LEGO",
+            "Arduino",
+            "конструирование",
+        ],
+        "tags": [
+            "Проектное обучение — свой робот на каждый блок",
+            "LEGO и Arduino в одной программе",
+            "Конкурс проектов раз в семестр",
+            "Свой набор деталей на ребёнка",
+        ],
     },
     {
         "name": "Английский для детей",
         "slug": "angliyskiy-dlya-detey",
         "price": 110_000,
         "short": "Разговорный английский в игровой форме, группы по возрасту.",
-        "tags": ["языки"],
+        "description": (
+            "Английский без зубрёжки правил: дети играют, поют, разыгрывают сценки — "
+            "и незаметно для себя начинают говорить. Группы собраны строго по возрасту, "
+            "поэтому темп и лексика подобраны под конкретный этап развития речи. "
+            "Педагог использует международные учебники Cambridge и следит за прогрессом "
+            "по чётким уровням — от starter до elementary. Родители получают короткий "
+            "отчёт по итогам каждого месяца: что ребёнок уже умеет сказать сам."
+        ),
+        "features": [
+            "языки",
+            "английский",
+            "разговорная практика",
+            "международные программы",
+        ],
+        "tags": [
+            "Группы строго по возрасту",
+            "Учебники Cambridge",
+            "Ежемесячный отчёт для родителей",
+            "Игровой формат без письменных тестов",
+        ],
     },
     {
         "name": "Шахматы",
         "slug": "shahmaty",
         "price": 100_000,
         "short": "От первых ходов до турниров, тренер с разрядом.",
-        "tags": ["логика", "турниры"],
+        "description": (
+            "Начинаем с базовых правил и техники безопасности фигур, дальше — "
+            "дебютные схемы, простые эндшпили и первые турнирные партии внутри клуба. "
+            "Тренер — кандидат в мастера спорта, ведёт занятия так, чтобы ребёнок "
+            "учился думать на несколько ходов вперёд, а не запоминать готовые "
+            "комбинации. Дважды в год — открытый турнир с награждением, куда можно "
+            "позвать родителей поболеть."
+        ),
+        "features": ["логика", "стратегия", "шахматы", "турниры"],
+        "tags": [
+            "Тренер — КМС по шахматам",
+            "Турнир внутри клуба дважды в год",
+            "От новичка до разрядной подготовки",
+            "Разбор партий после каждой игры",
+        ],
     },
 ]
 
-# (день недели, начало, конец) — все слоты разные, коллизии
-# преподавателей и кабинетов исключены по построению
-_SLOT_GRID: list[tuple[int, datetime.time, datetime.time]] = [
-    (0, datetime.time(16, 0), datetime.time(17, 0)),
-    (0, datetime.time(17, 30), datetime.time(18, 30)),
-    (1, datetime.time(16, 0), datetime.time(17, 0)),
-    (2, datetime.time(17, 0), datetime.time(18, 0)),
-    (3, datetime.time(16, 30), datetime.time(17, 30)),
-    (4, datetime.time(18, 0), datetime.time(19, 0)),
-    (5, datetime.time(10, 0), datetime.time(11, 0)),
-    (5, datetime.time(11, 30), datetime.time(12, 30)),
+# Слоты на каждый кружок: (день недели, начало, конец, индекс кабинета в _ROOM_NAMES,
+# возраст от, возраст до). 3 группы на кружок. Преподаватель у каждого кружка один —
+# коллизий по преподавателю между новыми слотами быть не может по построению.
+# ПОЧЕМУ дни/время именно такие: в базе с прошлых прогонов уже сидят 8 старых групп
+# расписания (Смирнова: Пн16-17/Ср17-18/Сб10-11, Орлов: Пн17:30-18:30/Чт16:30-17:30/
+# Сб11:30-12:30, Ким: Вт16-17/Пт18-19) — их нельзя тихо снести (Enrollment/DepositEntry
+# демо-подписки на них ссылаются через PROTECT), поэтому новые слоты для тех же
+# преподавателей намеренно поставлены на другие дни/часы, без пересечения по
+# преподавателю и по кабинету — проверено вручную при составлении
+_ACTIVITY_SLOTS: list[list[tuple[int, datetime.time, datetime.time, int, int, int]]] = [
+    # Ментальная арифметика (Смирнова)
+    [
+        (1, datetime.time(16, 30), datetime.time(17, 30), 0, 6, 9),
+        (3, datetime.time(16, 0), datetime.time(17, 0), 0, 8, 11),
+        (5, datetime.time(12, 0), datetime.time(13, 0), 0, 6, 9),
+    ],
+    # Робототехника (Орлов)
+    [
+        (1, datetime.time(17, 30), datetime.time(18, 30), 1, 8, 11),
+        (4, datetime.time(16, 0), datetime.time(17, 0), 0, 10, 13),
+        (5, datetime.time(10, 0), datetime.time(11, 0), 1, 8, 11),
+    ],
+    # Английский для детей (Ким)
+    [
+        (0, datetime.time(18, 0), datetime.time(19, 0), 2, 6, 9),
+        (2, datetime.time(16, 0), datetime.time(17, 0), 1, 10, 13),
+        (5, datetime.time(13, 0), datetime.time(14, 0), 2, 6, 9),
+    ],
+    # Шахматы (Волков) — новый преподаватель, старых занятых слотов нет
+    [
+        (2, datetime.time(17, 30), datetime.time(18, 30), 2, 6, 9),
+        (4, datetime.time(17, 0), datetime.time(18, 0), 2, 8, 11),
+        (5, datetime.time(9, 0), datetime.time(10, 0), 0, 10, 13),
+    ],
 ]
 
 # Тарифная сетка из project-context.md §6, цены в копейках
@@ -157,7 +289,7 @@ class Command(BaseCommand):
         self._seed_events()
         self._seed_gallery()
         self._seed_form_requests()
-        parent = self._seed_family(groups)
+        parent = self._seed_family(activities, groups)
         if not options.get("no_admin"):
             self._seed_admin()
 
@@ -179,14 +311,16 @@ class Command(BaseCommand):
                     email=seed["email"], full_name=seed["full_name"], is_staff=True
                 )
             user.groups.add(group)
-            profile, _ = TeacherProfile.objects.get_or_create(
+            # update_or_create — чтобы повторный прогон обновлял био/цитату
+            # у уже существующих преподавателей, а не игнорировал правки
+            profile, _ = TeacherProfile.objects.update_or_create(
                 user=user,
                 defaults={
                     "middle_name": seed["middle_name"],
                     "position": seed["position"],
                     "quote": seed["quote"],
                     "photo_url": f"https://i.pravatar.cc/300?img={i + 11}",
-                    "bio": f"{seed['position']}, стаж работы с детьми более 5 лет.",
+                    "bio": seed["bio"],
                 },
             )
             profiles.append(profile)
@@ -195,19 +329,16 @@ class Command(BaseCommand):
     def _seed_activities(self) -> list[Activity]:
         activities: list[Activity] = []
         for i, seed in enumerate(_ACTIVITIES):
-            activity, _ = Activity.objects.get_or_create(
+            activity, _ = Activity.objects.update_or_create(
                 slug=seed["slug"],
                 defaults={
                     "name": seed["name"],
                     "category": "CLUB",
                     "price": seed["price"],
                     "short_description": seed["short"],
-                    "description": (
-                        f"{seed['short']} Занятия проходят раз в неделю в мини-группах "
-                        "до 8 человек. Первое занятие — знакомство с педагогом."
-                    ),
+                    "description": seed["description"],
                     "cover_image": f"https://picsum.photos/seed/yra-{i}/800/600",
-                    "features": ["Мини-группы", "Опытные педагоги"],
+                    "features": seed["features"],
                     "tags": seed["tags"],
                     "is_active": True,
                 },
@@ -216,10 +347,9 @@ class Command(BaseCommand):
         return activities
 
     def _seed_rooms(self) -> list[Room]:
-        return [
-            Room.objects.get_or_create(name=name)[0]
-            for name in ("Жёлтый кабинет", "Синий кабинет", "Зал для намаза")
-        ]
+        # Переименовываем мусорное название, если оно осталось от старых прогонов
+        Room.objects.filter(name="Зал для намаза").update(name="Зелёный кабинет")
+        return [Room.objects.get_or_create(name=name)[0] for name in _ROOM_NAMES]
 
     def _seed_schedule(
         self,
@@ -228,25 +358,29 @@ class Command(BaseCommand):
         rooms: list[Room],
     ) -> list[Schedule]:
         groups: list[Schedule] = []
-        for i, (day, start, end) in enumerate(_SLOT_GRID):
-            slot, _ = TimeSlot.objects.get_or_create(
-                day_of_week=day, start_time=start, end_time=end
-            )
-            activity = activities[i % len(activities)]
-            schedule, _ = Schedule.objects.get_or_create(
-                activity=activity,
-                time_slot=slot,
-                defaults={
-                    "teacher": teachers[i % len(teachers)],
-                    "room": rooms[i % len(rooms)],
-                    "group_name": f"{activity.name} — группа {i // len(activities) + 1}",
-                    "max_capacity": 8,
-                    "age_min": 6 + (i % 3) * 2,
-                    "age_max": 9 + (i % 3) * 2,
-                    "is_active": True,
-                },
-            )
-            groups.append(schedule)
+        for activity_idx, slots in enumerate(_ACTIVITY_SLOTS):
+            activity = activities[activity_idx]
+            teacher = teachers[activity_idx]
+            for group_idx, (day, start, end, room_idx, age_min, age_max) in enumerate(
+                slots
+            ):
+                time_slot, _ = TimeSlot.objects.get_or_create(
+                    day_of_week=day, start_time=start, end_time=end
+                )
+                schedule, _ = Schedule.objects.update_or_create(
+                    activity=activity,
+                    time_slot=time_slot,
+                    defaults={
+                        "teacher": teacher,
+                        "room": rooms[room_idx],
+                        "group_name": f"{activity.name} — группа {group_idx + 1}",
+                        "max_capacity": 8,
+                        "age_min": age_min,
+                        "age_max": age_max,
+                        "is_active": True,
+                    },
+                )
+                groups.append(schedule)
         return groups
 
     def _seed_plans(self) -> None:
@@ -315,7 +449,9 @@ class Command(BaseCommand):
                 message="Подскажите, есть ли места в группу робототехники по субботам?",
             )
 
-    def _seed_family(self, groups: list[Schedule]) -> Parent:
+    def _seed_family(
+        self, activities: list[Activity], groups: list[Schedule]
+    ) -> Parent:
         parent = Parent.objects.filter(email=DEMO_PARENT_EMAIL).first()
         if parent is None:
             parent = Parent.objects.create_user(
@@ -339,6 +475,12 @@ class Command(BaseCommand):
         ]
 
         if not Subscription.objects.filter(parent=parent).exists():
+            # Берём по одной группе из двух разных кружков, а не первые попавшиеся —
+            # так демо-абонемент показывает реальную комбинацию направлений
+            demo_groups = [
+                next(g for g in groups if g.activity_id == activities[0].pk),
+                next(g for g in groups if g.activity_id == activities[1].pk),
+            ]
             plan = SubscriptionPlan.objects.get(slots_count=2, is_unlimited=False)
             subscription = Subscription.objects.create(
                 parent=parent,
@@ -349,7 +491,7 @@ class Command(BaseCommand):
                 start_date=today,
                 expires_at=timezone.now() + datetime.timedelta(days=30),
             )
-            for schedule in groups[:2]:
+            for schedule in demo_groups:
                 Enrollment.objects.create(
                     student=children[0],
                     subscription=subscription,
@@ -364,7 +506,9 @@ class Command(BaseCommand):
                 )
             # Занятие на сегодня, чтобы журнал в админке не был пустым
             Lesson.objects.get_or_create(
-                schedule=groups[0], date=today, defaults={"topic": "Вводное занятие"}
+                schedule=demo_groups[0],
+                date=today,
+                defaults={"topic": "Вводное занятие"},
             )
         return parent
 

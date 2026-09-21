@@ -249,6 +249,62 @@ class TestPublicGallery:
         assert poisoned.status_code == status.HTTP_200_OK
         assert poisoned.json() == first.json()
 
+    def test_limit_returns_paginated_envelope(self, api_client: APIClient) -> None:
+        for i in range(5):
+            GalleryImageFactory(order=i, image_url=f"https://cdn.example.com/{i}.jpg")
+
+        response = api_client.get(f"{GALLERY_URL}?limit=2")
+
+        assert response.status_code == status.HTTP_200_OK
+        body = response.json()
+        assert body["count"] == 5
+        assert body["previous"] is None
+        assert body["next"] is not None
+        assert [item["image_url"] for item in body["results"]] == [
+            "https://cdn.example.com/0.jpg",
+            "https://cdn.example.com/1.jpg",
+        ]
+
+    def test_limit_offset_slices_by_order(self, api_client: APIClient) -> None:
+        for i in range(5):
+            GalleryImageFactory(order=i, image_url=f"https://cdn.example.com/{i}.jpg")
+
+        response = api_client.get(f"{GALLERY_URL}?limit=2&offset=2")
+
+        assert response.status_code == status.HTTP_200_OK
+        body = response.json()
+        assert [item["image_url"] for item in body["results"]] == [
+            "https://cdn.example.com/2.jpg",
+            "https://cdn.example.com/3.jpg",
+        ]
+        assert body["previous"] is not None
+        assert body["next"] is not None
+
+    def test_paginated_request_is_not_cached(
+        self,
+        api_client: APIClient,
+        django_assert_num_queries: DjangoAssertNumQueries,
+    ) -> None:
+        # ПОЧЕМУ: комбинаций limit/offset много, кэшировать их в БД-ключах
+        # смысла нет — каждый пагинированный запрос идёт в БД
+        GalleryImageFactory()
+        api_client.get(f"{GALLERY_URL}?limit=1")
+
+        with django_assert_num_queries(2):  # count + выборка страницы
+            second = api_client.get(f"{GALLERY_URL}?limit=1")
+
+        assert second.status_code == status.HTTP_200_OK
+
+    def test_limit_is_capped_at_max(self, api_client: APIClient) -> None:
+        for i in range(3):
+            GalleryImageFactory(order=i)
+
+        response = api_client.get(f"{GALLERY_URL}?limit=9999")
+
+        assert response.status_code == status.HTTP_200_OK
+        # max_limit=60 — запрос выше потолка не роняется, просто ограничивается
+        assert len(response.json()["results"]) == 3
+
 
 class TestPublicEvents:
     def test_visibility_window(self, api_client: APIClient) -> None:
