@@ -397,7 +397,7 @@ class TestUpcomingTrials:
 
         trials = [item for item in response.json() if item["kind"] == "TRIAL"]
         assert len(trials) == 1
-        assert trials[0]["date"] == trial_date.isoformat()
+        assert trials[0]["date"] == trial_date.strftime("%d.%m.%Y")
         assert trials[0]["source_type"] == "trial"
         assert trials[0]["student_id"] == student.pk
 
