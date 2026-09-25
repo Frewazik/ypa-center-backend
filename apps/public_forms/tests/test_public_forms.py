@@ -20,6 +20,7 @@ from apps.public_forms.models import (
     FeedbackStatus,
 )
 from apps.public_forms.services import verify_captcha_token
+from apps.users.models import ConsentPurpose, PersonalDataConsent
 from apps.public_forms.tests.factories import (
     CallbackRequestFactory,
     FeedbackRequestFactory,
@@ -75,21 +76,23 @@ def api_client() -> APIClient:
 
 
 @pytest.fixture
-def callback_payload() -> dict[str, str]:
+def callback_payload() -> dict[str, object]:
     return {
         "name": "Ольга",
         "phone": "+79991234567",
         "preferred_time_window": CallTimeWindow.MORNING.value,
+        "pd_consent": True,
         "captcha_token": "test-token",
     }
 
 
 @pytest.fixture
-def feedback_payload() -> dict[str, str]:
+def feedback_payload() -> dict[str, object]:
     return {
         "name": "Ольга",
         "email": "olga@example.com",
         "message": "Со скольки лет принимаете на английский язык?",
+        "pd_consent": True,
         "captcha_token": "test-token",
     }
 
@@ -98,7 +101,7 @@ class TestHoneypot:
     def test_callback_honeypot_returns_success_but_saves_nothing(
         self,
         api_client: APIClient,
-        callback_payload: dict[str, str],
+        callback_payload: dict[str, object],
         notify_mock: MagicMock,
     ) -> None:
         payload = {**callback_payload, "website_url": "https://spam.example"}
@@ -113,7 +116,7 @@ class TestHoneypot:
     def test_feedback_honeypot_returns_success_but_saves_nothing(
         self,
         api_client: APIClient,
-        feedback_payload: dict[str, str],
+        feedback_payload: dict[str, object],
         notify_mock: MagicMock,
     ) -> None:
         payload = {**feedback_payload, "website_url": "https://spam.example"}
@@ -128,7 +131,7 @@ class TestHoneypot:
     def test_honeypot_skips_captcha_entirely(
         self,
         api_client: APIClient,
-        callback_payload: dict[str, str],
+        callback_payload: dict[str, object],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         captcha_called = MagicMock()
@@ -148,7 +151,7 @@ class TestHoneypot:
 
 class TestThrottling:
     def test_callback_ip_throttle_blocks_after_limit(
-        self, api_client: APIClient, callback_payload: dict[str, str]
+        self, api_client: APIClient, callback_payload: dict[str, object]
     ) -> None:
         for _ in range(THROTTLE_LIMIT):
             ok = api_client.post(CALLBACK_URL, callback_payload, format="json")
@@ -162,8 +165,8 @@ class TestThrottling:
     def test_throttle_scopes_are_independent_between_forms(
         self,
         api_client: APIClient,
-        callback_payload: dict[str, str],
-        feedback_payload: dict[str, str],
+        callback_payload: dict[str, object],
+        feedback_payload: dict[str, object],
     ) -> None:
         for _ in range(THROTTLE_LIMIT):
             api_client.post(CALLBACK_URL, callback_payload, format="json")
@@ -173,7 +176,7 @@ class TestThrottling:
         assert response.status_code == status.HTTP_202_ACCEPTED
 
     def test_throttle_keys_by_client_ip_behind_own_proxy(
-        self, api_client: APIClient, callback_payload: dict[str, str]
+        self, api_client: APIClient, callback_payload: dict[str, object]
     ) -> None:
         # ПОЧЕМУ: за своим прокси REMOTE_ADDR у всех один (адрес прокси) —
         # клиентов различает адрес, который прокси дописал в X-Forwarded-For
@@ -202,7 +205,7 @@ class TestThrottling:
         assert other_client == status.HTTP_202_ACCEPTED
 
     def test_forwarded_header_ignored_without_own_proxy(
-        self, api_client: APIClient, callback_payload: dict[str, str]
+        self, api_client: APIClient, callback_payload: dict[str, object]
     ) -> None:
         # ПОЧЕМУ: без своего прокси X-Forwarded-For целиком пишет клиент —
         # новый адрес в заголовке на каждый запрос не сбрасывает лимит
@@ -270,7 +273,7 @@ class TestCaptcha:
     def test_invalid_captcha_rejects_request(
         self,
         api_client: APIClient,
-        callback_payload: dict[str, str],
+        callback_payload: dict[str, object],
         notify_mock: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -290,7 +293,7 @@ class TestHappyPath:
     def test_callback_created_and_notification_scheduled_on_commit(
         self,
         api_client: APIClient,
-        callback_payload: dict[str, str],
+        callback_payload: dict[str, object],
         notify_mock: MagicMock,
         django_capture_on_commit_callbacks: OnCommitCapture,
     ) -> None:
@@ -306,7 +309,7 @@ class TestHappyPath:
     def test_feedback_created_and_notification_scheduled_on_commit(
         self,
         api_client: APIClient,
-        feedback_payload: dict[str, str],
+        feedback_payload: dict[str, object],
         notify_mock: MagicMock,
         django_capture_on_commit_callbacks: OnCommitCapture,
     ) -> None:
@@ -322,7 +325,7 @@ class TestHappyPath:
     def test_notification_not_scheduled_before_commit(
         self,
         api_client: APIClient,
-        callback_payload: dict[str, str],
+        callback_payload: dict[str, object],
         notify_mock: MagicMock,
         django_capture_on_commit_callbacks: OnCommitCapture,
     ) -> None:
@@ -348,3 +351,74 @@ class TestModels:
 
         assert callback.history.count() == 2
         assert callback.history.earliest().status == CallbackStatus.NEW
+
+
+class TestPersonalDataConsent:
+    @pytest.mark.parametrize("consent", [None, False])
+    @pytest.mark.parametrize(
+        ("url", "payload_fixture", "model"),
+        [
+            (CALLBACK_URL, "callback_payload", CallbackRequest),
+            (FEEDBACK_URL, "feedback_payload", FeedbackRequest),
+        ],
+    )
+    def test_form_without_consent_is_rejected_and_not_saved(
+        self,
+        api_client: APIClient,
+        request: pytest.FixtureRequest,
+        url: str,
+        payload_fixture: str,
+        model: type[CallbackRequest] | type[FeedbackRequest],
+        consent: bool | None,
+    ) -> None:
+        payload = dict(request.getfixturevalue(payload_fixture))
+        if consent is None:
+            payload.pop("pd_consent")
+        else:
+            payload["pd_consent"] = consent
+
+        response = api_client.post(url, payload, format="json")
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        assert model.objects.count() == 0
+        assert PersonalDataConsent.objects.count() == 0
+
+    def test_callback_consent_journaled_with_link_to_request(
+        self, api_client: APIClient, callback_payload: dict[str, object]
+    ) -> None:
+        response = api_client.post(
+            CALLBACK_URL,
+            callback_payload,
+            format="json",
+            REMOTE_ADDR="203.0.113.9",
+            HTTP_USER_AGENT="Mozilla/5.0",
+        )
+
+        assert response.status_code == status.HTTP_202_ACCEPTED
+        record = PersonalDataConsent.objects.get()
+        assert record.purpose == ConsentPurpose.CALLBACK
+        assert record.source_id == CallbackRequest.objects.get().pk
+        assert str(record.phone) == callback_payload["phone"]
+        assert record.document_version == settings.PD_CONSENT_VERSION
+        assert record.ip == "203.0.113.9"
+        assert record.parent is None
+
+    def test_feedback_consent_journaled_with_email(
+        self, api_client: APIClient, feedback_payload: dict[str, object]
+    ) -> None:
+        api_client.post(FEEDBACK_URL, feedback_payload, format="json")
+
+        record = PersonalDataConsent.objects.get()
+        assert record.purpose == ConsentPurpose.FEEDBACK
+        assert record.source_id == FeedbackRequest.objects.get().pk
+        assert record.email == feedback_payload["email"]
+
+    def test_honeypot_drop_leaves_no_consent_record(
+        self, api_client: APIClient, callback_payload: dict[str, object]
+    ) -> None:
+        # ПОЧЕМУ: данные бота не сохраняются — и согласие фиксировать не на что
+        payload = {**callback_payload, "website_url": "https://spam.example"}
+
+        api_client.post(CALLBACK_URL, payload, format="json")
+
+        assert PersonalDataConsent.objects.count() == 0

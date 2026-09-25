@@ -12,6 +12,8 @@ from rest_framework.serializers import ValidationError
 
 from apps.public_forms.models import CallbackRequest, FeedbackRequest
 from apps.public_forms.tasks import FormType, notify_managers_task
+from apps.users.consent import ConsentSource, record_consent
+from apps.users.models import ConsentPurpose
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +89,9 @@ def _schedule_manager_notification(request_id: int, form_type: FormType) -> None
     transaction.on_commit(lambda: _enqueue_notification(request_id, form_type))
 
 
-def _create_callback(data: CallbackSubmission) -> CallbackRequest:
+def _create_callback(
+    data: CallbackSubmission, consent: ConsentSource
+) -> CallbackRequest:
     # ПОЧЕМУ: без явного atomic на автокоммите on_commit сработал бы
     # мгновенно, до завершения функции
     with transaction.atomic():
@@ -96,16 +100,24 @@ def _create_callback(data: CallbackSubmission) -> CallbackRequest:
             phone=data.phone,
             preferred_time_window=data.preferred_time_window,
         )
+        record_consent(
+            ConsentPurpose.CALLBACK, consent, phone=data.phone, source_id=instance.pk
+        )
         _schedule_manager_notification(instance.pk, "callback")
     return instance
 
 
-def _create_feedback(data: FeedbackSubmission) -> FeedbackRequest:
+def _create_feedback(
+    data: FeedbackSubmission, consent: ConsentSource
+) -> FeedbackRequest:
     with transaction.atomic():
         instance = FeedbackRequest.objects.create(
             name=data.name,
             email=data.email,
             message=data.message,
+        )
+        record_consent(
+            ConsentPurpose.FEEDBACK, consent, email=data.email, source_id=instance.pk
         )
         _schedule_manager_notification(instance.pk, "feedback")
     return instance
@@ -125,8 +137,9 @@ async def _passes_spam_gate(raw_data: dict[str, object], remote_ip: str | None) 
 
 
 async def process_callback_submission(
-    raw_data: dict[str, object], remote_ip: str | None
+    raw_data: dict[str, object], consent: ConsentSource
 ) -> CallbackRequest | None:
+    remote_ip = consent.ip
     if not await _passes_spam_gate(raw_data, remote_ip):
         return None
     payload = CallbackSubmission(
@@ -134,12 +147,13 @@ async def process_callback_submission(
         phone=str(raw_data["phone"]),
         preferred_time_window=str(raw_data["preferred_time_window"]),
     )
-    return await sync_to_async(_create_callback)(payload)
+    return await sync_to_async(_create_callback)(payload, consent)
 
 
 async def process_feedback_submission(
-    raw_data: dict[str, object], remote_ip: str | None
+    raw_data: dict[str, object], consent: ConsentSource
 ) -> FeedbackRequest | None:
+    remote_ip = consent.ip
     if not await _passes_spam_gate(raw_data, remote_ip):
         return None
     payload = FeedbackSubmission(
@@ -147,4 +161,4 @@ async def process_feedback_submission(
         email=str(raw_data["email"]),
         message=str(raw_data["message"]),
     )
-    return await sync_to_async(_create_feedback)(payload)
+    return await sync_to_async(_create_feedback)(payload, consent)

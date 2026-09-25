@@ -30,7 +30,8 @@
   Пробное в группу, где ребёнок уже на абонементе → `409 STUDENT_ALREADY_ENROLLED`.
   Абонемент в группу после пробного (главный путь продажи) разрешён.
 - **Оплата ивентов** (`POST /checkout/event`) — вместо онлайн-оплаты сделана гостевая
-  регистрация `POST /api/v1/public/events/{id}/register/` со статусом
+  регистрация `POST /api/v1/public/events/{id}/register/` (с обязательным
+  `pd_consent: true`, `personal-data.md`) со статусом
   `PENDING_PAYMENT` и оплатой на месте; бронь освобождается свипером через 30 минут.
 - **Журнал учителя** (`/staff/*`) — реализован в админ-панели (django-unfold), а не
   как отдельное API; см. `admin.md`. Отдельные staff-эндпоинты не понадобились.
@@ -271,14 +272,21 @@ GET /api/v1/public/schedule?week_start=2026-06-15
 {
   "id": 42, "email": "olga@example.com",
   "full_name": "", "phone": "", "referral_source": "",
+  "pd_consent_at": null,
   "profile_completed": false,
   "children": []
 }
 
 // PATCH /api/v1/me/profile — заполнение анкеты (можно по частям)
-{ "full_name": "Ольга Иванова", "phone": "+79131234567", "referral_source": "FRIENDS" }
-// → 200, тот же объект профиля с "profile_completed": true
+{ "full_name": "Ольга Иванова", "phone": "+79131234567", "referral_source": "FRIENDS",
+  "pd_consent": true }
+// → 200, тот же объект профиля с "pd_consent_at": "2026-10-01T12:00:00+07:00"
+//   и "profile_completed": true
 ```
+
+- `pd_consent` — галочка согласия на обработку ПД (только запись). Пока
+  `pd_consent_at` = `null`, анкета не заполнена. `false` → `422`: отзыв согласия — не
+  через анкету. Повторное `true` ничего не меняет. Подробности — `personal-data.md`.
 
 - `referral_source` на запись: `FRIENDS` (друзья), `SOCIAL` (соцсети), `MAPS`
   (Яндекс.Карты/2ГИС), `SEARCH` (поиск), `SIGN` (вывеска), `SCHOOL` (школа/сад),
@@ -299,7 +307,7 @@ GET /api/v1/public/schedule?week_start=2026-06-15
   "type": "urn:problem-type:profileincomplete",
   "title": "ProfileIncomplete",
   "status": 403,
-  "detail": "Заполните анкету: ФИО, телефон и «откуда вы о нас узнали»."
+  "detail": "Заполните анкету: ФИО, телефон, «откуда вы о нас узнали» и согласие на обработку персональных данных."
 }
 ```
 

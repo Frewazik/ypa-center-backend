@@ -15,6 +15,8 @@ from apps.events.models import (
     EventRegistration,
     RegistrationStatus,
 )
+from apps.users.consent import ConsentSource, record_consent
+from apps.users.models import ConsentPurpose
 
 if TYPE_CHECKING:
     from apps.users.models import Parent
@@ -37,8 +39,13 @@ class RegistrationSubmission:
 
 
 def register_for_event(
-    event_id: int, data: RegistrationSubmission, parent: Parent | None = None
+    event_id: int,
+    data: RegistrationSubmission,
+    parent: Parent | None = None,
+    consent: ConsentSource | None = None,
 ) -> EventRegistration:
+    # consent=None — регистрацию заводит сотрудник (админка, звонок), согласие
+    # на сайте не давалось; с сайта вьюха всегда передаёт источник согласия
     # ПОЧЕМУ: остаток мест — денормализованный Event.seats_taken под
     # select_for_update. SUM по регистрациям в одном statement с FOR UPDATE
     # некорректен: READ COMMITTED + EvalPlanQual перечитывает только
@@ -86,6 +93,15 @@ def register_for_event(
         )
         event.seats_taken += data.attendees_count
         event.save(update_fields=["seats_taken"])
+        if consent is not None:
+            record_consent(
+                ConsentPurpose.EVENT_REGISTRATION,
+                consent,
+                parent=parent,
+                email=data.email,
+                phone=data.phone,
+                source_id=registration.pk,
+            )
         return registration
 
 
@@ -129,7 +145,10 @@ def release_expired_pending_registrations() -> int:
 
 
 def process_registration_submission(
-    event_id: int, raw_data: dict[str, object], parent: Parent | None = None
+    event_id: int,
+    raw_data: dict[str, object],
+    consent: ConsentSource,
+    parent: Parent | None = None,
 ) -> EventRegistration | None:
     if raw_data.get(HONEYPOT_FIELD):
         # ПОЧЕМУ: дропаем тихо — вьюха отдаст обычный успех,
@@ -145,4 +164,4 @@ def process_registration_submission(
         source=str(raw_data.get("source") or ""),
         comment=str(raw_data.get("comment") or ""),
     )
-    return register_for_event(event_id, payload, parent=parent)
+    return register_for_event(event_id, payload, parent=parent, consent=consent)

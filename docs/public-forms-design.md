@@ -243,4 +243,5 @@ transaction.on_commit(lambda: async_to_sync(notify_managers_task.kiq)(instance.p
 | Throttling                   | `ScopedRateThrottle` (IP) + кастомный (phone/email), счётчики в Redis |
 | Капча                        | серверная верификация токена в `serializer.validate()` |
 | Honeypot                     | скрытое поле, при срабатывании — тихий 204 без записи |
+| Согласие на обработку ПД     | обязательное `pd_consent: true` в каждой заявке, иначе `422`; журнал согласий — `personal-data.md` |
 | Уведомления                  | Taskiq + Redis Streams, постановка через `transaction.on_commit` |

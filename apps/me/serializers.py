@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from django.db import transaction
 from rest_framework import serializers
 
 from apps.billing.models import DepositEntryReason, SubscriptionStatus
@@ -9,6 +10,12 @@ from apps.users.models import (
     Parent,
     ReferralSource,
     Student,
+)
+from apps.users.consent import (
+    ConsentSource,
+    grant_registration_consent,
+    pd_consent_field,
+    require_true,
 )
 
 TIME_FORMAT = "%H:%M"
@@ -37,6 +44,11 @@ class ProfileSerializer(serializers.ModelSerializer[Parent]):
         choices=_REFERRAL_INPUT_CHOICES,
         help_text="Откуда узнали о центре. В ответе у старых родителей бывает UNKNOWN",
     )
+    pd_consent = pd_consent_field()
+    pd_consent_at = serializers.DateTimeField(
+        read_only=True,
+        help_text="Когда дано согласие на обработку ПД; null — галочку надо показать",
+    )
     profile_completed = serializers.BooleanField(
         source="is_profile_completed",
         read_only=True,
@@ -51,6 +63,8 @@ class ProfileSerializer(serializers.ModelSerializer[Parent]):
             "phone",
             "email",
             "referral_source",
+            "pd_consent",
+            "pd_consent_at",
             "profile_completed",
             "children",
         )
@@ -62,6 +76,20 @@ class ProfileSerializer(serializers.ModelSerializer[Parent]):
             for name in PROFILE_REQUIRED_FIELDS
             if name != "referral_source"
         }
+
+    def validate_pd_consent(self, value: bool) -> bool:
+        # ПОЧЕМУ: отзыв согласия — отдельный процесс (152-ФЗ ст. 9 ч. 2),
+        # не снятие галочки в анкете
+        return require_true(value)
+
+    def update(self, instance: Parent, validated_data: dict[str, object]) -> Parent:
+        consent = validated_data.pop("pd_consent", False)
+        with transaction.atomic():
+            parent = super().update(instance, validated_data)
+            if consent:
+                source = ConsentSource.from_request(self.context["request"])
+                grant_registration_consent(parent, source)
+        return parent
 
 
 class SubscriptionSlotViewSerializer(serializers.Serializer):

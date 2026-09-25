@@ -460,7 +460,10 @@ class Command(BaseCommand):
             parent.phone = "+79991234567"
             # Анкета заполнена — иначе демо-ЛК отвечает 403 PROFILE_INCOMPLETE
             parent.referral_source = ReferralSource.FRIENDS
-            parent.save(update_fields=["phone", "referral_source"])
+            # Демо-данные: согласие проставлено напрямую, без журнала — на
+            # проде оно появляется только из анкеты (apps.users.consent)
+            parent.pd_consent_at = timezone.now()
+            parent.save(update_fields=["phone", "referral_source", "pd_consent_at"])
 
         today = timezone.localdate()
         children = [

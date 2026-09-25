@@ -7,6 +7,7 @@ import datetime
 
 import factory
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 
 from apps.schedule.models import MaskType, Room, Schedule, ScheduleMask, TimeSlot
 
@@ -109,6 +110,7 @@ class ParentFactory(factory.django.DjangoModelFactory):
     phone = factory.Sequence(lambda n: f"+79{n:09d}")
     # Анкета заполнена: иначе ЛК и чекаут отвечают 403 PROFILE_INCOMPLETE
     referral_source = "FRIENDS"
+    pd_consent_at = factory.LazyFunction(timezone.now)
     email = factory.Sequence(lambda n: f"parent{n}@example.com")
 
 
