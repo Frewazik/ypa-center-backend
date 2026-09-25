@@ -289,12 +289,16 @@ class Enrollment(models.Model):
         constraints = [
             # ПОЧЕМУ: partial-индекс исключает CANCELED, позволяя купить слот повторно
             # Ловит гонки на уровне БД
+            # ПОЧЕМУ только REGULAR: пробное остаётся ENROLLED и после визита —
+            # без фильтра по типу оно навсегда закрывало абонемент в ту же группу.
+            # Обратный запрет (пробное поверх абонемента) — в create_trial_payment
             models.UniqueConstraint(
                 fields=["student", "schedule"],
                 condition=Q(
-                    status__in=(EnrollmentStatus.HELD, EnrollmentStatus.ENROLLED)
+                    type=EnrollmentType.REGULAR,
+                    status__in=(EnrollmentStatus.HELD, EnrollmentStatus.ENROLLED),
                 ),
-                name="uq_billing_active_enrollment_per_student_slot",
+                name="uq_billing_active_regular_per_student_slot",
             ),
             # ПОЧЕМУ: инвариант №5 (project-context §13) — максимум 1 пробное
             # на ребёнка по кружку. CANCELED не в условии: сорванная оплата

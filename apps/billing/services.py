@@ -676,6 +676,17 @@ def create_trial_payment(
             ).exists():
                 raise TrialLimitExceededError(student_id, trial_info.activity_id)
 
+            # ПОЧЕМУ не в БД: уникальность в группе держится только для REGULAR,
+            # пробное поверх абонемента запрещаем здесь. Гонку с чекаутом
+            # абонемента исключает тот же advisory-лок слота
+            if Enrollment.objects.filter(
+                student_id=student_id,
+                schedule_id=schedule_id,
+                type=EnrollmentType.REGULAR,
+                status__in=(EnrollmentStatus.HELD, EnrollmentStatus.ENROLLED),
+            ).exists():
+                raise DuplicateEnrollmentError(student_id, schedule_id)
+
             if _occupied_seats(schedule_id, on_date=trial_date) >= capacity:
                 raise NoAvailableSeatsError(schedule_id)
 
