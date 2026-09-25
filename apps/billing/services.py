@@ -983,7 +983,7 @@ def _apply_success(
                 info.id, tx.amount, info.amount_kopecks, info.currency
             )
         elif tx.enrollment_id is not None:
-            deferred = _apply_trial_success(info, tx, schedule_port)
+            deferred = _apply_trial_success(info, tx, tx.enrollment_id, schedule_port)
         else:
             data_error = _validate_success_payload(tx, info.id)
             if data_error is not None:
@@ -1083,8 +1083,14 @@ def _apply_success(
 
 
 def _apply_trial_success(
-    info: PaymentInfo, tx: Transaction, schedule_port: SchedulePort
+    info: PaymentInfo,
+    tx: Transaction,
+    enrollment_id: int,
+    schedule_port: SchedulePort,
 ) -> BillingError | None:
+    # ПОЧЕМУ enrollment_id отдельным аргументом: у tx поле Optional, а
+    # вызывающий уже проверил его на None — сужение типа не переживает
+    # границу функции, передаём готовый int
     # !!!: вызывается строго под select_for_update по tx из _apply_success.
     # ПОЧЕМУ повторная проверка мест: бронь (HELD) могла протухнуть
     # за время оплаты, а место — уйти конкуренту
@@ -1096,10 +1102,10 @@ def _apply_trial_success(
     # совпадать с _try_enroll_held_seats, иначе вебхуки пробного и абонемента
     # по одному слоту ловят взаимный дедлок. schedule_id читаем без лока
     schedule_id: int = Enrollment.objects.values_list("schedule_id", flat=True).get(
-        pk=tx.enrollment_id
+        pk=enrollment_id
     )
     _lock_slot_for_booking(schedule_id)
-    enrollment = Enrollment.objects.select_for_update().get(pk=tx.enrollment_id)
+    enrollment = Enrollment.objects.select_for_update().get(pk=enrollment_id)
 
     if enrollment.status != EnrollmentStatus.HELD:
         _mark_for_compensation(
