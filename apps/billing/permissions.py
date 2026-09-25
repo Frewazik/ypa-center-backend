@@ -6,6 +6,8 @@ from rest_framework.permissions import BasePermission
 from rest_framework.request import Request
 from rest_framework.views import APIView
 
+from apps.core.net import client_ip
+
 _ALLOWED_NETWORKS = tuple(
     ip_network(cidr)
     for cidr in (
@@ -19,20 +21,16 @@ _ALLOWED_NETWORKS = tuple(
 
 
 class YookassaIPAllowlist(BasePermission):
-    # !!! Читаем строго REMOTE_ADDR для защиты от спуфинга
-
-    # Доверенный reverse-proxy (nginx/traefik) ОБЯЗАН транслировать реальный IP
-    # клиента в REMOTE_ADDR на уровне WSGI/ASGI
-
-    # Парсить X-Forwarded-For внутри приложения напрямую запрещено,
-    # заголовок легко подделывается
+    # !!!: IP берём только через apps.core.net.client_ip. Голый REMOTE_ADDR
+    # за прокси — это адрес самого прокси (все вебхуки отклонялись бы),
+    # а левые адреса X-Forwarded-For пишет клиент — ими можно выдать себя
+    # за ЮКассу. client_ip верит только адресу, который дописал свой прокси
 
     message = "Источник запроса не входит в список разрешённых."
 
     def has_permission(self, request: Request, view: APIView) -> bool:
-        raw_addr = request.META.get("REMOTE_ADDR", "")
         try:
-            addr = ip_address(raw_addr)
+            addr = ip_address(client_ip(request))
         except ValueError:
             return False
         return any(addr in network for network in _ALLOWED_NETWORKS)
