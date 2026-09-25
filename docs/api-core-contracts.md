@@ -225,6 +225,38 @@ GET /api/v1/public/schedule?week_start=2026-06-15
 - Структура **денормализована**: `activity/teacher/room` вложены прямо в слот, фронту
   не нужны доп. запросы и склейки.
 
+#### Карточки кружков: `groups`
+
+```
+GET /api/v1/public/activities/
+GET /api/v1/public/activities/{id}/
+```
+
+Список (без пагинации) и деталь отдают одну форму кружка. Подгруппы в `groups` —
+только активные, в порядке «день недели → время начала». Поля карточки (`category`,
+`price`, `cover_image`, `short_description`, `features`, `tags`) в примере опущены:
+
+```json
+{
+  "id": 1,
+  "name": "Кружок мышления",
+  "slug": "kruzhok-myshleniya",
+  "description": "…",
+  "groups": [
+    { "id": 106, "group_name": "Младшая", "age_min": 7, "age_max": 10, "max_capacity": 6 }
+  ],
+  "teachers": [{ "id": 2, "full_name": "…", "photo_url": "…", "position": "…" }],
+  "days_of_week": [0, 3]
+}
+```
+
+- **Возраст — на уровне подгруппы**, а не кружка: у одного кружка группы разных
+  возрастов. `age_min`/`age_max` могут быть `null` (без ограничения).
+- **Времени и свободных мест в карточке нет** — их показывает сетка
+  (`GET /public/schedule`, `capacity`), где места считаются на конкретную дату.
+  Дни занятий кружка — `days_of_week` (0 = понедельник).
+- Ответ кэшируется на 5 минут и сбрасывается при сохранении кружка или группы.
+
 ---
 
 ### Сценарий 3 — Личный кабинет (Dashboard)
@@ -476,7 +508,7 @@ POST /api/v1/webhooks/yookassa
 | Эндпоинт | Риск N+1 | Обязательная конструкция ORM |
 | -------- | -------- | ---------------------------- |
 | `GET /public/schedule` | `activity`, `teacher`, `room` на каждый слот; счётчик мест | `select_related("activity","teacher","room")` + `annotate(taken=Count("enrollments", filter=Q(...)))` |
-| `GET /public/activities` | учитель и дни недели по каждому кружку | `select_related("teacher")` + `prefetch_related("slots")` |
+| `GET /public/activities` | группы, учителя и дни недели по каждому кружку | `Prefetch("slots", queryset=Schedule.objects.filter(is_active=True).select_related("teacher__user"))` — 2 запроса, без подсчёта мест |
 | `GET /me/subscriptions` | план + баланс по слотам + данные слотов | `select_related("plan","student")` + `Prefetch("slots", queryset=SubscriptionSlot.objects.select_related("schedule__activity"))` |
 | `GET /me/upcoming` | маски на каждую запись | `Prefetch("slot__exceptions", queryset=…filter(date__range=…), to_attr="masks_in_range")` (см. `schema-audit §4`) |
 | `GET /staff/journal` | ребёнок + баланс по каждой записи | `select_related("student","subscription_slot")` |
@@ -524,6 +556,8 @@ POST /api/v1/webhooks/yookassa
 | POST  | `/api/v1/auth/otp/request` | — | — |
 | POST  | `/api/v1/auth/otp/verify` | — | — |
 | GET   | `/api/v1/public/schedule` | — | — |
+| GET   | `/api/v1/public/activities/` | — | — |
+| GET   | `/api/v1/public/activities/{id}/` | — | — |
 | GET   | `/api/v1/me/profile` | да | — |
 | GET   | `/api/v1/me/subscriptions` | да | — |
 | GET   | `/api/v1/me/upcoming` | да | — |
