@@ -6,6 +6,7 @@ import sys
 from typing import Literal
 
 import dj_database_url
+from django.core.exceptions import ImproperlyConfigured
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -25,6 +26,9 @@ class Settings(BaseSettings):
     )
     ENVIRONMENT: Literal["local", "staging", "production"] = "local"
     ENABLE_THROTTLING: bool | None = None
+    # Сколько своих прокси стоит перед Django (Caddy на VPS — 1).
+    # Вне local обязательна: см. _resolve_trusted_proxy_count
+    TRUSTED_PROXY_COUNT: int | None = Field(default=None, ge=0)
 
     DATABASE_URL: str = Field(
         default="postgresql://postgres:postgres@localhost:5432/yra"
@@ -54,6 +58,25 @@ class Settings(BaseSettings):
 # ПОЧЕМУ ignore: обязательные поля заполняет pydantic-settings из env/.env,
 # mypy без pydantic-плагина видит их как незаполненные аргументы конструктора
 _env = Settings()  # type: ignore[call-arg]
+
+
+def _resolve_trusted_proxy_count(env: Settings) -> int:
+    # ПОЧЕМУ: ошибка в любую сторону тихая и опасная. Поставили 1 без
+    # прокси — клиент подделывает IP через X-Forwarded-For и обходит лимиты;
+    # поставили 0 за прокси — все клиенты получают IP прокси, делят один
+    # лимит, а вебхуки ЮКассы отклоняются. Поэтому вне local значение
+    # задаётся явно, а забытая переменная роняет запуск
+    if env.TRUSTED_PROXY_COUNT is not None:
+        return env.TRUSTED_PROXY_COUNT
+    if env.ENVIRONMENT == "local":
+        return 0
+    raise ImproperlyConfigured(
+        "Задайте TRUSTED_PROXY_COUNT — число своих прокси перед приложением "
+        "(Caddy на VPS — 1). См. docs/deploy.md"
+    )
+
+
+TRUSTED_PROXY_COUNT = _resolve_trusted_proxy_count(_env)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -202,6 +225,9 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_CLASSES": _throttle_classes,
     "DEFAULT_THROTTLE_RATES": _throttle_rates,
     "EXCEPTION_HANDLER": "apps.core.exceptions.problem_detail_exception_handler",
+    # ПОЧЕМУ: единственная ручка доверия к X-Forwarded-For — её читают и
+    # встроенные троттлы DRF, и apps.core.net.client_ip
+    "NUM_PROXIES": TRUSTED_PROXY_COUNT,
 }
 
 SIMPLE_JWT = {

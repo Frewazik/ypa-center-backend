@@ -4,12 +4,12 @@ from typing import Final
 
 from adrf.views import APIView
 from drf_spectacular.utils import extend_schema
-from ipware import get_client_ip
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
 
+from apps.core.net import client_ip
 from apps.public_forms.serializers import (
     CallbackRequestCreateSerializer,
     FeedbackRequestCreateSerializer,
@@ -36,10 +36,7 @@ class CallbackRequestCreateView(APIView):
     async def post(self, request: Request) -> Response:
         serializer = CallbackRequestCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        # !!!: django-ipware читает X-Forwarded-For. Это безопасно ТОЛЬКО если
-        # доверенный reverse-proxy (nginx) жёстко перетирает заголовки клиента
-        client_ip, _ = get_client_ip(request)
-        await process_callback_submission(serializer.validated_data, client_ip)
+        await process_callback_submission(serializer.validated_data, client_ip(request))
         # ПОЧЕМУ: ответ одинаков для реальной заявки и honeypot-дропа,
         # чтобы бот не отличил ловушку
         return Response(_ACCEPTED_BODY, status=status.HTTP_202_ACCEPTED)
@@ -57,6 +54,5 @@ class FeedbackRequestCreateView(APIView):
     async def post(self, request: Request) -> Response:
         serializer = FeedbackRequestCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        client_ip, _ = get_client_ip(request)
-        await process_feedback_submission(serializer.validated_data, client_ip)
+        await process_feedback_submission(serializer.validated_data, client_ip(request))
         return Response(_ACCEPTED_BODY, status=status.HTTP_202_ACCEPTED)
