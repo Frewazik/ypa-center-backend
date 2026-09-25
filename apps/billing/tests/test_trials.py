@@ -394,7 +394,7 @@ class TestCheckoutTrialView:
         response.render()
 
         assert response.status_code == status.HTTP_409_CONFLICT
-        assert response.data["extensions"] is not None or response.data
+        assert response.data["code"] == "TRIAL_LIMIT_EXCEEDED"
 
 
 @pytest.mark.django_db

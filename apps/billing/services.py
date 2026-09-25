@@ -1084,11 +1084,13 @@ def _apply_trial_success(
     # !!!: порядок захвата (advisory-лок слота → строка Enrollment) обязан
     # совпадать с _try_enroll_held_seats, иначе вебхуки пробного и абонемента
     # по одному слоту ловят взаимный дедлок. schedule_id читаем без лока
+    enrollment_id = tx.enrollment_id
+    assert enrollment_id is not None  # сужение для mypy: проверено в _apply_success
     schedule_id: int = Enrollment.objects.values_list("schedule_id", flat=True).get(
-        pk=tx.enrollment_id
+        pk=enrollment_id
     )
     _lock_slot_for_booking(schedule_id)
-    enrollment = Enrollment.objects.select_for_update().get(pk=tx.enrollment_id)
+    enrollment = Enrollment.objects.select_for_update().get(pk=enrollment_id)
 
     if enrollment.status != EnrollmentStatus.HELD:
         _mark_for_compensation(
