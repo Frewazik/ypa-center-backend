@@ -32,7 +32,7 @@ class SubscriptionInline(TabularInline):
 @admin.register(Parent)
 class ParentAdmin(ModelAdmin):
     list_display = ("id", "email", "full_name", "phone", "is_staff", "created_at")
-    list_filter = ("is_staff", "is_active")
+    list_filter = ("is_staff", "is_active", "referral_source")
     # ПОЧЕМУ: search_fields обязателен — StudentAdmin ссылается сюда через
     # autocomplete, без него Django падает при рендере виджета
     search_fields = ("email", "full_name", "phone")
@@ -43,7 +43,10 @@ class ParentAdmin(ModelAdmin):
     exclude = ("password",)
     inlines = (StudentInline, SubscriptionInline)
     fieldsets = (
-        (None, {"fields": ("email", "full_name", "phone", "comments")}),
+        (
+            None,
+            {"fields": ("email", "full_name", "phone", "referral_source", "comments")},
+        ),
         ("Доступ", {"fields": ("is_active", "is_staff", "is_superuser", "groups")}),
         ("Служебное", {"fields": ("last_login", "created_at", "updated_at")}),
     )

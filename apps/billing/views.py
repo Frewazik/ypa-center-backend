@@ -47,6 +47,7 @@ from apps.billing.services import (
 )
 from apps.billing.tasks import verify_and_process_payment
 from apps.users.models import Parent
+from apps.users.permissions import IsProfileCompleted
 
 _IDEMPOTENCY_HEADER = "X-Idempotency-Key"
 _PAYMENT_EVENTS = frozenset(
@@ -85,7 +86,9 @@ class TrialLimitConflict(APIException):
 
 
 class _CheckoutView(APIView):
-    permission_classes = [IsAuthenticated]
+    # ПОЧЕМУ: список задан явно (не из settings), поэтому анкету проверяем
+    # тут же — покупка до заполнения анкеты закрыта
+    permission_classes = [IsAuthenticated, IsProfileCompleted]
 
     def _require_idempotency_key(self, request: Request) -> str:
         raw_key = request.headers.get(_IDEMPOTENCY_HEADER)

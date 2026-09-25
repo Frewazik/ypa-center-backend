@@ -38,8 +38,11 @@ erDiagram
 ## users — люди и вход
 
 **parent** — кастомная модель пользователя (AUTH_USER_MODEL). `email` (unique, логин),
-`full_name`, `phone` (PhoneNumberField), `comments`, `is_active`, `is_staff`. Паролей у
+`full_name`, `phone` (PhoneNumberField), `referral_source` («откуда узнали», enum-строка,
+пусто до анкеты), `comments`, `is_active`, `is_staff`. Паролей у
 родителей нет (unusable password), пароль есть только у staff для входа в админку.
+Анкета заполнена, когда непусты `full_name`, `phone`, `referral_source` — вычисляется
+на лету (`Parent.is_profile_completed`), флага в БД нет (`auth-flow.md` §4.1).
 
 **student** — `parent` FK (CASCADE), `full_name`, `school_grade`, `dob`, `health_issues`.
 Уникальность `(parent, full_name, dob)` — защита от дабл-сабмита формы.

@@ -35,6 +35,9 @@ from apps.users.services import (
 
 
 class OTPRequestView(APIView):
+    # ПОЧЕМУ: токен на входе не нужен и вреден — с валидным токеном
+    # запрос считался бы «не анонимным» и мог обходить IP-лимит
+    authentication_classes = ()
     permission_classes = [AllowAny]
     throttle_classes = [OTPRequestPerIPThrottle, OTPRequestPerEmailThrottle]
 
@@ -74,13 +77,26 @@ class OTPRequestView(APIView):
 
 
 class OTPVerifyView(APIView):
+    authentication_classes = ()
     permission_classes = [AllowAny]
     throttle_classes = [OTPVerifyPerIPThrottle]
 
     @extend_schema(
         request=OTPVerifySerializer,
         responses={
-            200: OpenApiResponse(description="Токены выданы"),
+            200: inline_serializer(
+                "OTPVerifyResponse",
+                fields={
+                    "access": serializers.CharField(),
+                    "refresh": serializers.CharField(),
+                    "profile_completed": serializers.BooleanField(
+                        help_text=(
+                            "false — показать анкету (PATCH /me/profile/); "
+                            "до её заполнения ЛК и покупки отвечают 403"
+                        ),
+                    ),
+                },
+            ),
             400: OpenApiResponse(description="Ошибка валидации формата полей"),
             401: OpenApiResponse(description="Неверный или истёкший код"),
             429: OpenApiResponse(description="Превышен лимит попыток"),
@@ -114,7 +130,11 @@ class OTPVerifyView(APIView):
             )
 
         return Response(
-            {"access": tokens.access, "refresh": tokens.refresh},
+            {
+                "access": tokens.access,
+                "refresh": tokens.refresh,
+                "profile_completed": tokens.profile_completed,
+            },
             status=status.HTTP_200_OK,
         )
 

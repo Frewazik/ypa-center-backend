@@ -90,6 +90,7 @@ curl-ом и читать логи. Группировка по аудитори
 | 400  | `MALFORMED_REQUEST`        | Битый JSON, неизвестный тип продукта |
 | 401  | `AUTH_REQUIRED`            | Нет/протух токен (покупка абонемента/пробного гостем) |
 | 403  | `FORBIDDEN_RESOURCE`       | Доступ к чужому ребёнку/абонементу (приватность) |
+| 403  | `PROFILE_INCOMPLETE`       | Анкета не заполнена — ЛК и покупка закрыты (Сценарий 3) |
 | 404  | `NOT_FOUND`                | Слот/ивент/ребёнок не существует |
 | 409  | `NO_AVAILABLE_SEATS`       | Нет мест в слоте/ивенте |
 | 409  | `TRIAL_LIMIT_EXCEEDED`     | Уже было пробное по этому кружку |
@@ -143,15 +144,30 @@ POST /api/v1/auth/otp/verify
 { "email": "olga.e@example.com", "code": "418302" }
 ```
 
-Успех — `200`, выдача сессии (см. 1.4). Ошибки: `422 VALIDATION_ERROR` (код не 6 цифр),
-`409`/`401 OTP_INVALID` (неверный/истёкший код), `429` после N неудачных попыток.
+Успех — `200`, выдача сессии (см. 1.4) и флаг анкеты:
+
+```json
+{ "access": "eyJ…", "refresh": "eyJ…", "profile_completed": false }
+```
+
+- `profile_completed: false` → фронт показывает анкету (`PATCH /me/profile`,
+  Сценарий 3). Приходит при **каждом** входе, пока анкета не заполнена.
+- `profile_completed: true` → сразу в ЛК или на страницу покупки (`redirectFrom`).
+
+Ошибки: `422 VALIDATION_ERROR` (код не 6 цифр), `401 OTP_INVALID` (неверный/истёкший
+код, несуществующий или деактивированный аккаунт — один ответ на всё), `429` после
+5 неверных попыток (код мёртв, нужен новый).
 
 **Архитектурные ответы:**
 
-1. **Защита от флуда** (см. также `public-forms-design.md §2.1`):
-   - cooldown на отправку — 60 с на email (счётчик в Redis);
-   - не более 5 запросов кода / час на email и на IP (`ScopedRateThrottle`);
+1. **Защита от флуда** (без капчи; см. также `public-forms-design.md §2.1`,
+   обоснование ставок — `auth-flow.md` §3):
+   - cooldown на отправку — 60 с на email (по `magic_tokens.created_at` в БД, работает всегда);
+   - не более 5 запросов кода / час на email и 30 / час на IP (DRF-троттлинг
+     `otp_request_email` / `otp_request_ip`; по IP мягче из-за CGNAT и Wi-Fi ресепшена);
+   - не более 10 попыток ввода / мин на IP (`otp_verify_ip`);
    - не более 5 попыток ввода на один код, иначе код сжигается (`attempts_count` в таблице).
+   - Вьюхи `/auth/otp/*` не принимают JWT: с токеном запрос обходил бы IP-лимит.
 2. **Cooldown-таймер клиенту** — через тело (`resend_available_in`) и заголовок
    `Retry-After` на `429`. Фронт не считает сам — бэкенд авторитетен по времени.
 3. **Хранение сессии — рекомендация: JWT в `HttpOnly; Secure; SameSite=Lax` cookie.**
@@ -162,8 +178,8 @@ POST /api/v1/auth/otp/verify
    осознанный размен безопасности на простоту, а не дефолт.
    Django-сессии отвергнуты: лишний серверный стейт, хуже для будущего mobile-клиента.
 4. **Когда создаётся `Parent`** — *только при первом успешном `verify`*, не на
-   `request` (детали — `auth-flow.md` §5). После `verify`: профиль пуст → онбординг
-   (регистрация), профиль заполнен → кабинет (логин). Неподтверждённых профилей не
+   `request` (детали — `auth-flow.md` §5). После `verify`: `profile_completed=false` →
+   онбординг (анкета), `true` → кабинет (логин). Правило анкеты — `auth-flow.md` §4.1. Неподтверждённых профилей не
    существует: до verify в БД пишется лишь OTP-запись с TTL.
 
 ---
@@ -246,6 +262,52 @@ GET /api/v1/public/schedule?week_start=2026-06-15
 
 Первый экран — 3 параллельных запроса (HTTP/2 их мультиплексирует). Это дешевле
 одного монолита, который всё равно пришлось бы дробить пагинацией.
+
+**Профиль = анкета.** `GET/PATCH /api/v1/me/profile` доступен сразу после входа;
+остальные ресурсы ЛК и чекаут — только после заполнения анкеты (`auth-flow.md` §4).
+
+```json
+// GET /api/v1/me/profile — родитель сразу после первого входа
+{
+  "id": 42, "email": "olga@example.com",
+  "full_name": "", "phone": "", "referral_source": "",
+  "profile_completed": false,
+  "children": []
+}
+
+// PATCH /api/v1/me/profile — заполнение анкеты (можно по частям)
+{ "full_name": "Ольга Иванова", "phone": "+79131234567", "referral_source": "FRIENDS" }
+// → 200, тот же объект профиля с "profile_completed": true
+```
+
+- `referral_source` на запись: `FRIENDS` (друзья), `SOCIAL` (соцсети), `MAPS`
+  (Яндекс.Карты/2ГИС), `SEARCH` (поиск), `SIGN` (вывеска), `SCHOOL` (школа/сад),
+  `OTHER`. На чтение у давних родителей бывает `UNKNOWN` («не указано»), выбрать
+  его в анкете нельзя.
+- Передать пустое `full_name`/`phone`/`referral_source` нельзя — `422 VALIDATION_ERROR`.
+  Непереданные поля не трогаются.
+- Добавлять и править детей (`POST /me/children/`, `PATCH /me/children/{id}/`) можно
+  до заполнения анкеты — дети часть онбординга.
+
+**Закрытая ручка до анкеты** — `/me/subscriptions`, `/me/trials`, `/me/upcoming`,
+`/me/deposit/`, `/me/deposit/entries/`, `POST /checkout/subscription`,
+`POST /checkout/trial`:
+
+```json
+// 403
+{
+  "type": "urn:problem-type:profileincomplete",
+  "title": "ProfileIncomplete",
+  "status": 403,
+  "detail": "Заполните анкету: ФИО, телефон и «откуда вы о нас узнали»."
+}
+```
+
+Машинный признак сейчас — `type` (обработчик ошибок строит его из имени класса
+исключения `ProfileIncomplete`). Когда в обработчик вернётся поле `code` (§0.3),
+здесь появится `"code": "PROFILE_INCOMPLETE"` без изменений в ручках. Клиенту
+проверять оба: `code === "PROFILE_INCOMPLETE" || type === "urn:problem-type:profileincomplete"`.
+Без токена эти ручки отвечают `401`, как и раньше.
 
 **Лента `upcoming`** объединяет разнородные источники в один отсортированный поток.
 Ключ — **дискриминатор `kind`** и общий «конверт», чтобы фронт рендерил единым списком:
@@ -576,14 +638,16 @@ POST /api/v1/webhooks/yookassa
 | POST  | `/api/v1/auth/otp/request` | — | — |
 | POST  | `/api/v1/auth/otp/verify` | — | — |
 | GET   | `/api/v1/public/schedule` | — | — |
-| GET   | `/api/v1/me/profile` | да | — |
-| GET   | `/api/v1/me/subscriptions` | да | — |
-| GET   | `/api/v1/me/upcoming` | да | — |
-| GET   | `/api/v1/me/trials` | да | — |
-| GET   | `/api/v1/me/deposit/` | да | — |
-| GET   | `/api/v1/me/deposit/entries/` | да | — |
-| POST  | `/api/v1/checkout/subscription` | да | да |
-| POST  | `/api/v1/checkout/trial` | да | да |
+| GET/PATCH | `/api/v1/me/profile` | да (анкета не нужна) | — |
+| POST  | `/api/v1/me/children/` | да (анкета не нужна) | — |
+| PATCH | `/api/v1/me/children/{id}/` | да (анкета не нужна) | — |
+| GET   | `/api/v1/me/subscriptions` | да + анкета | — |
+| GET   | `/api/v1/me/upcoming` | да + анкета | — |
+| GET   | `/api/v1/me/trials` | да + анкета | — |
+| GET   | `/api/v1/me/deposit/` | да + анкета | — |
+| GET   | `/api/v1/me/deposit/entries/` | да + анкета | — |
+| POST  | `/api/v1/checkout/subscription` | да + анкета | да |
+| POST  | `/api/v1/checkout/trial` | да + анкета | да |
 | POST  | `/api/v1/checkout/event` | — | да |
 | GET   | `/api/v1/staff/journal` | да (staff) | — |
 | PATCH | `/api/v1/staff/attendance/{id}` | да (staff) | да |

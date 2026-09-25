@@ -6,6 +6,7 @@ from django.db.models import QuerySet
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import generics, status
 from rest_framework.exceptions import ValidationError
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -36,12 +37,18 @@ def _current_parent(request: Request) -> Parent:
     return cast(Parent, request.user)
 
 
+# ПОЧЕМУ: по умолчанию ЛК закрыт до заполнения анкеты (IsProfileCompleted
+# в settings). Профиль и дети — это и есть анкета, им нужен только вход
+_ONBOARDING_PERMISSIONS = [IsAuthenticated]
+
+
 @extend_schema(
     operation_id="me_profile",
     summary="Профиль родителя с детьми",
     responses=ProfileSerializer,
 )
 class ProfileView(generics.RetrieveUpdateAPIView[Parent]):
+    permission_classes = _ONBOARDING_PERMISSIONS
     serializer_class = ProfileSerializer
     http_method_names = ("get", "patch", "options")
 
@@ -56,6 +63,8 @@ class ProfileView(generics.RetrieveUpdateAPIView[Parent]):
     responses={status.HTTP_201_CREATED: ChildSerializer},
 )
 class ChildCreateView(APIView):
+    permission_classes = _ONBOARDING_PERMISSIONS
+
     def post(self, request: Request) -> Response:
         serializer = ChildSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -72,6 +81,7 @@ class ChildCreateView(APIView):
     responses=ChildSerializer,
 )
 class ChildUpdateView(generics.UpdateAPIView[Student]):
+    permission_classes = _ONBOARDING_PERMISSIONS
     serializer_class = ChildSerializer
     http_method_names = ("patch", "options")
 

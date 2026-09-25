@@ -4,13 +4,24 @@ from rest_framework import serializers
 
 from apps.billing.models import DepositEntryReason, SubscriptionStatus
 from apps.me.services import UpcomingItem
-from apps.users.models import Parent, Student
+from apps.users.models import (
+    PROFILE_REQUIRED_FIELDS,
+    Parent,
+    ReferralSource,
+    Student,
+)
 
 TIME_FORMAT = "%H:%M"
 DATE_FORMAT = "%d.%m.%Y"
 
 _NON_DRAFT_STATUS_CHOICES = [
     c for c in SubscriptionStatus.choices if c[0] != SubscriptionStatus.DRAFT
+]
+
+# ПОЧЕМУ: UNKNOWN ставит только миграция старым родителям — выбрать его
+# в анкете нельзя, иначе вопрос «откуда узнали» теряет смысл
+_REFERRAL_INPUT_CHOICES = [
+    c for c in ReferralSource.choices if c[0] != ReferralSource.UNKNOWN
 ]
 
 
@@ -22,11 +33,35 @@ class ChildSerializer(serializers.ModelSerializer[Student]):
 
 class ProfileSerializer(serializers.ModelSerializer[Parent]):
     children = ChildSerializer(many=True, read_only=True)
+    referral_source = serializers.ChoiceField(
+        choices=_REFERRAL_INPUT_CHOICES,
+        help_text="Откуда узнали о центре. В ответе у старых родителей бывает UNKNOWN",
+    )
+    profile_completed = serializers.BooleanField(
+        source="is_profile_completed",
+        read_only=True,
+        help_text="false — показать анкету; ЛК и покупки до её заполнения закрыты",
+    )
 
     class Meta:
         model = Parent
-        fields = ("id", "full_name", "phone", "email", "children")
+        fields = (
+            "id",
+            "full_name",
+            "phone",
+            "email",
+            "referral_source",
+            "profile_completed",
+            "children",
+        )
         read_only_fields = ("email",)
+        # ПОЧЕМУ: PATCH частичный — непереданное поле не трогаем, но стереть
+        # обязательное поле анкеты нельзя: родитель запер бы себе ЛК
+        extra_kwargs = {
+            name: {"allow_blank": False}
+            for name in PROFILE_REQUIRED_FIELDS
+            if name != "referral_source"
+        }
 
 
 class SubscriptionSlotViewSerializer(serializers.Serializer):

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import factory
 import pytest
+from django.conf import settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
@@ -19,13 +20,13 @@ from apps.users.constants import (
 )
 from apps.users.models import MagicTokens, Parent, Student
 from apps.users.services import (
+    LoginResult,
     OTPBruteForceError,
     OTPCooldownError,
     OTPExpiredError,
     OTPInvalidError,
     OTPNotFoundError,
     PurgeResult,
-    TokenPair,
     purge_stale_otp_tokens,
     request_otp,
     verify_otp,
@@ -48,6 +49,8 @@ class ParentFactory(factory.django.DjangoModelFactory):
     email = factory.Sequence(lambda n: f"parent{n}@example.com")
     full_name = factory.Faker("name", locale="ru_RU")
     phone = "+79991234567"
+    # Анкета заполнена: иначе ЛК и чекаут отвечают 403 PROFILE_INCOMPLETE
+    referral_source = "FRIENDS"
 
 
 class StudentFactory(factory.django.DjangoModelFactory):
@@ -69,6 +72,13 @@ class MagicTokensFactory(factory.django.DjangoModelFactory):
     expires_at = factory.LazyFunction(lambda: timezone.now() + timedelta(minutes=5))
     attempts_count = 0
     is_used = False
+
+
+def _hourly_limit(scope: str) -> int:
+    rate = settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"][scope]
+    count, period = rate.split("/")
+    assert period == "hour"
+    return int(count)
 
 
 def _backdate_token(email: str, seconds_ago: int) -> None:
@@ -329,7 +339,7 @@ class TestVerifyOtp:
         token = MagicTokensFactory(email="ok@example.com", code="654321")
         result = verify_otp("ok@example.com", "654321")
 
-        assert isinstance(result, TokenPair)
+        assert isinstance(result, LoginResult)
         assert result.access
         assert result.refresh
 
@@ -481,8 +491,9 @@ class TestOTPThrottling:
     ) -> None:
         # ПОЧЕМУ: троттл по IP обязан отсечь атаку
         # до вызова сервисного слоя и создания MagicToken
+        limit = _hourly_limit("otp_request_ip")
         with patch("apps.users.views.request_otp") as mock_service:
-            for i in range(5):
+            for i in range(limit):
                 resp = api_client.post(
                     "/api/v1/auth/otp/request/",
                     {"email": f"unique{i}@example.com"},
@@ -492,14 +503,68 @@ class TestOTPThrottling:
 
             resp = api_client.post(
                 "/api/v1/auth/otp/request/",
-                {"email": "unique5@example.com"},
+                {"email": "one-more@example.com"},
                 content_type="application/json",
             )
 
         assert resp.status_code == 429
         assert "Retry-After" in resp
-        # Барьер стоит ПЕРЕД сервисом: шестой запрос до request_otp не дошёл
-        assert mock_service.call_count == 5
+        # Барьер стоит ПЕРЕД сервисом: лишний запрос до request_otp не дошёл
+        assert mock_service.call_count == limit
+
+    def test_ip_limit_is_softer_than_email_limit(self) -> None:
+        # ПОЧЕМУ: за одним IP — абоненты мобильного оператора (CGNAT) и Wi-Fi
+        # ресепшена; строгим остаётся лимит по email, он бережёт ящик жертвы
+        assert _hourly_limit("otp_request_email") == 5
+        assert _hourly_limit("otp_request_ip") == 30
+
+    def test_valid_token_does_not_bypass_ip_limit(self, api_client: APIClient) -> None:
+        # ПОЧЕМУ: раньше IP-лимит стоял на AnonRateThrottle, а он пропускает
+        # запросы с валидным токеном — вошедший мог слать коды на чужие ящики
+        # без ограничения по IP
+        parent = ParentFactory()
+        access = str(RefreshToken.for_user(parent).access_token)
+        api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        limit = _hourly_limit("otp_request_ip")
+
+        with patch("apps.users.views.request_otp"):
+            statuses = [
+                api_client.post(
+                    "/api/v1/auth/otp/request/",
+                    {"email": f"victim{i}@example.com"},
+                    content_type="application/json",
+                ).status_code
+                for i in range(limit + 1)
+            ]
+
+        assert statuses[:limit] == [202] * limit
+        assert statuses[-1] == 429
+
+    def test_email_limit_counts_real_requests_across_cooldowns(
+        self, api_client: APIClient
+    ) -> None:
+        # ПОЧЕМУ: сквозной сценарий без моков сервиса — пять настоящих кодов
+        # за час с честным ожиданием cooldown, шестой отсекается
+        with patch("apps.users.services.send_otp_email_task"):
+            for i in range(5):
+                resp = api_client.post(
+                    "/api/v1/auth/otp/request/",
+                    {"email": "hourly@example.com"},
+                    content_type="application/json",
+                    REMOTE_ADDR=f"10.1.0.{i + 1}",
+                )
+                assert resp.status_code == 202
+                _backdate_token("hourly@example.com", OTP_COOLDOWN_SECONDS + 1)
+
+            resp = api_client.post(
+                "/api/v1/auth/otp/request/",
+                {"email": "hourly@example.com"},
+                content_type="application/json",
+                REMOTE_ADDR="10.1.0.99",
+            )
+
+        assert resp.status_code == 429
+        assert MagicTokens.objects.filter(email="hourly@example.com").count() == 5
 
     def test_request_per_email_limit_survives_ip_rotation(
         self, api_client: APIClient
@@ -654,7 +719,9 @@ class TestOTPRequestView:
 @pytest.mark.django_db
 class TestOTPVerifyView:
     def test_returns_200_with_tokens(self, api_client: APIClient) -> None:
-        fake_tokens = TokenPair(access="acc.tok.en", refresh="ref.tok.en")
+        fake_tokens = LoginResult(
+            access="acc.tok.en", refresh="ref.tok.en", profile_completed=True
+        )
 
         with patch("apps.users.views.verify_otp", return_value=fake_tokens):
             resp = api_client.post(
@@ -856,3 +923,134 @@ class TestAccessTokenExpiration:
             HTTP_AUTHORIZATION=f"Bearer {str(access)}",
         )
         assert resp.status_code == 401
+
+
+def _login(api_client: APIClient, email: str) -> dict[str, object]:
+    # ПОЧЕМУ: полный путь через HTTP — запрос кода, код из БД, verify
+    with patch("apps.users.services.send_otp_email_task"):
+        requested = api_client.post(
+            "/api/v1/auth/otp/request/",
+            {"email": email},
+            content_type="application/json",
+        )
+    assert requested.status_code == 202
+    token = MagicTokens.objects.filter(email=email, is_used=False).get()
+    verified = api_client.post(
+        "/api/v1/auth/otp/verify/",
+        {"email": email, "code": token.code},
+        content_type="application/json",
+    )
+    assert verified.status_code == 200
+    # Следующий вход того же адреса не должен упереться в cooldown
+    _backdate_token(email, OTP_COOLDOWN_SECONDS + 1)
+    body: dict[str, object] = verified.json()
+    return body
+
+
+@pytest.mark.django_db
+class TestOnboardingLogin:
+    def test_first_login_creates_empty_profile_and_asks_for_form(
+        self, api_client: APIClient
+    ) -> None:
+        body = _login(api_client, "first@example.com")
+
+        assert body["profile_completed"] is False
+        assert body["access"] and body["refresh"]
+        parent = Parent.objects.get(email="first@example.com")
+        assert (parent.full_name, str(parent.phone), parent.referral_source) == (
+            "",
+            "",
+            "",
+        )
+
+    def test_repeat_login_with_unfinished_form_asks_again(
+        self, api_client: APIClient
+    ) -> None:
+        # ПОЧЕМУ: «закрыл вкладку — при следующем входе предложат продолжить».
+        # Частично заполненная анкета всё ещё незаполненная
+        _login(api_client, "halfway@example.com")
+        Parent.objects.filter(email="halfway@example.com").update(
+            full_name="Ольга Иванова"
+        )
+
+        body = _login(api_client, "halfway@example.com")
+
+        assert body["profile_completed"] is False
+
+    def test_login_with_completed_form_goes_straight_in(
+        self, api_client: APIClient
+    ) -> None:
+        ParentFactory(email="done@example.com")
+
+        body = _login(api_client, "done@example.com")
+
+        assert body["profile_completed"] is True
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"full_name": ""},
+            {"full_name": "   "},
+            {"phone": ""},
+            {"referral_source": ""},
+        ],
+    )
+    def test_any_empty_required_field_means_incomplete(
+        self, overrides: dict[str, str]
+    ) -> None:
+        assert ParentFactory.build().is_profile_completed is True
+        assert ParentFactory.build(**overrides).is_profile_completed is False
+
+    def test_comments_are_not_required(self) -> None:
+        assert ParentFactory.build(comments="").is_profile_completed is True
+
+
+@pytest.mark.django_db
+class TestOTPAntiAbuse:
+    def test_request_response_identical_for_known_and_unknown_email(
+        self, api_client: APIClient
+    ) -> None:
+        # ПОЧЕМУ: анти-энумерация — по ответу нельзя понять, есть ли аккаунт
+        ParentFactory(email="known@example.com")
+
+        with patch("apps.users.services.send_otp_email_task"):
+            known = api_client.post(
+                "/api/v1/auth/otp/request/",
+                {"email": "known@example.com"},
+                content_type="application/json",
+            )
+            unknown = api_client.post(
+                "/api/v1/auth/otp/request/",
+                {"email": "nobody@example.com"},
+                content_type="application/json",
+            )
+
+        assert known.status_code == unknown.status_code == 202
+        assert known.content == unknown.content
+        assert not Parent.objects.filter(email="nobody@example.com").exists()
+
+    def test_code_dies_after_five_wrong_attempts_and_new_code_works(
+        self, api_client: APIClient
+    ) -> None:
+        MagicTokensFactory(email="brute@example.com", code="123456")
+
+        def verify(code: str) -> int:
+            return api_client.post(
+                "/api/v1/auth/otp/verify/",
+                {"email": "brute@example.com", "code": code},
+                content_type="application/json",
+                REMOTE_ADDR="10.2.0.1",
+            ).status_code
+
+        assert [verify("000000") for _ in range(OTP_MAX_ATTEMPTS)] == [
+            401
+        ] * OTP_MAX_ATTEMPTS
+        # Код аннулирован: даже верный больше не принимается
+        assert verify("123456") == 429
+
+        _backdate_token("brute@example.com", OTP_COOLDOWN_SECONDS + 1)
+        with patch("apps.users.services.send_otp_email_task"):
+            request_otp("brute@example.com")
+        fresh = MagicTokens.objects.get(email="brute@example.com", is_used=False)
+
+        assert verify(fresh.code) == 200
