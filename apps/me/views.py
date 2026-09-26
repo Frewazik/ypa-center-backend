@@ -12,6 +12,8 @@ from rest_framework.views import APIView
 
 from apps.me.serializers import (
     ChildSerializer,
+    DepositBalanceSerializer,
+    DepositEntryViewSerializer,
     ProfileSerializer,
     SubscriptionViewSerializer,
     TrialViewSerializer,
@@ -22,6 +24,8 @@ from apps.me.services import (
     UPCOMING_MAX_WEEKS,
     build_upcoming_feed,
     create_child,
+    get_parent_deposit_balance,
+    list_parent_deposit_entries,
     list_parent_subscriptions,
     list_parent_trials,
 )
@@ -96,6 +100,36 @@ class TrialListView(APIView):
     def get(self, request: Request) -> Response:
         views = list_parent_trials(_current_parent(request))
         return Response(TrialViewSerializer(views, many=True).data)
+
+
+@extend_schema(
+    operation_id="me_deposit",
+    summary="Баланс депозита родителя",
+    description=(
+        "Баланс в копейках. Нет депозита — 0. Нужен чекауту, чтобы решить, "
+        "предлагать ли оплату с депозита (use_deposit)."
+    ),
+    responses=DepositBalanceSerializer,
+)
+class DepositBalanceView(APIView):
+    def get(self, request: Request) -> Response:
+        balance = get_parent_deposit_balance(_current_parent(request))
+        return Response(DepositBalanceSerializer({"balance": balance}).data)
+
+
+@extend_schema(
+    operation_id="me_deposit_entries",
+    summary="История движений депозита",
+    description=(
+        "Новые сверху. amount со знаком: плюс — начисление, минус — списание. "
+        "Пока без пагинации — весь список массивом."
+    ),
+    responses=DepositEntryViewSerializer(many=True),
+)
+class DepositEntryListView(APIView):
+    def get(self, request: Request) -> Response:
+        views = list_parent_deposit_entries(_current_parent(request))
+        return Response(DepositEntryViewSerializer(views, many=True).data)
 
 
 @extend_schema(

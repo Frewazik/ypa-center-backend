@@ -676,6 +676,17 @@ def create_trial_payment(
             ).exists():
                 raise TrialLimitExceededError(student_id, trial_info.activity_id)
 
+            # ПОЧЕМУ не в БД: уникальность в группе держится только для REGULAR,
+            # пробное поверх абонемента запрещаем здесь. Гонку с чекаутом
+            # абонемента исключает тот же advisory-лок слота
+            if Enrollment.objects.filter(
+                student_id=student_id,
+                schedule_id=schedule_id,
+                type=EnrollmentType.REGULAR,
+                status__in=(EnrollmentStatus.HELD, EnrollmentStatus.ENROLLED),
+            ).exists():
+                raise DuplicateEnrollmentError(student_id, schedule_id)
+
             if _occupied_seats(schedule_id, on_date=trial_date) >= capacity:
                 raise NoAvailableSeatsError(schedule_id)
 
@@ -972,7 +983,7 @@ def _apply_success(
                 info.id, tx.amount, info.amount_kopecks, info.currency
             )
         elif tx.enrollment_id is not None:
-            deferred = _apply_trial_success(info, tx, schedule_port)
+            deferred = _apply_trial_success(info, tx, tx.enrollment_id, schedule_port)
         else:
             data_error = _validate_success_payload(tx, info.id)
             if data_error is not None:
@@ -1072,8 +1083,14 @@ def _apply_success(
 
 
 def _apply_trial_success(
-    info: PaymentInfo, tx: Transaction, schedule_port: SchedulePort
+    info: PaymentInfo,
+    tx: Transaction,
+    enrollment_id: int,
+    schedule_port: SchedulePort,
 ) -> BillingError | None:
+    # ПОЧЕМУ enrollment_id отдельным аргументом: у tx поле Optional, а
+    # вызывающий уже проверил его на None — сужение типа не переживает
+    # границу функции, передаём готовый int
     # !!!: вызывается строго под select_for_update по tx из _apply_success.
     # ПОЧЕМУ повторная проверка мест: бронь (HELD) могла протухнуть
     # за время оплаты, а место — уйти конкуренту
@@ -1084,8 +1101,6 @@ def _apply_trial_success(
     # !!!: порядок захвата (advisory-лок слота → строка Enrollment) обязан
     # совпадать с _try_enroll_held_seats, иначе вебхуки пробного и абонемента
     # по одному слоту ловят взаимный дедлок. schedule_id читаем без лока
-    enrollment_id = tx.enrollment_id
-    assert enrollment_id is not None  # сужение для mypy: проверено в _apply_success
     schedule_id: int = Enrollment.objects.values_list("schedule_id", flat=True).get(
         pk=enrollment_id
     )

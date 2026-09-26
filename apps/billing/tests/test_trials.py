@@ -12,14 +12,18 @@ from rest_framework import status
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from apps.billing.models import (
+    Attendance,
+    AttendanceStatus,
     Enrollment,
     EnrollmentStatus,
     EnrollmentType,
+    SubscriptionStatus,
     Transaction,
     TransactionStatus,
 )
 from apps.billing.services import (
     CheckoutResult,
+    DuplicateEnrollmentError,
     NoAvailableSeatsError,
     SeatsTakenAfterPaymentError,
     StudentNotOwnedError,
@@ -39,9 +43,11 @@ from apps.billing.tests.test_billing import (
     ParentFactory,
     StudentFactory,
     SubscriptionPlanFactory,
+    _checkout,
     _gateway_for,
 )
 from apps.billing.views import CheckoutTrialView
+from apps.journal.services import open_lesson
 from apps.schedule.models import Schedule
 from apps.users.models import Parent, Student
 
@@ -394,7 +400,32 @@ class TestCheckoutTrialView:
         response.render()
 
         assert response.status_code == status.HTTP_409_CONFLICT
+        assert response.data["type"] == "urn:problem-type:triallimitconflict"
         assert response.data["code"] == "TRIAL_LIMIT_EXCEEDED"
+
+    def test_trial_over_subscription_maps_to_409_already_enrolled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        parent = ParentFactory()
+        student = StudentFactory(parent=parent)
+        _checkout([101], parent=parent, student=student)
+        trial_date = timezone.localdate() + timedelta(days=3)
+
+        response = self._post(
+            parent,
+            {
+                "student_id": student.pk,
+                "schedule_id": 101,
+                "trial_date": trial_date.isoformat(),
+            },
+            _trial_port(101, trial_date),
+            monkeypatch,
+        )
+        response.render()
+
+        assert response.status_code == status.HTTP_409_CONFLICT
+        assert response.data["type"] == "urn:problem-type:enrollmentconflict"
+        assert response.data["code"] == "STUDENT_ALREADY_ENROLLED"
 
 
 @pytest.mark.django_db
@@ -509,3 +540,114 @@ class TestCheckoutQueryBudget:
 
         with django_assert_num_queries(2):
             _occupied_seats_bulk([101, 102], on_date=target)
+
+
+@pytest.mark.django_db
+class TestTrialAndSubscriptionSameGroup:
+    def _pass_trial(self) -> None:
+        # Время прошло: занятие пробного уже состоялось
+        Enrollment.objects.filter(type=EnrollmentType.TRIAL).update(
+            trial_date=timezone.localdate() - timedelta(days=1)
+        )
+
+    def test_subscription_after_past_trial_in_same_slot(self) -> None:
+        _, parent, student = _trial_checkout(101, price=0, days_ahead=0)
+        self._pass_trial()
+
+        result = _checkout([101], parent=parent, student=student)
+
+        assert result.status == "PENDING_PAYMENT"
+        regular = Enrollment.objects.get(student=student, type=EnrollmentType.REGULAR)
+        assert regular.schedule_id == 101
+        assert regular.status == EnrollmentStatus.HELD
+
+    def test_trial_limit_still_holds_after_trial_passed(self) -> None:
+        _, parent, student = _trial_checkout(101, price=0, days_ahead=0)
+        self._pass_trial()
+
+        with pytest.raises(TrialLimitExceededError):
+            _trial_checkout(101, parent=parent, student=student, days_ahead=7)
+
+    def test_second_subscription_in_same_slot_is_still_rejected(self) -> None:
+        parent = ParentFactory()
+        student = StudentFactory(parent=parent)
+        _checkout([101], parent=parent, student=student)
+
+        with pytest.raises(DuplicateEnrollmentError):
+            _checkout([101], parent=parent, student=student)
+
+    def test_trial_over_live_subscription_is_rejected(self) -> None:
+        parent = ParentFactory()
+        student = StudentFactory(parent=parent)
+        _checkout([101], parent=parent, student=student)
+
+        with pytest.raises(DuplicateEnrollmentError):
+            _trial_checkout(101, parent=parent, student=student)
+
+        assert not Enrollment.objects.filter(type=EnrollmentType.TRIAL).exists()
+
+    def test_trial_allowed_after_subscription_canceled(self) -> None:
+        parent = ParentFactory()
+        student = StudentFactory(parent=parent)
+        _checkout([101], parent=parent, student=student)
+        Enrollment.objects.update(status=EnrollmentStatus.CANCELED)
+
+        result, _, _ = _trial_checkout(101, parent=parent, student=student)
+
+        assert result.status == "PENDING_PAYMENT"
+
+    def test_trial_in_other_group_of_same_activity_is_allowed(self) -> None:
+        # Запрет — на ту же группу, а не на кружок целиком
+        Schedule.objects.filter(pk=102).update(
+            activity_id=Schedule.objects.get(pk=101).activity_id
+        )
+        parent = ParentFactory()
+        student = StudentFactory(parent=parent)
+        _checkout([101], parent=parent, student=student)
+
+        result, _, _ = _trial_checkout(102, parent=parent, student=student)
+
+        assert result.status == "PENDING_PAYMENT"
+
+    def test_trial_lesson_then_subscription_end_to_end(self) -> None:
+        # Купил пробное → вебхук → занятие прошло в журнале → купил абонемент
+        # в ту же группу → вебхук → постоянная запись активна
+        schedule = Schedule.objects.get(pk=101)
+        today = timezone.localdate()
+        days_ahead = (schedule.day_of_week - today.weekday()) % 7
+        trial_date = today + timedelta(days=days_ahead)
+
+        _, parent, student = _trial_checkout(101, days_ahead=days_ahead)
+        trial_tx = Transaction.objects.get()
+        payment_id, gateway = _gateway_for(trial_tx, "succeeded")
+        confirm_payment(
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=_trial_port(101, trial_date),
+        )
+        trial = Enrollment.objects.get(type=EnrollmentType.TRIAL)
+        assert trial.status == EnrollmentStatus.ENROLLED
+
+        open_lesson(101, trial_date)
+        attendance = Attendance.objects.get(enrollment=trial)
+        assert attendance.status == AttendanceStatus.ATTENDED
+        self._pass_trial()
+
+        _checkout([101], parent=parent, student=student)
+        sub_tx = Transaction.objects.get(subscription__isnull=False)
+        payment_id, gateway = _gateway_for(sub_tx, "succeeded")
+        confirm_payment(
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=FakeSchedulePort(),
+        )
+
+        regular = Enrollment.objects.get(type=EnrollmentType.REGULAR)
+        assert regular.student_id == student.pk
+        assert regular.schedule_id == 101
+        assert regular.status == EnrollmentStatus.ENROLLED
+        assert regular.subscription is not None
+        assert regular.subscription.status == SubscriptionStatus.ACTIVE
+        trial.refresh_from_db()
+        # Пробное не отменяется — на нём держится лимит «1 пробное на кружок»
+        assert trial.status == EnrollmentStatus.ENROLLED

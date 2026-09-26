@@ -6,13 +6,17 @@ from typing import Final, Literal, TypeAlias, cast
 
 from django.db import IntegrityError, transaction
 from django.db.models import Prefetch, Q
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from apps.billing.models import (
+    DepositEntry,
+    DepositEntryReason,
     Enrollment,
     EnrollmentStatus,
     EnrollmentType,
+    ParentDeposit,
     Subscription,
     SubscriptionStatus,
     TransactionStatus,
@@ -28,6 +32,12 @@ UpcomingKind: TypeAlias = Literal["SUBSCRIPTION_SESSION", "TRIAL", "EVENT"]
 
 
 _WEEKDAY_ABBR_RU: Final = ("ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС")
+
+# ПОЧЕМУ: метка в модели написана для админки; родителю «неисполненный заказ»
+# непонятен. Остальные причины показываем меткой модели как есть
+_DEPOSIT_REASON_DISPLAY_OVERRIDES: Final[dict[str, str]] = {
+    DepositEntryReason.ORDER_CANCELED_RETURN: "Возврат: заказ не был оплачен",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +76,17 @@ class TrialView:
     end_time: datetime.time
     status: str
     cost: int | None
+    created_at: datetime.datetime
+
+
+@dataclass(frozen=True, slots=True)
+class DepositEntryView:
+    id: int
+    amount: int
+    reason: str
+    reason_display: str
+    subscription_id: int | None
+    subscription_display_id: str | None
     created_at: datetime.datetime
 
 
@@ -150,6 +171,53 @@ def list_parent_subscriptions(parent: Parent) -> list[SubscriptionView]:
                 expires_at=subscription.expires_at,
                 total_remaining=total_remaining,
                 slots=slot_views,
+            )
+        )
+    return views
+
+
+def get_parent_deposit_balance(parent: Parent) -> int:
+    # Строки депозита нет до первого начисления — это баланс 0. При чтении её
+    # не создаём: создание — дело начисления (_locked_parent_deposit)
+    balance = (
+        ParentDeposit.objects.filter(parent=parent)
+        .values_list("balance", flat=True)
+        .first()
+    )
+    return balance or 0
+
+
+def list_parent_deposit_entries(parent: Parent) -> list[DepositEntryView]:
+    # ПОЧЕМУ Coalesce: начисление при истечении ссылается на абонемент
+    # напрямую, а списание и возврат — через транзакцию чекаута. Фронту
+    # отдаём один subscription_id, склейка — одним LEFT JOIN в том же запросе
+    rows = (
+        DepositEntry.objects.filter(deposit__parent=parent)
+        .annotate(
+            source_subscription_id=Coalesce(
+                "subscription_id", "transaction__subscription_id"
+            )
+        )
+        .order_by("-created_at", "-pk")
+        .values("pk", "amount", "reason", "created_at", "source_subscription_id")
+    )
+    views: list[DepositEntryView] = []
+    for row in rows:
+        reason = row["reason"]
+        subscription_id = cast("int | None", row["source_subscription_id"])
+        views.append(
+            DepositEntryView(
+                id=row["pk"],
+                amount=row["amount"],
+                reason=reason,
+                reason_display=_DEPOSIT_REASON_DISPLAY_OVERRIDES.get(
+                    reason, DepositEntryReason(reason).label
+                ),
+                subscription_id=subscription_id,
+                subscription_display_id=(
+                    f"#SUB-{subscription_id}" if subscription_id is not None else None
+                ),
+                created_at=row["created_at"],
             )
         )
     return views

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
-from apps.billing.models import SubscriptionStatus
+from apps.billing.models import DepositEntryReason, SubscriptionStatus
 from apps.me.services import UpcomingItem
 from apps.users.models import Parent, Student
 
@@ -67,6 +67,21 @@ class TrialViewSerializer(serializers.Serializer):
     # ПОЧЕМУ: null — если платёжная транзакция была аннулирована/потеряна,
     # цену показывать не из чего
     cost = serializers.IntegerField(read_only=True, allow_null=True)
+    created_at = serializers.DateTimeField(read_only=True)
+
+
+class DepositBalanceSerializer(serializers.Serializer):
+    balance = serializers.IntegerField(read_only=True)
+
+
+class DepositEntryViewSerializer(serializers.Serializer):
+    id = serializers.IntegerField(read_only=True)
+    # Знаковая: плюс — пришло на депозит, минус — потрачено
+    amount = serializers.IntegerField(read_only=True)
+    reason = serializers.ChoiceField(choices=DepositEntryReason.choices, read_only=True)
+    reason_display = serializers.CharField(read_only=True)
+    subscription_id = serializers.IntegerField(read_only=True, allow_null=True)
+    subscription_display_id = serializers.CharField(read_only=True, allow_null=True)
     created_at = serializers.DateTimeField(read_only=True)
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+from typing import TYPE_CHECKING
 
 import pytest
 from django.utils import timezone
@@ -21,12 +22,18 @@ from apps.schedule.tests.factories import (
 )
 from apps.users.models import Parent, Student
 from apps.billing.models import (
+    DepositEntry,
+    DepositEntryReason,
     EnrollmentStatus,
+    ParentDeposit,
     SubscriptionStatus,
     Transaction,
     TransactionStatus,
 )
 from apps.billing.tests.factories import SubscriptionSlotFactory
+
+if TYPE_CHECKING:
+    from pytest_django import DjangoAssertNumQueries
 
 pytestmark = pytest.mark.django_db
 
@@ -35,6 +42,8 @@ CHILDREN_URL = "/api/v1/me/children/"
 SUBSCRIPTIONS_URL = "/api/v1/me/subscriptions/"
 UPCOMING_URL = "/api/v1/me/upcoming/"
 TRIALS_URL = "/api/v1/me/trials/"
+DEPOSIT_URL = "/api/v1/me/deposit/"
+DEPOSIT_ENTRIES_URL = "/api/v1/me/deposit/entries/"
 
 
 @pytest.fixture
@@ -420,3 +429,143 @@ class TestUpcomingTrials:
         response = api_client.get(UPCOMING_URL, {"child_id": student.pk})
 
         assert [item["kind"] for item in response.json()] == ["TRIAL"]
+
+
+class TestDeposit:
+    def _history(self, parent: Parent) -> ParentDeposit:
+        # Реальный сценарий: остаток абонемента пришёл на депозит, часть
+        # потрачена на новый абонемент, неоплаченный заказ вернул деньги
+        deposit = ParentDeposit.objects.create(parent=parent, balance=250_000)
+        expired = SubscriptionFactory(parent=parent)
+        bought = SubscriptionFactory(parent=parent)
+        abandoned = SubscriptionFactory(parent=parent)
+        spend_tx = Transaction.objects.create(
+            parent=parent,
+            subscription=bought,
+            amount=0,
+            status=TransactionStatus.SUCCEEDED,
+        )
+        return_tx = Transaction.objects.create(
+            parent=parent,
+            subscription=abandoned,
+            amount=100_000,
+            status=TransactionStatus.CANCELED,
+        )
+        base = timezone.now() - datetime.timedelta(days=10)
+        rows = [
+            (
+                300_000,
+                DepositEntryReason.SUBSCRIPTION_EXPIRY_CREDIT,
+                {"subscription": expired},
+            ),
+            (-50_000, DepositEntryReason.CHECKOUT_SPEND, {"transaction": spend_tx}),
+            (-20_000, DepositEntryReason.CHECKOUT_SPEND, {"transaction": return_tx}),
+            (
+                20_000,
+                DepositEntryReason.ORDER_CANCELED_RETURN,
+                {"transaction": return_tx},
+            ),
+        ]
+        for day, (amount, reason, link) in enumerate(rows):
+            entry = DepositEntry.objects.create(
+                deposit=deposit, amount=amount, reason=reason, **link
+            )
+            DepositEntry.objects.filter(pk=entry.pk).update(
+                created_at=base + datetime.timedelta(days=day)
+            )
+        return deposit
+
+    def test_requires_auth(self) -> None:
+        assert APIClient().get(DEPOSIT_URL).status_code == 401
+        assert APIClient().get(DEPOSIT_ENTRIES_URL).status_code == 401
+
+    def test_parent_without_deposit_gets_zero_and_empty_history(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        balance = api_client.get(DEPOSIT_URL)
+        entries = api_client.get(DEPOSIT_ENTRIES_URL)
+
+        assert balance.status_code == status.HTTP_200_OK
+        assert balance.json() == {"balance": 0}
+        assert entries.status_code == status.HTTP_200_OK
+        assert entries.json() == []
+        # Чтение не заводит строку депозита — это делает только начисление
+        assert not ParentDeposit.objects.filter(parent=parent).exists()
+
+    def test_returns_balance(self, api_client: APIClient, parent: Parent) -> None:
+        self._history(parent)
+
+        response = api_client.get(DEPOSIT_URL)
+
+        assert response.json() == {"balance": 250_000}
+
+    def test_history_newest_first_with_subscription_links(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        deposit = self._history(parent)
+
+        response = api_client.get(DEPOSIT_ENTRIES_URL)
+
+        assert response.status_code == status.HTTP_200_OK
+        payload = response.json()
+        assert [item["amount"] for item in payload] == [
+            20_000,
+            -20_000,
+            -50_000,
+            300_000,
+        ]
+        # Инвариант депозита: баланс равен сумме журнала
+        assert sum(item["amount"] for item in payload) == deposit.balance
+        returned, _, spent, credited = payload
+        assert returned["reason"] == "ORDER_CANCELED_RETURN"
+        assert returned["reason_display"] == "Возврат: заказ не был оплачен"
+        assert credited["reason_display"] == "Несгораемый остаток абонемента"
+        # Абонемент находится и напрямую, и через транзакцию чекаута
+        expired_sub = DepositEntry.objects.get(
+            reason=DepositEntryReason.SUBSCRIPTION_EXPIRY_CREDIT
+        ).subscription_id
+        spend_sub = Transaction.objects.get(amount=0).subscription_id
+        assert credited["subscription_id"] == expired_sub
+        assert credited["subscription_display_id"] == f"#SUB-{expired_sub}"
+        assert spent["subscription_id"] == spend_sub
+        assert set(spent) == {
+            "id",
+            "amount",
+            "reason",
+            "reason_display",
+            "subscription_id",
+            "subscription_display_id",
+            "created_at",
+        }
+
+    def test_foreign_deposit_is_invisible(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        self._history(ParentFactory())
+
+        assert api_client.get(DEPOSIT_URL).json() == {"balance": 0}
+        assert api_client.get(DEPOSIT_ENTRIES_URL).json() == []
+
+    def test_balance_is_single_query(
+        self,
+        api_client: APIClient,
+        parent: Parent,
+        django_assert_num_queries: DjangoAssertNumQueries,
+    ) -> None:
+        self._history(parent)
+
+        with django_assert_num_queries(1):
+            api_client.get(DEPOSIT_URL)
+
+    def test_history_query_count_does_not_grow(
+        self,
+        api_client: APIClient,
+        parent: Parent,
+        django_assert_num_queries: DjangoAssertNumQueries,
+    ) -> None:
+        self._history(parent)
+
+        # Один запрос на весь журнал: абонемент-через-транзакцию склеивается
+        # JOIN'ом, а не догрузкой на каждую строку
+        with django_assert_num_queries(1):
+            api_client.get(DEPOSIT_ENTRIES_URL)
