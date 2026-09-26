@@ -23,6 +23,7 @@ from apps.events.services import (
 )
 from apps.events.tests.factories import EventFactory, EventRegistrationFactory
 from apps.schedule.tests.factories import ParentFactory
+from apps.users.models import ConsentPurpose, PersonalDataConsent
 
 pytestmark = pytest.mark.django_db
 
@@ -76,6 +77,7 @@ def registration_payload() -> dict[str, object]:
         "attendees_count": 2,
         "source": "instagram",
         "comment": "Будем вдвоём с младшей сестрой",
+        "pd_consent": True,
     }
 
 
@@ -303,3 +305,71 @@ class TestRegistrationParentBinding:
         api_client.post(_register_url(event.pk), registration_payload, format="json")
 
         assert EventRegistration.objects.get(event=event).parent_id is None
+
+
+class TestEventRegistrationConsent:
+    @pytest.mark.parametrize("consent", [None, False])
+    def test_registration_without_consent_rejected_and_seats_kept(
+        self,
+        api_client: APIClient,
+        registration_payload: dict[str, object],
+        consent: bool | None,
+    ) -> None:
+        event = EventFactory(price=0)
+        payload = dict(registration_payload)
+        if consent is None:
+            payload.pop("pd_consent")
+        else:
+            payload["pd_consent"] = consent
+
+        response = api_client.post(_register_url(event.pk), payload, format="json")
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        event.refresh_from_db()
+        assert event.seats_taken == 0
+        assert PersonalDataConsent.objects.count() == 0
+
+    def test_guest_registration_journals_consent(
+        self, api_client: APIClient, registration_payload: dict[str, object]
+    ) -> None:
+        event = EventFactory(price=0)
+
+        api_client.post(_register_url(event.pk), registration_payload, format="json")
+
+        record = PersonalDataConsent.objects.get()
+        assert record.purpose == ConsentPurpose.EVENT_REGISTRATION
+        assert record.source_id == EventRegistration.objects.get().pk
+        assert record.parent is None
+        assert record.email == registration_payload["email"]
+
+    def test_logged_in_parent_linked_to_consent(
+        self, registration_payload: dict[str, object]
+    ) -> None:
+        parent = ParentFactory()
+        client = APIClient()
+        client.force_authenticate(user=parent)
+        event = EventFactory(price=0)
+
+        client.post(_register_url(event.pk), registration_payload, format="json")
+
+        assert PersonalDataConsent.objects.get().parent == parent
+
+    def test_staff_created_registration_has_no_site_consent(self) -> None:
+        # ПОЧЕМУ: регистрацию по звонку заводит сотрудник — согласие на сайте
+        # не давалось, выдумывать запись журнала нельзя
+        event = EventFactory(price=0)
+
+        register_for_event(
+            event.pk,
+            RegistrationSubmission(
+                child_name="Миша",
+                parent_name="Ольга",
+                phone="+79991234567",
+                email="",
+                attendees_count=1,
+                source="",
+                comment="",
+            ),
+        )
+
+        assert PersonalDataConsent.objects.count() == 0

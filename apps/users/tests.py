@@ -51,6 +51,7 @@ class ParentFactory(factory.django.DjangoModelFactory):
     phone = "+79991234567"
     # Анкета заполнена: иначе ЛК и чекаут отвечают 403 PROFILE_INCOMPLETE
     referral_source = "FRIENDS"
+    pd_consent_at = factory.LazyFunction(timezone.now)
 
 
 class StudentFactory(factory.django.DjangoModelFactory):
@@ -993,10 +994,11 @@ class TestOnboardingLogin:
             {"full_name": "   "},
             {"phone": ""},
             {"referral_source": ""},
+            {"pd_consent_at": None},
         ],
     )
     def test_any_empty_required_field_means_incomplete(
-        self, overrides: dict[str, str]
+        self, overrides: dict[str, object]
     ) -> None:
         assert ParentFactory.build().is_profile_completed is True
         assert ParentFactory.build(**overrides).is_profile_completed is False

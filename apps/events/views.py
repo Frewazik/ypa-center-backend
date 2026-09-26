@@ -15,6 +15,7 @@ from apps.events.serializers import (
 )
 from apps.events.services import process_registration_submission
 from apps.events.throttling import EventRegistrationIPThrottle
+from apps.users.consent import ConsentSource
 
 _ACCEPTED_BODY: Final[dict[str, str]] = {"status": "accepted"}
 
@@ -38,6 +39,7 @@ class EventRegistrationCreateView(APIView):
         process_registration_submission(
             event_id,
             cast("dict[str, object]", serializer.validated_data),
+            ConsentSource.from_request(request),
             parent=parent,
         )
         # ПОЧЕМУ: ответ одинаков для реальной регистрации и honeypot-дропа,

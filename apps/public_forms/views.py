@@ -9,7 +9,6 @@ from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from apps.core.net import client_ip
 from apps.public_forms.serializers import (
     CallbackRequestCreateSerializer,
     FeedbackRequestCreateSerializer,
@@ -20,6 +19,7 @@ from apps.public_forms.services import (
     process_feedback_submission,
 )
 from apps.public_forms.throttling import CallbackIPThrottle, FeedbackIPThrottle
+from apps.users.consent import ConsentSource
 
 _ACCEPTED_BODY: Final[dict[str, str]] = {"status": "accepted"}
 
@@ -36,7 +36,9 @@ class CallbackRequestCreateView(APIView):
     async def post(self, request: Request) -> Response:
         serializer = CallbackRequestCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        await process_callback_submission(serializer.validated_data, client_ip(request))
+        await process_callback_submission(
+            serializer.validated_data, ConsentSource.from_request(request)
+        )
         # ПОЧЕМУ: ответ одинаков для реальной заявки и honeypot-дропа,
         # чтобы бот не отличил ловушку
         return Response(_ACCEPTED_BODY, status=status.HTTP_202_ACCEPTED)
@@ -54,5 +56,7 @@ class FeedbackRequestCreateView(APIView):
     async def post(self, request: Request) -> Response:
         serializer = FeedbackRequestCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        await process_feedback_submission(serializer.validated_data, client_ip(request))
+        await process_feedback_submission(
+            serializer.validated_data, ConsentSource.from_request(request)
+        )
         return Response(_ACCEPTED_BODY, status=status.HTTP_202_ACCEPTED)

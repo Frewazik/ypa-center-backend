@@ -4,6 +4,8 @@ import datetime
 from typing import TYPE_CHECKING
 
 import pytest
+from django.conf import settings
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -20,7 +22,7 @@ from apps.schedule.tests.factories import (
     StudentFactory,
     SubscriptionFactory,
 )
-from apps.users.models import Parent, Student
+from apps.users.models import ConsentPurpose, Parent, PersonalDataConsent, Student
 from apps.billing.models import (
     DepositEntry,
     DepositEntryReason,
@@ -586,17 +588,18 @@ _GATED_ENDPOINTS = [
     ("post", CHECKOUT_TRIAL_URL),
 ]
 
-_ANKETA = {
+_ANKETA: dict[str, object] = {
     "full_name": "Петрова Анна Сергеевна",
     "phone": "+79131234567",
     "referral_source": "MAPS",
+    "pd_consent": True,
 }
 
 
 @pytest.fixture
 def new_parent() -> Parent:
     # Так выглядит родитель сразу после первого входа
-    return ParentFactory(full_name="", phone="", referral_source="")
+    return ParentFactory(full_name="", phone="", referral_source="", pd_consent_at=None)
 
 
 @pytest.fixture
@@ -678,7 +681,11 @@ class TestOnboardingGate:
 
         rest = new_client.patch(
             PROFILE_URL,
-            {"phone": _ANKETA["phone"], "referral_source": "FRIENDS"},
+            {
+                "phone": _ANKETA["phone"],
+                "referral_source": "FRIENDS",
+                "pd_consent": True,
+            },
             format="json",
         )
         assert rest.json()["profile_completed"] is True
@@ -735,3 +742,92 @@ class TestReferralBackfillMigration:
         assert legacy.referral_source == "UNKNOWN"
         assert legacy.is_profile_completed is True
         assert answered.referral_source == "SCHOOL"
+
+
+class TestRegistrationConsent:
+    def test_filled_fields_without_consent_keep_cabinet_closed(
+        self, new_client: APIClient
+    ) -> None:
+        anketa = {k: v for k, v in _ANKETA.items() if k != "pd_consent"}
+
+        response = new_client.patch(PROFILE_URL, anketa, format="json")
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["profile_completed"] is False
+        assert response.json()["pd_consent_at"] is None
+        assert new_client.get(SUBSCRIPTIONS_URL).status_code == 403
+
+    def test_unchecked_box_is_rejected(self, new_client: APIClient) -> None:
+        response = new_client.patch(
+            PROFILE_URL, {**_ANKETA, "pd_consent": False}, format="json"
+        )
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        assert PersonalDataConsent.objects.count() == 0
+
+    def test_consent_is_journaled_as_proof(
+        self, new_client: APIClient, new_parent: Parent
+    ) -> None:
+        response = new_client.patch(
+            PROFILE_URL,
+            _ANKETA,
+            format="json",
+            REMOTE_ADDR="203.0.113.7",
+            HTTP_USER_AGENT="Mozilla/5.0 (Android)",
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["pd_consent_at"] is not None
+        record = PersonalDataConsent.objects.get()
+        assert record.purpose == ConsentPurpose.REGISTRATION
+        assert record.document_version == settings.PD_CONSENT_VERSION
+        assert record.parent == new_parent
+        assert record.email == new_parent.email
+        # Телефон из этой же анкеты — снимок на момент согласия
+        assert str(record.phone) == _ANKETA["phone"]
+        assert record.ip == "203.0.113.7"
+        assert record.user_agent == "Mozilla/5.0 (Android)"
+
+    def test_repeated_consent_does_not_duplicate_or_move_date(
+        self, new_client: APIClient, new_parent: Parent
+    ) -> None:
+        new_client.patch(PROFILE_URL, _ANKETA, format="json")
+        new_parent.refresh_from_db()
+        first_consent_at = new_parent.pd_consent_at
+
+        new_client.patch(PROFILE_URL, {"pd_consent": True}, format="json")
+
+        new_parent.refresh_from_db()
+        assert new_parent.pd_consent_at == first_consent_at
+        assert PersonalDataConsent.objects.count() == 1
+
+    def test_consent_ip_taken_through_own_proxy(self, new_client: APIClient) -> None:
+        with override_settings(
+            REST_FRAMEWORK={**settings.REST_FRAMEWORK, "NUM_PROXIES": 1}
+        ):
+            new_client.patch(
+                PROFILE_URL,
+                _ANKETA,
+                format="json",
+                REMOTE_ADDR="172.18.0.2",
+                HTTP_X_FORWARDED_FOR="1.2.3.4, 203.0.113.7",
+            )
+
+        assert PersonalDataConsent.objects.get().ip == "203.0.113.7"
+
+    def test_admin_cannot_fake_or_erase_consent(self) -> None:
+        # ПОЧЕМУ: согласие — действие самого родителя. Даже суперпользователь
+        # не ставит галочку «за клиента» и не правит/удаляет журнал
+        from django.contrib import admin
+        from django.test import RequestFactory
+
+        from apps.users.admin import ParentAdmin
+
+        request = RequestFactory().get("/admin/")
+        request.user = ParentFactory(is_staff=True, is_superuser=True)
+        journal_admin = admin.site._registry[PersonalDataConsent]
+
+        assert "pd_consent_at" in ParentAdmin.readonly_fields
+        assert journal_admin.has_add_permission(request) is False
+        assert journal_admin.has_change_permission(request) is False
+        assert journal_admin.has_delete_permission(request) is False

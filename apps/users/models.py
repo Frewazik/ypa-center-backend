@@ -25,8 +25,16 @@ class ReferralSource(models.TextChoices):
     UNKNOWN = "UNKNOWN", "Не указано"
 
 
-# ПОЧЕМУ: единственный источник правды правила «анкета заполнена» —
-# его читают permission-класс, verify и сериализатор профиля
+class ConsentPurpose(models.TextChoices):
+    REGISTRATION = "REGISTRATION", "Регистрация в личном кабинете"
+    CALLBACK = "CALLBACK", "Заказ обратного звонка"
+    FEEDBACK = "FEEDBACK", "Обратная связь"
+    EVENT_REGISTRATION = "EVENT_REGISTRATION", "Запись на событие"
+
+
+# ПОЧЕМУ: единственный источник правды правила «анкета заполнена» (вместе
+# с согласием на обработку ПД) — его читают permission-класс, verify
+# и сериализатор профиля
 PROFILE_REQUIRED_FIELDS: Final[tuple[str, ...]] = (
     "full_name",
     "phone",
@@ -104,6 +112,13 @@ class Parent(AbstractBaseUser, PermissionsMixin):
         blank=True,
         default="",
     )
+    # ПОЧЕМУ: состояние для проверки анкеты без лишнего запроса. Доказательство
+    # (версия документа, IP, браузер) — в журнале PersonalDataConsent
+    pd_consent_at = models.DateTimeField(
+        verbose_name="Согласие на обработку ПД",
+        null=True,
+        blank=True,
+    )
     is_active = models.BooleanField(verbose_name="Активен", default=True)
     is_staff = models.BooleanField(verbose_name="Персонал", default=False)
     created_at = models.DateTimeField(verbose_name="Создан", auto_now_add=True)
@@ -127,7 +142,10 @@ class Parent(AbstractBaseUser, PermissionsMixin):
         # ПОЧЕМУ: вычисляется на лету, а не хранится флагом — флаг расходится
         # с полями, когда их правят в админке. Поля лежат в той же строке,
         # что уже загрузил JWTAuthentication, лишних запросов нет
-        return all(str(getattr(self, name)).strip() for name in PROFILE_REQUIRED_FIELDS)
+        has_fields = all(
+            str(getattr(self, name)).strip() for name in PROFILE_REQUIRED_FIELDS
+        )
+        return has_fields and self.pd_consent_at is not None
 
 
 class Student(models.Model):
@@ -204,6 +222,61 @@ class MagicTokens(models.Model):
 
     def __str__(self) -> str:
         return f"OTP для {self.email} (использован: {self.is_used})"
+
+
+class PersonalDataConsent(models.Model):
+    """Журнал согласий на обработку ПД (152-ФЗ, ст. 9).
+
+    Обязанность доказать, что согласие получено, лежит на операторе
+    (ст. 9 ч. 3). Строка — это доказательство: кто, когда, на какую версию
+    документа и откуда согласился. Только добавление: записи не правятся
+    и не удаляются, отзыв согласия — отдельная будущая запись.
+    """
+
+    purpose = models.CharField(
+        verbose_name="Где дано",
+        max_length=32,
+        choices=ConsentPurpose.choices,
+    )
+    document_version = models.CharField(verbose_name="Версия документа", max_length=32)
+    # ПОЧЕМУ: SET_NULL, а не CASCADE — удаление аккаунта не должно
+    # уничтожать доказательство, что согласие было; контакт остаётся снимком
+    parent = models.ForeignKey(
+        Parent,
+        verbose_name="Родитель",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="pd_consents",
+        # Поиск по родителю покрывает составной индекс pdc_parent_created_idx
+        db_index=False,
+    )
+    email = models.EmailField(verbose_name="Email", blank=True)
+    phone = PhoneNumberField(verbose_name="Телефон", region="RU", blank=True)
+    # ПОЧЕМУ: id заявки/регистрации в таблице, которую задаёт purpose.
+    # Без FK — журнал общий для четырёх таблиц и переживает их чистку
+    source_id = models.PositiveBigIntegerField(
+        verbose_name="ID заявки", null=True, blank=True
+    )
+    ip = models.GenericIPAddressField(verbose_name="IP", null=True, blank=True)
+    user_agent = models.CharField(verbose_name="Браузер", max_length=512, blank=True)
+    created_at = models.DateTimeField(verbose_name="Дано", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Согласие на обработку ПД"
+        verbose_name_plural = "Согласия на обработку ПД"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(
+                fields=["parent", "-created_at"], name="pdc_parent_created_idx"
+            ),
+            models.Index(
+                fields=["purpose", "source_id"], name="pdc_purpose_source_idx"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.get_purpose_display()} · {self.document_version}"
 
 
 class TeacherProfile(models.Model):

@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # Сколько своих прокси стоит перед Django (Caddy на VPS — 1).
     # Вне local обязательна: см. _resolve_trusted_proxy_count
     TRUSTED_PROXY_COUNT: int | None = Field(default=None, ge=0)
+    # Версия текста согласия на обработку ПД, который сейчас показывает фронт
+    # (например, дата редакции «2026-10-01»). Вне local обязательна
+    PD_CONSENT_VERSION: str | None = Field(default=None, min_length=1, max_length=32)
 
     DATABASE_URL: str = Field(
         default="postgresql://postgres:postgres@localhost:5432/yra"
@@ -77,6 +80,22 @@ def _resolve_trusted_proxy_count(env: Settings) -> int:
 
 
 TRUSTED_PROXY_COUNT = _resolve_trusted_proxy_count(_env)
+
+
+def _resolve_pd_consent_version(env: Settings) -> str:
+    # ПОЧЕМУ: версия — часть доказательства согласия (152-ФЗ). Выдуманный
+    # дефолт в проде записал бы в журнал «согласие на неизвестно что»
+    if env.PD_CONSENT_VERSION:
+        return env.PD_CONSENT_VERSION
+    if env.ENVIRONMENT == "local":
+        return "local-draft"
+    raise ImproperlyConfigured(
+        "Задайте PD_CONSENT_VERSION — версию текста согласия на обработку ПД, "
+        "который показывает фронт. См. docs/personal-data.md"
+    )
+
+
+PD_CONSENT_VERSION = _resolve_pd_consent_version(_env)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 

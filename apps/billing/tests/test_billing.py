@@ -90,6 +90,7 @@ class ParentFactory(factory.django.DjangoModelFactory):
     phone = factory.Sequence(lambda n: f"+7999000{n:04d}")
     # Анкета заполнена: иначе ЛК и чекаут отвечают 403 PROFILE_INCOMPLETE
     referral_source = "FRIENDS"
+    pd_consent_at = factory.LazyFunction(timezone.now)
     email = factory.Sequence(lambda n: f"parent{n}@example.com")
 
 

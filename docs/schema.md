@@ -39,13 +39,22 @@ erDiagram
 
 **parent** — кастомная модель пользователя (AUTH_USER_MODEL). `email` (unique, логин),
 `full_name`, `phone` (PhoneNumberField), `referral_source` («откуда узнали», enum-строка,
-пусто до анкеты), `comments`, `is_active`, `is_staff`. Паролей у
+пусто до анкеты), `pd_consent_at` (дата согласия на обработку ПД из анкеты, `NULL` —
+не давалось), `comments`, `is_active`, `is_staff`. Паролей у
 родителей нет (unusable password), пароль есть только у staff для входа в админку.
-Анкета заполнена, когда непусты `full_name`, `phone`, `referral_source` — вычисляется
-на лету (`Parent.is_profile_completed`), флага в БД нет (`auth-flow.md` §4.1).
+Анкета заполнена, когда непусты `full_name`, `phone`, `referral_source` и `pd_consent_at`
+— вычисляется на лету (`Parent.is_profile_completed`), флага в БД нет (`auth-flow.md` §4.1).
 
 **student** — `parent` FK (CASCADE), `full_name`, `school_grade`, `dob`, `health_issues`.
 Уникальность `(parent, full_name, dob)` — защита от дабл-сабмита формы.
+`health_issues` — сведения о здоровье, специальная категория ПД (`personal-data.md` §5).
+
+**personal_data_consent** (`users_personaldataconsent`) — журнал согласий на обработку ПД,
+только добавление: `purpose` (анкета / звонок / обратная связь / событие),
+`document_version`, `parent` FK (SET_NULL — доказательство переживает удаление аккаунта),
+снимок `email`/`phone`, `source_id` (id заявки в таблице по `purpose`, без FK), `ip`,
+`user_agent`, `created_at`. Индексы `(parent, created_at DESC)` и `(purpose, source_id)`.
+Детали — `personal-data.md`.
 
 **magic_tokens** — OTP-коды входа: `email`, `code` (6 цифр), `attempts_count`,
 `expires_at`, `is_used`. Составные индексы `(is_used, expires_at)` и

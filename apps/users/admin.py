@@ -6,7 +6,7 @@ from django.http import HttpRequest
 from unfold.admin import ModelAdmin, TabularInline
 
 from apps.billing.models import Subscription
-from apps.users.models import Parent, Student, TeacherProfile
+from apps.users.models import Parent, PersonalDataConsent, Student, TeacherProfile
 
 
 class StudentInline(TabularInline):
@@ -37,7 +37,9 @@ class ParentAdmin(ModelAdmin):
     # autocomplete, без него Django падает при рендере виджета
     search_fields = ("email", "full_name", "phone")
     ordering = ("-created_at",)
-    readonly_fields = ("created_at", "updated_at", "last_login")
+    # ПОЧЕМУ: согласие даёт только сам родитель на сайте — поставить его
+    # «за клиента» из админки нельзя, это подделка доказательства
+    readonly_fields = ("created_at", "updated_at", "last_login", "pd_consent_at")
     # ПОЧЕМУ: Parent — AUTH_USER_MODEL без пароля (вход по OTP), поле password
     # в форме провоцирует админа «починить» хэш руками
     exclude = ("password",)
@@ -47,6 +49,7 @@ class ParentAdmin(ModelAdmin):
             None,
             {"fields": ("email", "full_name", "phone", "referral_source", "comments")},
         ),
+        ("Персональные данные", {"fields": ("pd_consent_at",)}),
         ("Доступ", {"fields": ("is_active", "is_staff", "is_superuser", "groups")}),
         ("Служебное", {"fields": ("last_login", "created_at", "updated_at")}),
     )
@@ -66,6 +69,36 @@ class StudentAdmin(ModelAdmin):
         "parent__phone",
     )
     autocomplete_fields = ("parent",)
+
+
+@admin.register(PersonalDataConsent)
+class PersonalDataConsentAdmin(ModelAdmin):
+    # ПОЧЕМУ: журнал — доказательство согласий по 152-ФЗ. Только чтение:
+    # правка или удаление строки уничтожает доказательство
+    list_display = (
+        "created_at",
+        "purpose",
+        "document_version",
+        "parent",
+        "email",
+        "phone",
+    )
+    list_filter = ("purpose", "document_version")
+    search_fields = ("email", "phone", "parent__email")
+    list_select_related = ("parent",)
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+    def has_change_permission(
+        self, request: HttpRequest, obj: PersonalDataConsent | None = None
+    ) -> bool:
+        return False
+
+    def has_delete_permission(
+        self, request: HttpRequest, obj: PersonalDataConsent | None = None
+    ) -> bool:
+        return False
 
 
 @admin.register(TeacherProfile)
