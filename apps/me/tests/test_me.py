@@ -569,3 +569,169 @@ class TestDeposit:
         # JOIN'ом, а не догрузкой на каждую строку
         with django_assert_num_queries(1):
             api_client.get(DEPOSIT_ENTRIES_URL)
+
+
+CHECKOUT_SUBSCRIPTION_URL = "/api/v1/checkout/subscription"
+CHECKOUT_TRIAL_URL = "/api/v1/checkout/trial"
+PROFILE_INCOMPLETE_TYPE = "urn:problem-type:profileincomplete"
+
+# Ручки, закрытые до заполнения анкеты: (метод, URL)
+_GATED_ENDPOINTS = [
+    ("get", SUBSCRIPTIONS_URL),
+    ("get", TRIALS_URL),
+    ("get", UPCOMING_URL),
+    ("get", DEPOSIT_URL),
+    ("get", DEPOSIT_ENTRIES_URL),
+    ("post", CHECKOUT_SUBSCRIPTION_URL),
+    ("post", CHECKOUT_TRIAL_URL),
+]
+
+_ANKETA = {
+    "full_name": "Петрова Анна Сергеевна",
+    "phone": "+79131234567",
+    "referral_source": "MAPS",
+}
+
+
+@pytest.fixture
+def new_parent() -> Parent:
+    # Так выглядит родитель сразу после первого входа
+    return ParentFactory(full_name="", phone="", referral_source="")
+
+
+@pytest.fixture
+def new_client(new_parent: Parent) -> APIClient:
+    client = APIClient()
+    client.force_authenticate(user=new_parent)
+    return client
+
+
+class TestOnboardingGate:
+    @pytest.mark.parametrize(("method", "url"), _GATED_ENDPOINTS)
+    def test_cabinet_and_checkout_closed_until_form_filled(
+        self, new_client: APIClient, method: str, url: str
+    ) -> None:
+        response = getattr(new_client, method)(url, {}, format="json")
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        body = response.json()
+        # Машинный признак, по которому фронт отличает анкету от «чужого»
+        assert body["type"] == PROFILE_INCOMPLETE_TYPE
+        assert body["title"] == "ProfileIncomplete"
+
+    @pytest.mark.parametrize(("method", "url"), _GATED_ENDPOINTS)
+    def test_guest_still_gets_401_not_403(self, method: str, url: str) -> None:
+        response = getattr(APIClient(), method)(url, {}, format="json")
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_profile_readable_and_reports_incomplete(
+        self, new_client: APIClient, new_parent: Parent
+    ) -> None:
+        response = new_client.get(PROFILE_URL)
+
+        assert response.status_code == status.HTTP_200_OK
+        payload = response.json()
+        assert payload["profile_completed"] is False
+        assert payload["email"] == new_parent.email
+        assert payload["referral_source"] == ""
+
+    def test_children_can_be_added_and_edited_before_form(
+        self, new_client: APIClient, new_parent: Parent
+    ) -> None:
+        created = new_client.post(
+            CHILDREN_URL,
+            {"full_name": "Петров Миша", "dob": "2016-05-01"},
+            format="json",
+        )
+        assert created.status_code == status.HTTP_201_CREATED
+
+        updated = new_client.patch(
+            f"{CHILDREN_URL}{created.json()['id']}/",
+            {"school_grade": "3"},
+            format="json",
+        )
+        assert updated.status_code == status.HTTP_200_OK
+
+    def test_filled_form_opens_everything(
+        self, new_client: APIClient, new_parent: Parent
+    ) -> None:
+        response = new_client.patch(PROFILE_URL, _ANKETA, format="json")
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["profile_completed"] is True
+        new_parent.refresh_from_db()
+        # force_authenticate держит тот же объект, что обновил PATCH
+        for url in (SUBSCRIPTIONS_URL, TRIALS_URL, UPCOMING_URL, DEPOSIT_URL):
+            assert new_client.get(url).status_code == status.HTTP_200_OK
+        # Чекаут пускает дальше анкеты: без Idempotency-Key — уже валидация
+        checkout = new_client.post(CHECKOUT_TRIAL_URL, {}, format="json")
+        assert checkout.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    def test_form_can_be_saved_in_parts(
+        self, new_client: APIClient, new_parent: Parent
+    ) -> None:
+        first = new_client.patch(
+            PROFILE_URL, {"full_name": _ANKETA["full_name"]}, format="json"
+        )
+        assert first.json()["profile_completed"] is False
+
+        rest = new_client.patch(
+            PROFILE_URL,
+            {"phone": _ANKETA["phone"], "referral_source": "FRIENDS"},
+            format="json",
+        )
+        assert rest.json()["profile_completed"] is True
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"full_name": ""},
+            {"full_name": "   "},
+            {"phone": ""},
+            {"referral_source": ""},
+            {"referral_source": "UNKNOWN"},
+            {"referral_source": "TIKTOK"},
+        ],
+    )
+    def test_required_fields_cannot_be_blanked_or_faked(
+        self, api_client: APIClient, parent: Parent, payload: dict[str, str]
+    ) -> None:
+        # ПОЧЕМУ: иначе родитель одним PATCH запер бы себе ЛК, а UNKNOWN
+        # зарезервирован за миграцией старых родителей
+        response = api_client.patch(PROFILE_URL, payload, format="json")
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        parent.refresh_from_db()
+        assert parent.is_profile_completed is True
+
+    def test_staff_without_phone_is_not_exempt(self) -> None:
+        # ПОЧЕМУ: у педагогов и админов своя работа в админке (сессия, не DRF);
+        # если педагог сам покупает ребёнку кружок — заполняет анкету как все
+        teacher = ParentFactory(phone="", is_staff=True)
+        client = APIClient()
+        client.force_authenticate(user=teacher)
+
+        assert client.get(SUBSCRIPTIONS_URL).status_code == status.HTTP_403_FORBIDDEN
+        assert client.get(PROFILE_URL).status_code == status.HTTP_200_OK
+
+
+class TestReferralBackfillMigration:
+    def test_existing_parents_marked_unknown_new_fields_untouched(self) -> None:
+        import importlib
+
+        from django.apps import apps as django_apps
+
+        migration = importlib.import_module(
+            "apps.users.migrations.0005_parent_referral_source"
+        )
+        legacy = ParentFactory(referral_source="")
+        answered = ParentFactory(referral_source="SCHOOL")
+
+        migration.mark_existing_parents_unknown(django_apps, None)
+
+        legacy.refresh_from_db()
+        answered.refresh_from_db()
+        assert legacy.referral_source == "UNKNOWN"
+        assert legacy.is_profile_completed is True
+        assert answered.referral_source == "SCHOOL"

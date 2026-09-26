@@ -107,6 +107,8 @@ class ParentFactory(factory.django.DjangoModelFactory):
 
     full_name = factory.Sequence(lambda n: f"Родитель {n} Тестовый")
     phone = factory.Sequence(lambda n: f"+79{n:09d}")
+    # Анкета заполнена: иначе ЛК и чекаут отвечают 403 PROFILE_INCOMPLETE
+    referral_source = "FRIENDS"
     email = factory.Sequence(lambda n: f"parent{n}@example.com")
 
 

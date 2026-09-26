@@ -170,7 +170,9 @@ if _enable_throttling:
         "public_forms_callback": "3/min",
         "public_forms_feedback": "3/min",
         "events_registration": "3/min",
-        "otp_request_ip": "5/hour",
+        # ПОЧЕМУ: за одним IP сидят абоненты мобильного оператора (CGNAT)
+        # и родители на Wi-Fi ресепшена. Ящик жертвы бережёт лимит по email
+        "otp_request_ip": "30/hour",
         "otp_request_email": "5/hour",
         "otp_verify_ip": "10/min",
         "auth_token_refresh": "60/min",
@@ -195,8 +197,11 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ],
+    # ПОЧЕМУ: анкета закрывает всё по умолчанию — забытая новая ручка ЛК
+    # не утечёт молча. Профиль и дети открыты явно в apps/me/views.py
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
+        "apps.users.permissions.IsProfileCompleted",
     ],
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_THROTTLE_CLASSES": _throttle_classes,

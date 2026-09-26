@@ -9,7 +9,29 @@ from django.db import models
 from django.conf import settings
 from phonenumber_field.modelfields import PhoneNumberField
 
-from typing import ClassVar
+from typing import ClassVar, Final
+
+
+class ReferralSource(models.TextChoices):
+    FRIENDS = "FRIENDS", "Друзья, знакомые"
+    SOCIAL = "SOCIAL", "Соцсети (VK, Telegram)"
+    MAPS = "MAPS", "Яндекс.Карты, 2ГИС"
+    SEARCH = "SEARCH", "Поиск в интернете"
+    SIGN = "SIGN", "Вывеска, проходил мимо"
+    SCHOOL = "SCHOOL", "Школа, детский сад"
+    OTHER = "OTHER", "Другое"
+    # ПОЧЕМУ: проставляется миграцией родителям, зарегистрированным до
+    # появления поля, — источник у них честно неизвестен
+    UNKNOWN = "UNKNOWN", "Не указано"
+
+
+# ПОЧЕМУ: единственный источник правды правила «анкета заполнена» —
+# его читают permission-класс, verify и сериализатор профиля
+PROFILE_REQUIRED_FIELDS: Final[tuple[str, ...]] = (
+    "full_name",
+    "phone",
+    "referral_source",
+)
 
 
 class ParentManager(BaseUserManager["Parent"]):
@@ -75,6 +97,13 @@ class Parent(AbstractBaseUser, PermissionsMixin):
         verbose_name="Комментарии",
         blank=True,
     )
+    referral_source = models.CharField(
+        verbose_name="Откуда узнали",
+        max_length=32,
+        choices=ReferralSource.choices,
+        blank=True,
+        default="",
+    )
     is_active = models.BooleanField(verbose_name="Активен", default=True)
     is_staff = models.BooleanField(verbose_name="Персонал", default=False)
     created_at = models.DateTimeField(verbose_name="Создан", auto_now_add=True)
@@ -92,6 +121,13 @@ class Parent(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self) -> str:
         return self.email
+
+    @property
+    def is_profile_completed(self) -> bool:
+        # ПОЧЕМУ: вычисляется на лету, а не хранится флагом — флаг расходится
+        # с полями, когда их правят в админке. Поля лежат в той же строке,
+        # что уже загрузил JWTAuthentication, лишних запросов нет
+        return all(str(getattr(self, name)).strip() for name in PROFILE_REQUIRED_FIELDS)
 
 
 class Student(models.Model):

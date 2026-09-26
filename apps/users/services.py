@@ -68,9 +68,12 @@ class OTPCooldownError(Exception):
 
 
 @dataclass(frozen=True, slots=True)
-class TokenPair:
+class LoginResult:
     access: str
     refresh: str
+    # ПОЧЕМУ: вход и регистрация — один флоу; по этому флагу фронт решает,
+    # показать анкету или пустить в ЛК/покупку
+    profile_completed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +142,7 @@ def request_otp(email: str) -> None:
         transaction.on_commit(lambda: _enqueue_otp_email(email, code))
 
 
-def verify_otp(email: str, code: str) -> TokenPair:
+def verify_otp(email: str, code: str) -> LoginResult:
     email = _normalize_email(email)
     error_to_raise: Exception | None = None
     parent: Parent | None = None
@@ -190,9 +193,10 @@ def verify_otp(email: str, code: str) -> TokenPair:
         raise OTPNotFoundError("Не удалось связать профиль пользователя.")
 
     refresh: RefreshToken = RefreshToken.for_user(parent)
-    return TokenPair(
+    return LoginResult(
         access=str(refresh.access_token),
         refresh=str(refresh),
+        profile_completed=parent.is_profile_completed,
     )
 
 

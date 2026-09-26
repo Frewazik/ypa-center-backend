@@ -27,7 +27,7 @@ from apps.public_forms.models import (
     FeedbackRequest,
 )
 from apps.schedule.models import Room, Schedule, TimeSlot
-from apps.users.models import Parent, Student, TeacherProfile
+from apps.users.models import Parent, ReferralSource, Student, TeacherProfile
 
 DEMO_ADMIN_EMAIL = "admin@demo.ru"
 DEMO_ADMIN_PASSWORD = "admin123"  # noqa: S105 — демо-стенд, не секрет
@@ -458,7 +458,9 @@ class Command(BaseCommand):
                 email=DEMO_PARENT_EMAIL, full_name="Правый лев"
             )
             parent.phone = "+79991234567"
-            parent.save(update_fields=["phone"])
+            # Анкета заполнена — иначе демо-ЛК отвечает 403 PROFILE_INCOMPLETE
+            parent.referral_source = ReferralSource.FRIENDS
+            parent.save(update_fields=["phone", "referral_source"])
 
         today = timezone.localdate()
         children = [

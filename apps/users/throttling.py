@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from rest_framework.request import Request
-from rest_framework.throttling import AnonRateThrottle, SimpleRateThrottle
+from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
+from apps.core.throttling import ClientIPRateThrottle
 
-class OTPRequestPerIPThrottle(AnonRateThrottle):
+
+# ПОЧЕМУ: не AnonRateThrottle — он пропускает запросы с валидным токеном,
+# и с чужим/своим токеном IP-лимит на вход не действовал
+class OTPRequestPerIPThrottle(ClientIPRateThrottle):
     scope = "otp_request_ip"
 
 
@@ -24,7 +28,7 @@ class OTPRequestPerEmailThrottle(SimpleRateThrottle):
         }
 
 
-class OTPVerifyPerIPThrottle(AnonRateThrottle):
+class OTPVerifyPerIPThrottle(ClientIPRateThrottle):
     scope = "otp_verify_ip"
 
 
