@@ -12,8 +12,6 @@ from apps.events.models import Event
 from apps.schedule.models import Schedule
 from apps.users.models import TeacherProfile
 
-TIME_FORMAT = "%H:%M"
-
 
 class ActivityCardSerializer(serializers.ModelSerializer[Activity]):
     class Meta:
@@ -34,32 +32,9 @@ class ActivityCardSerializer(serializers.ModelSerializer[Activity]):
 
 
 class ScheduleGroupPublicSerializer(serializers.ModelSerializer[Schedule]):
-    day_of_week_display = serializers.CharField(
-        source="get_day_of_week_display", read_only=True
-    )
-    start_time = serializers.TimeField(read_only=True, format=TIME_FORMAT)
-    end_time = serializers.TimeField(read_only=True, format=TIME_FORMAT)
-    seats_free = serializers.SerializerMethodField()
-
     class Meta:
         model = Schedule
-        fields = (
-            "id",
-            "group_name",
-            "age_min",
-            "age_max",
-            "day_of_week",
-            "day_of_week_display",
-            "start_time",
-            "end_time",
-            "max_capacity",
-            "seats_free",
-        )
-
-    def get_seats_free(self, schedule: Schedule) -> int:
-        # ПОЧЕМУ: capacity_taken обязан приходить из annotate() вьюхи;
-        # обращение к enrollment здесь породило бы N+1
-        return max(schedule.max_capacity - schedule.capacity_taken, 0)
+        fields = ("id", "group_name", "age_min", "age_max", "max_capacity")
 
 
 class ActivityTeacherPayload(TypedDict):

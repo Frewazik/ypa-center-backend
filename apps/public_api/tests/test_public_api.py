@@ -101,28 +101,32 @@ class TestPopularActivities:
 
 
 class TestActivityDetail:
-    def test_returns_active_groups_with_age_and_seats(
-        self, api_client: APIClient
-    ) -> None:
+    def test_returns_active_groups_with_age(self, api_client: APIClient) -> None:
         activity = ActivityFactory()
         group = ScheduleFactory(
-            activity=activity, max_capacity=6, age_min=7, age_max=10
+            activity=activity,
+            group_name="Младшая",
+            max_capacity=6,
+            age_min=7,
+            age_max=10,
         )
         ScheduleFactory(activity=activity, is_active=False)
-        EnrollmentFactory.create_batch(2, schedule=group)
-        EnrollmentFactory(schedule=group, is_active=False)
 
         response = api_client.get(_detail_url(activity.pk))
 
         assert response.status_code == status.HTTP_200_OK
         payload = response.json()
-        assert len(payload["groups"]) == 1
-        group_payload = payload["groups"][0]
-        assert group_payload["age_min"] == 7
-        assert group_payload["age_max"] == 10
-        assert group_payload["max_capacity"] == 6
-        assert group_payload["seats_free"] == 4
-        assert group_payload["start_time"] == group.start_time.strftime("%H:%M")
+        # ПОЧЕМУ точное равенство: ловит и пропажу, и возврат лишних полей
+        # (время, места) — фронт их больше не читает
+        assert payload["groups"] == [
+            {
+                "id": group.pk,
+                "group_name": "Младшая",
+                "age_min": 7,
+                "age_max": 10,
+                "max_capacity": 6,
+            }
+        ]
 
     def test_query_budget_is_two(
         self,
@@ -409,8 +413,10 @@ class TestPublicActivitiesCatalog:
             photo_url="https://cdn.example.com/teachers/makukha.jpg",
             position="Учитель Английского Языка",
         )
-        ScheduleFactory(activity=activity, teacher=teacher)
-        ScheduleFactory(activity=activity, teacher=teacher)
+        groups = [
+            ScheduleFactory(activity=activity, teacher=teacher),
+            ScheduleFactory(activity=activity, teacher=teacher),
+        ]
         ScheduleFactory(activity=activity, is_active=False)
 
         response = api_client.get(CATALOG_URL)
@@ -422,9 +428,7 @@ class TestPublicActivitiesCatalog:
         assert len(card["teachers"]) == 1
         assert card["teachers"][0]["full_name"] == "Надежда Геннадьевна Макуха"
         assert card["teachers"][0]["position"] == "Учитель Английского Языка"
-        assert card["days_of_week"] == sorted(
-            {group["day_of_week"] for group in card["groups"]}
-        )
+        assert card["days_of_week"] == sorted({group.day_of_week for group in groups})
 
     def test_inactive_activities_hidden(self, api_client: APIClient) -> None:
         ActivityFactory(is_active=False)
@@ -468,54 +472,3 @@ class TestTeacherShowcaseFields:
         assert card["position"] == "Педагог Кружка Мышления"
         assert card["quote"].startswith("Думать - это навык.")
         assert card["bio"].startswith("Выпускник ФМШ")
-
-
-class TestCatalogSeatsIgnoreTrials:
-    # !!!: карточка каталога отвечает на вопрос «насколько укомплектована
-    # группа». Разовый пробный визитёр её не гасит — иначе десяток пробных
-    # на разные недели вешал бы фантомный sold-out на живой кружок
-
-    def test_future_trials_do_not_reduce_free_seats(
-        self, api_client: APIClient
-    ) -> None:
-        activity = ActivityFactory()
-        group = ScheduleFactory(activity=activity, max_capacity=3)
-        for week in range(1, 6):
-            EnrollmentFactory(
-                schedule=group,
-                trial=True,
-                trial_date=timezone.localdate() + datetime.timedelta(days=7 * week),
-                is_active=True,
-            )
-
-        response = api_client.get(_detail_url(activity.pk))
-
-        (group_payload,) = response.json()["groups"]
-        assert group_payload["seats_free"] == 3
-
-    def test_regular_enrollments_still_reduce_free_seats(
-        self, api_client: APIClient
-    ) -> None:
-        activity = ActivityFactory()
-        group = ScheduleFactory(activity=activity, max_capacity=3)
-        EnrollmentFactory(schedule=group, is_active=True)
-
-        response = api_client.get(_detail_url(activity.pk))
-
-        (group_payload,) = response.json()["groups"]
-        assert group_payload["seats_free"] == 2
-
-    def test_stale_hold_does_not_hold_the_seat(self, api_client: APIClient) -> None:
-        # ПОЧЕМУ: витрина раньше считала любой HELD без проверки TTL —
-        # брошенная корзина месячной давности гасила место навсегда
-        activity = ActivityFactory()
-        group = ScheduleFactory(activity=activity, max_capacity=3)
-        stale = EnrollmentFactory(schedule=group, status="HELD")
-        type(stale).objects.filter(pk=stale.pk).update(
-            created_at=timezone.now() - datetime.timedelta(hours=2)
-        )
-
-        response = api_client.get(_detail_url(activity.pk))
-
-        (group_payload,) = response.json()["groups"]
-        assert group_payload["seats_free"] == 3

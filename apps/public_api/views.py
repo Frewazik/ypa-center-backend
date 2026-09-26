@@ -13,7 +13,6 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 
 from apps.billing.models import EnrollmentStatus, SubscriptionPlan
-from apps.billing.selectors import regular_seat_q
 from apps.catalog.models import Activity
 from apps.content.models import GalleryImage
 from apps.core.caching import cached_payload, payload_cache_key
@@ -35,14 +34,6 @@ CACHE_TTL_SHOWCASE_SECONDS: Final[int] = 60 * 5
 CACHE_TTL_EVENTS_SECONDS: Final[int] = 60
 
 
-def _seat_holding_filter() -> Q:
-    # ПОЧЕМУ только постоянные записи: карточка каталога отвечает на вопрос
-    # «насколько укомплектована группа», и разовый пробный визитёр её не
-    # гасит — иначе десяток пробных на разные недели вешал бы на кружок
-    # фантомный sold-out. Точную занятость на дату считает чекаут
-    return regular_seat_q("enrollment__")
-
-
 def _active_groups_queryset() -> QuerySet[Schedule]:
     # ПОЧЕМУ: day_of_week/start_time денормализованы триггером на schedule —
     # JOIN к time_slot не нужен. teacher__user поднимается сразу: из этих же
@@ -50,11 +41,6 @@ def _active_groups_queryset() -> QuerySet[Schedule]:
     return (
         Schedule.objects.filter(is_active=True)
         .select_related("teacher__user")
-        # ПОЧЕМУ ignore: capacity_taken объявлен на модели ради типизации
-        # сериализаторов; django-stubs считает annotate() переопределением
-        .annotate(  # type: ignore[no-redef]
-            capacity_taken=Count("enrollment", filter=_seat_holding_filter())
-        )
         .order_by("day_of_week", "start_time")
     )
 
@@ -134,7 +120,7 @@ class ActivityDetailView(generics.RetrieveAPIView[Activity]):
     serializer_class = ActivityDetailSerializer
 
     def get_queryset(self) -> QuerySet[Activity]:
-        # Бюджет: 2 SQL-запроса (activity + prefetch групп с агрегатом мест)
+        # Бюджет: 2 SQL-запроса (activity + prefetch групп)
         return Activity.objects.filter(is_active=True).prefetch_related(
             Prefetch("slots", queryset=_active_groups_queryset())
         )
