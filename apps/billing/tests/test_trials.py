@@ -401,6 +401,7 @@ class TestCheckoutTrialView:
 
         assert response.status_code == status.HTTP_409_CONFLICT
         assert response.data["type"] == "urn:problem-type:triallimitconflict"
+        assert response.data["code"] == "TRIAL_LIMIT_EXCEEDED"
 
     def test_trial_over_subscription_maps_to_409_already_enrolled(
         self, monkeypatch: pytest.MonkeyPatch
@@ -423,9 +424,8 @@ class TestCheckoutTrialView:
         response.render()
 
         assert response.status_code == status.HTTP_409_CONFLICT
-        # ПОЧЕМУ type, а не code: обработчик RFC 9457 отдаёт класс исключения
-        # в type, default_code в тело не попадает
         assert response.data["type"] == "urn:problem-type:enrollmentconflict"
+        assert response.data["code"] == "STUDENT_ALREADY_ENROLLED"
 
 
 @pytest.mark.django_db

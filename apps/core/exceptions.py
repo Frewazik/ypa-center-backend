@@ -1,9 +1,11 @@
 import logging
 from typing import TypeAlias, TypedDict, cast
 
+from django.core.exceptions import PermissionDenied
+from django.http import Http404
 from django.utils.translation import gettext as _
 from rest_framework import status
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.settings import api_settings
@@ -12,6 +14,19 @@ from rest_framework.views import exception_handler
 logger = logging.getLogger(__name__)
 
 ErrorData: TypeAlias = dict[str, "ErrorData"] | list["ErrorData"] | str
+
+
+# ПОЧЕМУ: фронт делает switch по `code`, а встроенные исключения DRF
+# отдают свои snake_case-коды. Приводим их к каталогу из api-core-contracts.md
+_DRF_CODE_TO_CATALOG: dict[str, str] = {
+    "parse_error": "MALFORMED_REQUEST",
+    "not_authenticated": "AUTH_REQUIRED",
+    "authentication_failed": "AUTH_REQUIRED",
+    "token_not_valid": "AUTH_REQUIRED",
+    "permission_denied": "FORBIDDEN_RESOURCE",
+    "not_found": "NOT_FOUND",
+    "throttled": "RATE_LIMITED",
+}
 
 
 class InvalidParam(TypedDict):
@@ -46,6 +61,23 @@ def _get_invalid_params(
     return params
 
 
+def _get_error_code(exc: Exception) -> str:
+    if isinstance(exc, ValidationError):
+        return "VALIDATION_ERROR"
+    # exception_handler DRF сам превращает их в NotFound/PermissionDenied,
+    # но сюда приходит исходное исключение Django
+    if isinstance(exc, Http404):
+        return "NOT_FOUND"
+    if isinstance(exc, PermissionDenied):
+        return "FORBIDDEN_RESOURCE"
+    if isinstance(exc, APIException):
+        codes = exc.get_codes()
+        # detail-словарь/список даёт вложенные коды — берём код класса
+        code = codes if isinstance(codes, str) else str(exc.default_code)
+        return _DRF_CODE_TO_CATALOG.get(code, code.upper())
+    return "INTERNAL_SERVER_ERROR"
+
+
 def problem_detail_exception_handler(
     exc: Exception, context: dict[str, object]
 ) -> Response | None:
@@ -68,6 +100,7 @@ def problem_detail_exception_handler(
             "title": "Internal Server Error",
             "status": status.HTTP_500_INTERNAL_SERVER_ERROR,
             "detail": _("Внутренняя ошибка сервера. Инцидент зафиксирован."),
+            "code": "INTERNAL_SERVER_ERROR",
         }
 
         if request_id:
@@ -88,6 +121,8 @@ def problem_detail_exception_handler(
         payload["detail"] = response.data.get("detail", str(exc))
     else:
         payload["detail"] = str(exc)
+
+    payload["code"] = _get_error_code(exc)
 
     extensions: dict[str, object] = {}
     if request_id:

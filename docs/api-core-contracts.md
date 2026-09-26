@@ -64,25 +64,48 @@ curl-ом и читать логи. Группировка по аудитори
 
 ### 0.3. Единый формат ошибок (RFC 9457) — на всю систему
 
-Любая ошибка — `application/problem+json`. Базовые поля по RFC 9457 + наши расширения:
+Любая ошибка — `application/problem+json`. Базовые поля по RFC 9457 + наши расширения.
+Тело собирает `apps.core.exceptions.problem_detail_exception_handler`:
 
 ```json
 {
-  "type": "https://api.ypa-center.ru/problems/no-available-seats",
-  "title": "Нет свободных мест",
+  "type": "urn:problem-type:noseatsconflict",
+  "title": "NoSeatsConflict",
   "status": 409,
-  "detail": "В группе «Кружок мышления, ПН 16:00» не осталось мест.",
-  "instance": "/api/v1/checkout/subscription",
+  "detail": "В выбранном слоте не осталось свободных мест.",
   "code": "NO_AVAILABLE_SEATS",
-  "errors": [
-    { "field": "schedule_ids[0]", "code": "SEAT_TAKEN", "message": "Мест нет" }
-  ]
+  "extensions": { "request_id": "8f0c…" }
 }
 ```
 
-- `type` — стабильный URI-идентификатор класса проблемы (можно завести страницу-описание).
-- `code` *(расширение)* — машинный enum для `switch` на фронте, не привязанный к локали.
-- `errors[]` *(расширение)* — пофайловые ошибки валидации (DRF-стиль, но завёрнутый).
+Ошибка валидации (`422`):
+
+```json
+{
+  "type": "urn:problem-type:validationerror",
+  "title": "Validation Error",
+  "status": 422,
+  "detail": "Ошибка валидации входных данных.",
+  "code": "VALIDATION_ERROR",
+  "extensions": {
+    "invalid_params": [{ "name": "email", "reason": "Введите правильный адрес электронной почты." }]
+  }
+}
+```
+
+- `code` — **всегда есть, на верхнем уровне**. Машинный enum из каталога ниже, не
+  привязан к локали. Фронт делает `switch` именно по нему: несколько `409` отличаются
+  только `code`. `type` и `title` выводятся из имени класса исключения и могут меняться
+  при рефакторинге — на них не завязываться.
+- Откуда берётся `code`: у своих исключений — `default_code` (или `code=` при `raise`);
+  встроенные ошибки DRF/Django приводятся к каталогу (`not_found` → `NOT_FOUND`,
+  `throttled` → `RATE_LIMITED` и т.д.); любая `422` — `VALIDATION_ERROR`; необработанное
+  исключение — `500 INTERNAL_SERVER_ERROR`.
+- `extensions` *(необязательное)* — есть, только если есть что положить:
+  `request_id` (эхо заголовка `X-Request-ID`) и `invalid_params[]` (поля с ошибками
+  валидации, `name` — путь поля вида `items[0].date`).
+- Ответы, собранные вручную (например, `409 PAYMENT_IN_PROGRESS` с `Retry-After`),
+  дополнительно содержат `instance` — путь запроса; `code` там тоже на верхнем уровне.
 
 **Каталог бизнес-ошибок** (единый для ядра и форм):
 
@@ -98,8 +121,10 @@ curl-ом и читать логи. Группировка по аудитори
 | 409  | `STUDENT_ALREADY_ENROLLED` | Ребёнок уже на абонементе в этой группе (повторный абонемент или пробное поверх него) |
 | 409  | `SUBSCRIPTION_EXPIRED`     | Абонемент просрочен (списание/возврат фишки) |
 | 409  | `IDEMPOTENCY_KEY_REUSED`   | Ключ переиспользован с другим телом запроса |
+| 409  | `PAYMENT_IN_PROGRESS`      | Платёж по этому ключу ещё обрабатывается (с `Retry-After`) |
 | 422  | `VALIDATION_ERROR`         | Поля не прошли валидацию (формат, обязательность) |
 | 429  | `RATE_LIMITED`             | Превышен троттлинг / cooldown OTP |
+| 500  | `INTERNAL_SERVER_ERROR`    | Необработанное исключение (инцидент в логах) |
 
 Граница **422 vs 409**: `422` — данные синтаксически приняты, но семантически
 невалидны (плохой email, пустой `schedule_ids`); `409` — данные валидны, но

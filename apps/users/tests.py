@@ -682,6 +682,7 @@ class TestOTPRequestView:
 
         data = resp.json()
         assert "type" in data
+        assert data["code"] == "RATE_LIMITED"
         assert "extensions" in data
         assert "request_id" in data["extensions"]
 
@@ -711,6 +712,7 @@ class TestOTPRequestView:
         data = resp.json()
         assert data["type"] == "urn:problem-type:validationerror"
         assert data["title"] == "Validation Error"
+        assert data["code"] == "VALIDATION_ERROR"
 
         params = data["extensions"]["invalid_params"]
         assert len(params) == 1
