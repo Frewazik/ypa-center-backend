@@ -158,7 +158,7 @@ def validate(self, attrs):
     token = self.initial_data.get("captcha_token")
     resp = requests.post(TURNSTILE_VERIFY_URL,
                          data={"secret": SECRET, "response": token,
-                               "remoteip": self.context["request"].META.get("REMOTE_ADDR")},
+                               "remoteip": client_ip(self.context["request"])},
                          timeout=5)
     if not resp.json().get("success"):
         raise ValidationError({"captcha": "Проверка не пройдена"})
@@ -168,7 +168,8 @@ def validate(self, attrs):
 Нюансы:
 - `timeout` обязателен — иначе зависший провайдер вешает наш поток.
 - secret-ключ — в env, не в коде (это и в `CLAUDE.md` как запрет хардкода секретов).
-- `remoteip` повышает точность скоринга у v3/Turnstile.
+- `remoteip` повышает точность скоринга у v3/Turnstile. IP — через
+  `apps.core.net.client_ip`, как у лимитов (`deploy.md`).
 
 ### 2.3. Honeypot (поле-ловушка)
 

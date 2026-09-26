@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
+from django.conf import settings
 from django.test import override_settings
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -171,33 +172,51 @@ class TestThrottling:
 
         assert response.status_code == status.HTTP_202_ACCEPTED
 
-    def test_throttle_keys_by_forwarded_client_ip_not_proxy(
+    def test_throttle_keys_by_client_ip_behind_own_proxy(
         self, api_client: APIClient, callback_payload: dict[str, str]
     ) -> None:
-        # ПОЧЕМУ: разные клиентские IP в X-Forwarded-For не должны делить
-        # один счётчик, даже если REMOTE_ADDR (адрес прокси) одинаков
-        for _ in range(THROTTLE_LIMIT):
+        # ПОЧЕМУ: за своим прокси REMOTE_ADDR у всех один (адрес прокси) —
+        # клиентов различает адрес, который прокси дописал в X-Forwarded-For
+        def post(forwarded: str) -> int:
+            return api_client.post(
+                CALLBACK_URL,
+                callback_payload,
+                format="json",
+                REMOTE_ADDR="172.18.0.2",
+                HTTP_X_FORWARDED_FOR=forwarded,
+            ).status_code
+
+        with override_settings(
+            REST_FRAMEWORK={**settings.REST_FRAMEWORK, "NUM_PROXIES": 1}
+        ):
+            for _ in range(THROTTLE_LIMIT):
+                post("203.0.113.1")
+            blocked = post("203.0.113.1")
+            # Подделка: клиент 203.0.113.1 вписал слева «чужой» IP —
+            # прокси дописал настоящий справа, лимит не обойти
+            spoofed = post("198.51.100.77, 203.0.113.1")
+            other_client = post("203.0.113.2")
+
+        assert blocked == status.HTTP_429_TOO_MANY_REQUESTS
+        assert spoofed == status.HTTP_429_TOO_MANY_REQUESTS
+        assert other_client == status.HTTP_202_ACCEPTED
+
+    def test_forwarded_header_ignored_without_own_proxy(
+        self, api_client: APIClient, callback_payload: dict[str, str]
+    ) -> None:
+        # ПОЧЕМУ: без своего прокси X-Forwarded-For целиком пишет клиент —
+        # новый адрес в заголовке на каждый запрос не сбрасывает лимит
+        statuses = [
             api_client.post(
                 CALLBACK_URL,
                 callback_payload,
                 format="json",
-                HTTP_X_FORWARDED_FOR="203.0.113.1",
-            )
-        blocked = api_client.post(
-            CALLBACK_URL,
-            callback_payload,
-            format="json",
-            HTTP_X_FORWARDED_FOR="203.0.113.1",
-        )
-        other_client = api_client.post(
-            CALLBACK_URL,
-            callback_payload,
-            format="json",
-            HTTP_X_FORWARDED_FOR="203.0.113.2",
-        )
+                HTTP_X_FORWARDED_FOR=f"203.0.113.{i + 1}",
+            ).status_code
+            for i in range(THROTTLE_LIMIT + 1)
+        ]
 
-        assert blocked.status_code == status.HTTP_429_TOO_MANY_REQUESTS
-        assert other_client.status_code == status.HTTP_202_ACCEPTED
+        assert statuses[-1] == status.HTTP_429_TOO_MANY_REQUESTS
 
 
 @pytest.mark.asyncio
