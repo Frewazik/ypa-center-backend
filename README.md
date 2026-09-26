@@ -115,12 +115,23 @@ uv run taskiq scheduler config.worker:scheduler
 
 ## Проверки качества
 
+Все проверки одной командой — ruff, формат, mypy, забытые миграции и pytest:
+
 ```bash
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy .
-uv run pytest
+uv run python scripts/check.py          # всё, перед PR
+uv run python scripts/check.py --fast   # без pytest, за секунды
+uv run python scripts/check.py --fix    # ruff сам чинит и форматирует
 ```
+
+Шаги идут до конца, в итоге — таблица OK/FAIL; код выхода 1, если что-то упало.
+
+Хук перед коммитом (ruff, формат, mypy, проверка миграций при правке моделей) ставится один раз:
+
+```bash
+uv run pre-commit install
+```
+
+Хуки берут ruff и mypy из `uv.lock`, поэтому проверяют ровно то же, что и ручной запуск.
 
 Тесты гоняются на реальном Postgres — advisory-локи, триггеры и exclusion-констрейнты проверяются на живой БД, а не на моках. Данные генерируются только через Factory Boy.
 
