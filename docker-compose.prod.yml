@@ -1,0 +1,116 @@
+# Прод на одном VPS. Инструкция — docs/deploy.md.
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+# Наружу смотрит только Caddy (80/443): он выпускает HTTPS-сертификат и
+# проксирует в gunicorn. У backend, postgres и redis нет `ports:` — к ним
+# нельзя прийти в обход прокси (иначе ломается доверие к X-Forwarded-For).
+
+x-app: &app
+  image: yra-backend:latest
+  build:
+    context: .
+    target: runtime
+  restart: unless-stopped
+  env_file: .env.prod
+  environment:
+    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    DATABASE_SSL_REQUIRE: "false"
+    REDIS_URL: redis://redis:6379/0
+  volumes:
+    - media:/app/media
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Одноразовый: накатывает миграции и завершается. Остальные ждут его
+  # успеха — два процесса не накатят одну миграцию наперегонки.
+  migrate:
+    <<: *app
+    restart: "no"
+    command: python manage.py migrate --noinput
+
+  backend:
+    <<: *app
+    # ПОЧЕМУ gthread (--threads): sync-воркер держит молчащее соединение до
+    # таймаута (WORKER TIMEOUT / «no URI read»), потоковый — нет.
+    # forwarded-allow-ips="*": до gunicorn доходит только Caddy из
+    # docker-сети, его X-Forwarded-Proto доверяем.
+    command: >
+      gunicorn config.wsgi:application
+      --bind 0.0.0.0:8000
+      --workers ${GUNICORN_WORKERS:-2}
+      --threads 4
+      --timeout 60
+      --forwarded-allow-ips=*
+      --access-logfile -
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  taskiq-worker:
+    <<: *app
+    command: taskiq worker config.worker:broker --workers 2 --log-level INFO
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  taskiq-scheduler:
+    <<: *app
+    command: taskiq scheduler config.worker:scheduler --log-level INFO
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - media:/srv/media:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  redis_data:
+  media:
+  caddy_data:
+  caddy_config:

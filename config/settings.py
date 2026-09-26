@@ -33,7 +33,13 @@ class Settings(BaseSettings):
     DATABASE_URL: str = Field(
         default="postgresql://postgres:postgres@localhost:5432/yra"
     )
+    # None — SSL к БД обязателен везде, кроме local. False — для Postgres
+    # в той же docker-сети на VPS: трафик не выходит за пределы машины
+    DATABASE_SSL_REQUIRE: bool | None = None
     REDIS_URL: str = Field(default="redis://localhost:6379/0")
+
+    # Полные адреса с https:// — откуда разрешены POST в админку
+    CSRF_TRUSTED_ORIGINS: list[str] = Field(default=[])
 
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
@@ -48,6 +54,8 @@ class Settings(BaseSettings):
     EMAIL_HOST_USER: str = ""
     EMAIL_HOST_PASSWORD: str = ""
     EMAIL_USE_TLS: bool = False
+    # Адрес «От кого» для кодов входа; SMTP-сервисы отклоняют чужой домен
+    DEFAULT_FROM_EMAIL: str = "webmaster@localhost"
 
     CAPTCHA_VERIFY_URL: str = (
         "https://challenges.cloudflare.com/turnstile/v0/siteverify"
@@ -83,6 +91,21 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = _env.SECRET_KEY
 DEBUG = _env.DEBUG
 ALLOWED_HOSTS = _env.ALLOWED_HOSTS
+
+if DEBUG and _env.ENVIRONMENT == "production":
+    # ПОЧЕМУ: DEBUG по умолчанию True, и забытая строка в .env на проде
+    # отдаёт наружу трейсбеки с настройками и SQL — лучше не стартовать
+    raise ImproperlyConfigured("В production задайте DEBUG=False")
+
+if not DEBUG:
+    # ПОЧЕМУ: TLS снимает Caddy, до gunicorn запрос доходит по http. Без
+    # доверия к X-Forwarded-Proto Django считает запрос небезопасным и
+    # отклоняет POST админки по CSRF (Origin https ≠ http)
+    if TRUSTED_PROXY_COUNT > 0:
+        SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+CSRF_TRUSTED_ORIGINS = _env.CSRF_TRUSTED_ORIGINS
 
 INSTALLED_APPS = [
     "unfold",
@@ -155,7 +178,11 @@ DATABASES = {
         _env.DATABASE_URL,
         conn_max_age=600,  # ПОЧЕМУ: conn_max_age держит коннекты; при масштабировании подов упремся в лимит БД
         conn_health_checks=True,
-        ssl_require=_env.ENVIRONMENT != "local",
+        ssl_require=(
+            _env.DATABASE_SSL_REQUIRE
+            if _env.DATABASE_SSL_REQUIRE is not None
+            else _env.ENVIRONMENT != "local"
+        ),
     )
 }
 
@@ -285,6 +312,7 @@ EMAIL_PORT = _env.EMAIL_PORT
 EMAIL_HOST_USER = _env.EMAIL_HOST_USER
 EMAIL_HOST_PASSWORD = _env.EMAIL_HOST_PASSWORD
 EMAIL_USE_TLS = _env.EMAIL_USE_TLS
+DEFAULT_FROM_EMAIL = _env.DEFAULT_FROM_EMAIL
 AUTH_USER_MODEL = "users.Parent"
 
 CAPTCHA_VERIFY_URL = _env.CAPTCHA_VERIFY_URL

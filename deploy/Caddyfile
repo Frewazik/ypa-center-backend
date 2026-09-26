@@ -1,0 +1,19 @@
+# DOMAIN берётся из .env.prod (api.example.ru). Для реального домена Caddy
+# сам получает и продлевает сертификат Let's Encrypt; для localhost —
+# выпускает локальный самоподписанный.
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Загруженные файлы (фото и т.п.) отдаём с диска, мимо Django.
+	# Статику (/static/) отдаёт whitenoise из образа.
+	handle_path /media/* {
+		root * /srv/media
+		file_server
+	}
+
+	handle {
+		# reverse_proxy сам дописывает X-Forwarded-For/Proto —
+		# см. docs/deploy.md §2
+		reverse_proxy backend:8000
+	}
+}

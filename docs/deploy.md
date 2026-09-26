@@ -1,14 +1,134 @@
-# Развёртывание: прокси и реальный IP клиента
+# Развёртывание — прод на VPS, прокси и реальный IP клиента
 
-> **Назначение.** Что обязано быть настроено на сервере, чтобы бэкенд видел настоящий IP
-> клиента: лимиты входа и форм, капча и allowlist вебхука ЮКассы.
-> **Статус.** Актуальный — авторитет по доверию к прокси и `X-Forwarded-For`.
+> **Назначение.** Как выложить бэкенд на сервер (`docker-compose.prod.yml`), обновлять,
+> бэкапить, и что обязано быть настроено, чтобы бэкенд видел настоящий IP клиента.
+> **Статус.** Актуальный — авторитет по прод-окружению, доверию к прокси и `X-Forwarded-For`.
 > **Связанные документы.** Лимиты входа — `auth-flow.md` §3; вебхук —
 > `api-core-contracts.md` §2.2; анти-спам форм — `public-forms-design.md`.
 
 ---
 
-## 1. Зачем это нужно
+## 1. Схема прода
+
+Всё живёт на одном VPS в одном `docker compose`:
+
+```
+интернет ──443/80──▶ caddy ──▶ backend (gunicorn, gthread) ──▶ postgres
+                       │                                  └──▶ redis ◀── taskiq-worker
+                       └── /media/* с диска                            ◀── taskiq-scheduler
+```
+
+| Сервис | Что делает | Наружу |
+| ------ | ---------- | ------ |
+| `caddy` | HTTPS (сертификат Let's Encrypt сам), отдаёт `/media/`, проксирует остальное | 80, 443 |
+| `migrate` | Накатывает миграции и завершается; остальные ждут его успеха | — |
+| `backend` | Django под gunicorn: 2 процесса × 4 потока | — |
+| `taskiq-worker`, `taskiq-scheduler` | Фоновые задачи и расписание | — |
+| `postgres`, `redis` | Данные; тома `postgres_data`, `redis_data` | — |
+
+Статика (`/static/`) собирается в образ на этапе сборки и отдаётся whitenoise.
+Загруженные файлы — том `media`, общий у приложения и Caddy.
+
+**Почему gunicorn с потоками (`gthread`).** Синхронный воркер обслуживает одно
+соединение за раз: клиент, открывший соединение и молчащий, занимает воркер до
+таймаута (в логе `WORKER TIMEOUT` / `Error handling request (no URI read)`).
+Потоковый воркер ждёт такие соединения, не блокируясь. Проверено: 6 молчащих
+соединений на 2 воркера — запросы отвечают сразу, таймаутов нет.
+
+## 2. Сервер
+
+| Параметр | Минимум | Почему |
+| -------- | ------- | ------ |
+| RAM | **4 ГБ** | 7 контейнеров + сборка образа на сервере; на 2 ГБ сборка может упасть по памяти |
+| CPU | 2 vCPU | = `GUNICORN_WORKERS=2` |
+| Диск | 40 ГБ NVMe | образы, база, медиа, бэкапы |
+| ОС | Ubuntu 24.04 LTS | |
+| Где | **ЦОД в России** | 152-ФЗ: персональные данные граждан РФ хранятся в РФ |
+
+Плюс домен (поддомен вида `api.<домен>`) с A-записью на IP сервера и SMTP-ящик для
+писем с кодами входа.
+
+## 3. Первая выкладка
+
+```bash
+# 1. Docker (официальный скрипт)
+curl -fsSL https://get.docker.com | sh
+
+# 2. Файрвол: наружу только SSH и веб
+ufw allow OpenSSH && ufw allow 80 && ufw allow 443/tcp && ufw allow 443/udp && ufw enable
+
+# 3. Код
+git clone <repo-url> /opt/yra && cd /opt/yra
+
+# 4. Окружение: заменить все put_... и example.ru
+cp .env.prod.example .env.prod && nano .env.prod
+
+# 5. Запуск (первая сборка — несколько минут)
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+
+# 6. Админ
+docker compose -f docker-compose.prod.yml --env-file .env.prod exec backend python manage.py createsuperuser
+```
+
+Порты Docker **обходят ufw**, поэтому в `docker-compose.prod.yml` порты открыты только
+у Caddy. Не добавляйте `ports:` к `postgres`, `redis`, `backend`: база станет доступна
+из интернета, а обход Caddy ломает доверие к IP (§9).
+
+Обязательное в `.env.prod`:
+
+| Переменная | Значение | Если забыть |
+| ---------- | -------- | ----------- |
+| `DEBUG` | `False` | при `ENVIRONMENT=production` не стартует — защита от утечки трейсбеков |
+| `SECRET_KEY` | длинная случайная строка | подделка сессий и токенов |
+| `DOMAIN`, `ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS` | домен API | 400 на все запросы / 403 на вход в админку |
+| `TRUSTED_PROXY_COUNT` | `1` | не стартует (§9) |
+| `DEFAULT_FROM_EMAIL` | адрес на вашем домене | SMTP отклоняет письма с кодами |
+
+`DATABASE_URL` и `DATABASE_SSL_REQUIRE=false` задаёт сам compose: база в той же
+docker-сети, трафик не покидает сервер.
+
+## 4. Проверка после выкладки
+
+```bash
+docker compose -f docker-compose.prod.yml --env-file .env.prod ps
+```
+
+`migrate` — `Exited (0)`, остальные — `Up`. Затем:
+
+1. `https://<домен>/api/schema/swagger-ui/` открывается, замок в браузере зелёный.
+2. `https://<домен>/admin/` — вход под суперпользователем работает (проверка CSRF за прокси).
+3. Запрос кода входа — письмо приходит.
+4. Проверки IP и вебхука ЮКассы — §11.
+
+## 5. Обновление
+
+```bash
+cd /opt/yra && git pull
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+```
+
+Compose пересоберёт образ, `migrate` накатит новые миграции, затем перезапустятся
+приложение и воркеры. Во время перезапуска (секунды) запросы могут получить 502.
+
+Логи: `docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f backend`.
+
+## 6. Бэкапы
+
+База — единственное, что нельзя восстановить из git. Ежедневный дамп через cron
+(`crontab -e`):
+
+```
+0 3 * * * cd /opt/yra && docker compose -f docker-compose.prod.yml --env-file .env.prod exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -Fc "$POSTGRES_DB"' > /opt/backups/yra-$(date +\%F).dump && find /opt/backups -name 'yra-*.dump' -mtime +14 -delete
+```
+
+(`mkdir -p /opt/backups` заранее.) Дампы на том же диске не спасут при потере
+сервера — копируйте их наружу (объектное хранилище, другой сервер) или включите
+снапшоты диска у хостинга. Восстановление:
+`docker compose ... exec -T postgres pg_restore -U yra -d yra --clean < файл.dump`.
+
+---
+
+## 7. Реальный IP клиента: зачем это нужно
 
 IP клиента нужен в трёх местах:
 
@@ -22,7 +142,7 @@ IP клиента нужен в трёх местах:
 адрес приходит в заголовке `X-Forwarded-For`. Этот заголовок клиент может прислать и сам,
 с любым содержимым.
 
-## 2. Правило
+## 8. Правило
 
 **Своему прокси доверяем, клиенту — нет.** Каждый свой прокси дописывает в **конец**
 `X-Forwarded-For` адрес, от которого получил запрос. Значит, если перед Django стоит
@@ -39,7 +159,7 @@ N = 1 → берём 1-й с конца  →  203.0.113.7                       
 лимиты (`ClientIPRateThrottle`), капча форм и `YookassaIPAllowlist`. Встроенные троттлы
 DRF смотрят на ту же настройку `NUM_PROXIES`.
 
-## 3. Настройка `TRUSTED_PROXY_COUNT`
+## 9. Настройка `TRUSTED_PROXY_COUNT`
 
 | Схема | Значение |
 | ----- | -------- |
@@ -59,10 +179,12 @@ DRF смотрят на ту же настройку `NUM_PROXIES`.
 доверенным. В `docker-compose` прод-окружения у `backend` не должно быть `ports:`, только
 внутренняя сеть. Наружу смотрит лишь Caddy (80/443).
 
-## 4. Caddy
+## 10. Caddy
+
+Рабочий конфиг — `deploy/Caddyfile`. Суть для IP:
 
 ```
-api.example.ru {
+{$DOMAIN} {
     reverse_proxy backend:8000
 }
 ```
@@ -84,7 +206,7 @@ api.example.ru {
 Для nginx то же самое делает `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`.
 Можно и `$remote_addr`: правило «N-й с конца» работает для обоих вариантов.
 
-## 5. Проверка после выкладки
+## 11. Проверка IP и вебхука после выкладки
 
 1. Послать с внешней машины запрос с подделкой:
    `curl -H "X-Forwarded-For: 1.2.3.4" https://api.example.ru/api/v1/auth/otp/request/ …`.
