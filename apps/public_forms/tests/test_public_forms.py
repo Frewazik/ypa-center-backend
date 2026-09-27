@@ -19,6 +19,7 @@ from apps.public_forms.models import (
     FeedbackRequest,
     FeedbackStatus,
 )
+from apps.public_forms.serializers import FEEDBACK_MESSAGE_MAX_LENGTH
 from apps.public_forms.services import verify_captcha_token
 from apps.users.models import ConsentPurpose, PersonalDataConsent
 from apps.public_forms.tests.factories import (
@@ -333,6 +334,61 @@ class TestHappyPath:
             api_client.post(CALLBACK_URL, callback_payload, format="json")
 
         notify_mock.assert_not_called()
+
+
+class TestFeedbackMessageLength:
+    def test_message_at_limit_accepted(
+        self, api_client: APIClient, feedback_payload: dict[str, object]
+    ) -> None:
+        payload = {**feedback_payload, "message": "я" * FEEDBACK_MESSAGE_MAX_LENGTH}
+
+        response = api_client.post(FEEDBACK_URL, payload, format="json")
+
+        assert response.status_code == status.HTTP_202_ACCEPTED
+        assert FeedbackRequest.objects.count() == 1
+
+    def test_too_long_message_rejected(
+        self,
+        api_client: APIClient,
+        feedback_payload: dict[str, object],
+        notify_mock: MagicMock,
+    ) -> None:
+        payload = {
+            **feedback_payload,
+            "message": "я" * (FEEDBACK_MESSAGE_MAX_LENGTH + 1),
+        }
+
+        response = api_client.post(FEEDBACK_URL, payload, format="json")
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        assert FeedbackRequest.objects.count() == 0
+        assert PersonalDataConsent.objects.count() == 0
+        notify_mock.assert_not_called()
+
+
+class TestQueueFailure:
+    def test_request_saved_when_queue_is_down(
+        self,
+        api_client: APIClient,
+        feedback_payload: dict[str, object],
+        monkeypatch: pytest.MonkeyPatch,
+        django_capture_on_commit_callbacks: OnCommitCapture,
+    ) -> None:
+        # ПОЧЕМУ: заявка клиента уже в базе — упавший Redis не должен
+        # превращать её в ошибку; менеджер увидит её в админке
+        async def _broken_kiq(*args: object, **kwargs: object) -> None:
+            raise ConnectionError("redis down")
+
+        monkeypatch.setattr(
+            "apps.public_forms.services.notify_managers_task.kiq", _broken_kiq
+        )
+
+        with django_capture_on_commit_callbacks(execute=True):
+            response = api_client.post(FEEDBACK_URL, feedback_payload, format="json")
+
+        assert response.status_code == status.HTTP_202_ACCEPTED
+        assert FeedbackRequest.objects.count() == 1
+        assert PersonalDataConsent.objects.count() == 1
 
 
 class TestModels:

@@ -55,7 +55,16 @@ class Settings(BaseSettings):
     CAPTCHA_VERIFY_URL: str = (
         "https://challenges.cloudflare.com/turnstile/v0/siteverify"
     )
-    CAPTCHA_SECRET_KEY: str = "1x0000000000000000000000000000000AA"
+    # Пусто локально — тестовый ключ Cloudflare. Вне local обязателен:
+    # см. _resolve_captcha_secret_key
+    CAPTCHA_SECRET_KEY: str = ""
+
+    # Бот и чат, куда приходит «новая заявка с сайта». В production обязательны
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_MANAGER_CHAT_ID: str = ""
+    # Адрес, на котором открывается админка (https://api.example.ru) —
+    # для ссылки на заявку в уведомлении. В production обязателен
+    ADMIN_BASE_URL: str = ""
 
 
 # ПОЧЕМУ ignore: обязательные поля заполняет pydantic-settings из env/.env,
@@ -96,6 +105,63 @@ def _resolve_pd_consent_version(env: Settings) -> str:
 
 
 PD_CONSENT_VERSION = _resolve_pd_consent_version(_env)
+
+# Тестовые секреты Cloudflare Turnstile: 1x… всегда «успех», 2x… всегда
+# «провал», 3x… «токен уже использован»
+_CAPTCHA_TEST_SECRET_PREFIXES = ("1x0000000000", "2x0000000000", "3x0000000000")
+_CAPTCHA_ALWAYS_PASS_SECRET = "1x0000000000000000000000000000000AA"
+
+
+def _resolve_captcha_secret_key(env: Settings) -> str:
+    # ПОЧЕМУ: у капчи не бывает безопасного дефолта. Тестовый ключ пропускает
+    # любой токен — забытая переменная на проде молча открыла бы формы ботам;
+    # пустой ключ отклонял бы всех — формы молча перестали бы работать.
+    # Поэтому вне local значение задаётся явно, а в production тестовый
+    # ключ запрещён даже явно
+    secret = env.CAPTCHA_SECRET_KEY
+    if not secret:
+        if env.ENVIRONMENT == "local":
+            return _CAPTCHA_ALWAYS_PASS_SECRET
+        raise ImproperlyConfigured(
+            "Задайте CAPTCHA_SECRET_KEY — секретный ключ Cloudflare Turnstile. "
+            "См. docs/public-forms-design.md"
+        )
+    if env.ENVIRONMENT == "production" and secret.startswith(
+        _CAPTCHA_TEST_SECRET_PREFIXES
+    ):
+        raise ImproperlyConfigured(
+            "CAPTCHA_SECRET_KEY в production — тестовый ключ Cloudflare. "
+            "Задайте боевой секрет виджета Turnstile"
+        )
+    return secret
+
+
+CAPTCHA_SECRET_KEY = _resolve_captcha_secret_key(_env)
+
+_MANAGER_NOTIFICATION_SETTINGS = (
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_MANAGER_CHAT_ID",
+    "ADMIN_BASE_URL",
+)
+
+
+def _check_manager_notification_settings(env: Settings) -> None:
+    # ПОЧЕМУ: без бота заявки с сайта копятся в админке, и никто о них не
+    # узнаёт — в production это видно только по жалобам клиентов. Локально
+    # и на staging пустой Telegram допустим: задача пишет в лог и выходит
+    if env.ENVIRONMENT != "production":
+        return
+    missing = [
+        name for name in _MANAGER_NOTIFICATION_SETTINGS if not getattr(env, name)
+    ]
+    if missing:
+        raise ImproperlyConfigured(
+            f"Задайте {', '.join(missing)} — уведомления о заявках с сайта. "
+            "См. docs/public-forms-design.md"
+        )
+
+
+_check_manager_notification_settings(_env)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -312,13 +378,13 @@ EMAIL_USE_TLS = _env.EMAIL_USE_TLS
 AUTH_USER_MODEL = "users.Parent"
 
 CAPTCHA_VERIFY_URL = _env.CAPTCHA_VERIFY_URL
-CAPTCHA_SECRET_KEY = _env.CAPTCHA_SECRET_KEY
 # ПОЧЕМУ: public_forms читает этот таймаут для httpx; без него проверка
 # капчи падала бы в AttributeError на первом же запросе
 EXTERNAL_HTTP_TIMEOUT_SECONDS = 5.0
 
-TELEGRAM_BOT_TOKEN = "dummy-bot-token"
-TELEGRAM_MANAGER_CHAT_ID = "dummy-chat-id"
+TELEGRAM_BOT_TOKEN = _env.TELEGRAM_BOT_TOKEN
+TELEGRAM_MANAGER_CHAT_ID = _env.TELEGRAM_MANAGER_CHAT_ID
+ADMIN_BASE_URL = _env.ADMIN_BASE_URL
 
 UNFOLD = {
     "SITE_TITLE": "Улица Радости - админка",
