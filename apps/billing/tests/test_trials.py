@@ -219,6 +219,22 @@ class TestCreateTrialPayment:
                 schedule_port=FakeSchedulePort(),
             )
 
+    def test_archived_student_is_rejected(self) -> None:
+        parent = ParentFactory()
+        student = StudentFactory(parent=parent, archived_at=timezone.now())
+
+        with pytest.raises(StudentNotOwnedError):
+            create_trial_payment(
+                parent_id=parent.pk,
+                student_id=student.pk,
+                schedule_id=101,
+                trial_date=timezone.localdate() + timedelta(days=3),
+                idempotency_key=str(uuid.uuid4()),
+                request_fingerprint=_FP,
+                gateway=FakeGateway(),
+                schedule_port=FakeSchedulePort(),
+            )
+
     def test_full_slot_is_rejected(self) -> None:
         _trial_checkout(101, capacity=1)
 

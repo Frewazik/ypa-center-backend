@@ -3,7 +3,12 @@ from __future__ import annotations
 from django.db import transaction
 from rest_framework import serializers
 
-from apps.billing.models import DepositEntryReason, SubscriptionStatus
+from apps.billing.models import (
+    DepositEntryReason,
+    EnrollmentStatus,
+    EnrollmentType,
+    SubscriptionStatus,
+)
 from apps.me.services import UpcomingItem
 from apps.users.models import (
     PROFILE_REQUIRED_FIELDS,
@@ -38,8 +43,20 @@ class ChildSerializer(serializers.ModelSerializer[Student]):
         fields = ("id", "full_name", "dob", "school_grade", "health_issues")
 
 
+class ActiveEnrollmentSerializer(serializers.Serializer):
+    id = serializers.IntegerField(read_only=True)
+    type = serializers.ChoiceField(choices=EnrollmentType.choices, read_only=True)
+    status = serializers.ChoiceField(choices=EnrollmentStatus.choices, read_only=True)
+    activity_name = serializers.CharField(read_only=True)
+    group_name = serializers.CharField(read_only=True, allow_blank=True)
+    subscription_id = serializers.IntegerField(read_only=True, allow_null=True)
+    trial_date = serializers.DateField(read_only=True, allow_null=True)
+
+
 class ProfileSerializer(serializers.ModelSerializer[Parent]):
-    children = ChildSerializer(many=True, read_only=True)
+    # ПОЧЕМУ source: удалённые родителем дети скрыты только из ЛК — админка
+    # и история покупок их видят
+    children = ChildSerializer(many=True, read_only=True, source="active_children")
     referral_source = serializers.ChoiceField(
         choices=_REFERRAL_INPUT_CHOICES,
         help_text="Откуда узнали о центре. В ответе у старых родителей бывает UNKNOWN",

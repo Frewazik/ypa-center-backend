@@ -128,6 +128,12 @@ def problem_detail_exception_handler(
     if request_id:
         extensions["request_id"] = request_id
 
+    # ПОЧЕМУ: 409 бывает нужно объяснить машинно (что именно мешает) —
+    # исключение кладёт данные в атрибут extensions, формат ответа общий
+    exc_extensions = getattr(exc, "extensions", None)
+    if isinstance(exc_extensions, dict):
+        extensions.update(exc_extensions)
+
     if isinstance(exc, ValidationError):
         payload["title"] = "Validation Error"
         payload["detail"] = _("Ошибка валидации входных данных.")

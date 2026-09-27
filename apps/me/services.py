@@ -8,7 +8,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import Prefetch, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import NotFound, ValidationError
 
 from apps.billing.models import (
     DepositEntry,
@@ -106,6 +106,9 @@ class UpcomingItem:
     is_rescheduled: bool
 
 
+_DUPLICATE_CHILD_MESSAGE: Final = "Ребёнок с таким ФИО и датой рождения уже добавлен."
+
+
 def create_child(parent: Parent, data: dict[str, object]) -> Student:
     try:
         with transaction.atomic():
@@ -117,11 +120,100 @@ def create_child(parent: Parent, data: dict[str, object]) -> Student:
                 health_issues=str(data.get("health_issues") or ""),
             )
     except IntegrityError as exc:
-        # Сработал uq_student_per_parent_name_dob — дабл-сабмит формы
-        raise ValidationError(
-            {"full_name": ["Ребёнок с таким ФИО и датой рождения уже добавлен."]},
-            code="VALIDATION_ERROR",
-        ) from exc
+        # Сработал uq_student_active_per_parent_name_dob — дабл-сабмит формы
+        raise _duplicate_child_error() from exc
+
+
+def update_child(child: Student, data: dict[str, object]) -> Student:
+    # ПОЧЕМУ свой перехват: DRF не строит проверку уникальности — поля parent
+    # нет в сериализаторе. Без него переименование в «близнеца» давало 500
+    for field, value in data.items():
+        setattr(child, field, value)
+    try:
+        with transaction.atomic():
+            child.save()
+    except IntegrityError as exc:
+        raise _duplicate_child_error() from exc
+    return child
+
+
+def _duplicate_child_error() -> ValidationError:
+    return ValidationError(
+        {"full_name": [_DUPLICATE_CHILD_MESSAGE]}, code="VALIDATION_ERROR"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveEnrollmentView:
+    id: int
+    type: str
+    status: str
+    activity_name: str
+    group_name: str
+    subscription_id: int | None
+    trial_date: datetime.date | None
+
+
+class ChildHasActiveEnrollmentsError(Exception):
+    def __init__(self, enrollments: list[ActiveEnrollmentView]) -> None:
+        super().__init__(f"У ребёнка {len(enrollments)} живых записей.")
+        self.enrollments = enrollments
+
+
+def archive_child(parent: Parent, child_id: int) -> None:
+    with transaction.atomic():
+        # ПОЧЕМУ FOR NO KEY UPDATE: чекаут берёт тот же лок на ребёнка перед
+        # созданием брони. Без него чекаут мог проверить «не архивный» и
+        # записать ребёнка, которого мы в ту же секунду архивируем
+        child = (
+            Student.objects.active()
+            .select_for_update(no_key=True)
+            .filter(pk=child_id, parent=parent)
+            .first()
+        )
+        if child is None:
+            # Чужой, несуществующий и уже удалённый неотличимы
+            raise NotFound(code="NOT_FOUND")
+        blocking = _active_enrollments(child)
+        if blocking:
+            raise ChildHasActiveEnrollmentsError(blocking)
+        # ПОЧЕМУ health_issues не стираем: решение бизнеса (2026-09-26) —
+        # пока храним вместе с карточкой; стирание — отдельная задача по 152-ФЗ
+        child.archived_at = timezone.now()
+        child.save(update_fields=["archived_at", "updated_at"])
+
+
+def _active_enrollments(child: Student) -> list[ActiveEnrollmentView]:
+    # ПОЧЕМУ дата у пробного: оно остаётся ENROLLED и после визита
+    # (uq_billing_active_regular_per_student_slot), прошедшее — уже история.
+    # Действующий абонемент отдельно не проверяем: у живого абонемента всегда
+    # есть HELD/ENROLLED-запись, истёкший их отменяет (sweep_expired_subscriptions)
+    alive = (
+        Q(status=EnrollmentStatus.HELD)
+        | Q(status=EnrollmentStatus.ENROLLED, type=EnrollmentType.REGULAR)
+        | Q(
+            status=EnrollmentStatus.ENROLLED,
+            type=EnrollmentType.TRIAL,
+            trial_date__gte=timezone.localdate(),
+        )
+    )
+    enrollments = (
+        Enrollment.objects.filter(alive, student=child)
+        .select_related("schedule__activity")
+        .order_by("pk")
+    )
+    return [
+        ActiveEnrollmentView(
+            id=enrollment.pk,
+            type=enrollment.type,
+            status=enrollment.status,
+            activity_name=enrollment.schedule.activity.name,
+            group_name=enrollment.schedule.group_name,
+            subscription_id=enrollment.subscription_id,
+            trial_date=enrollment.trial_date,
+        )
+        for enrollment in enrollments
+    ]
 
 
 def list_parent_subscriptions(parent: Parent) -> list[SubscriptionView]:

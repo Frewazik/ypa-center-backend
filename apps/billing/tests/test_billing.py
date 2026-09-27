@@ -547,6 +547,33 @@ class TestCreatePayment:
         assert Transaction.objects.count() == 0
         assert Enrollment.objects.count() == 0
 
+    def test_archived_student_rejected(self) -> None:
+        # Удалённый родителем ребёнок для чекаута — как чужой
+        parent = ParentFactory()
+        student = StudentFactory(parent=parent, archived_at=timezone.now())
+
+        with pytest.raises(StudentNotOwnedError):
+            _checkout([101], parent=parent, student=student)
+
+        assert Enrollment.objects.count() == 0
+
+    def test_student_archived_after_precheck_rejected_under_lock(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ПОЧЕМУ: имитация гонки — ребёнка удалили между быстрой проверкой и
+        # транзакцией. Повторная проверка под локом не даёт создать бронь
+        parent = ParentFactory()
+        student = StudentFactory(parent=parent, archived_at=timezone.now())
+        monkeypatch.setattr(
+            billing_services, "_ensure_student_owned", lambda *_args: None
+        )
+
+        with pytest.raises(StudentNotOwnedError):
+            _checkout([101], parent=parent, student=student)
+
+        assert Enrollment.objects.count() == 0
+        assert Transaction.objects.count() == 0
+
     def test_slots_count_mismatch_rejected_before_any_mutation(self) -> None:
         # ПОЧЕМУ: защита от фрода при подмене количества слотов в запросе
         # предотвращает покупку "безлимита" по цене минимального тарифа

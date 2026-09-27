@@ -6,6 +6,7 @@ from django.contrib.auth.models import (
     PermissionsMixin,
 )
 from django.db import models
+from django.db.models import Q
 from django.conf import settings
 from phonenumber_field.modelfields import PhoneNumberField
 
@@ -147,6 +148,15 @@ class Parent(AbstractBaseUser, PermissionsMixin):
         )
         return has_fields and self.pd_consent_at is not None
 
+    @property
+    def active_children(self) -> StudentQuerySet:
+        return Student.objects.active().filter(parent=self)
+
+
+class StudentQuerySet(models.QuerySet["Student"]):
+    def active(self) -> StudentQuerySet:
+        return self.filter(archived_at__isnull=True)
+
 
 class Student(models.Model):
     parent = models.ForeignKey(
@@ -166,8 +176,20 @@ class Student(models.Model):
         verbose_name="Особенности здоровья",
         blank=True,
     )
+    # ПОЧЕМУ мягкое удаление: на ребёнка ссылаются записи, посещения и оплаты
+    # (PROTECT) — это учёт, стирать его нельзя. Архивный скрыт из ЛК и
+    # чекаута, но виден в админке и в истории покупок родителя
+    archived_at = models.DateTimeField(
+        verbose_name="Удалён родителем",
+        null=True,
+        blank=True,
+    )
     created_at = models.DateTimeField(verbose_name="Создан", auto_now_add=True)
     updated_at = models.DateTimeField(verbose_name="Обновлён", auto_now=True)
+
+    # ПОЧЕМУ не менеджер по умолчанию с фильтром: он тихо спрятал бы архивных
+    # из админки и обратных связей. Скрываем явно — Student.objects.active()
+    objects = StudentQuerySet.as_manager()
 
     class Meta:
         verbose_name = "Ребёнок"
@@ -176,10 +198,12 @@ class Student(models.Model):
         constraints = [
             # ПОЧЕМУ: ловит дабл-сабмит формы. Близнецов различает дата
             # рождения + разные имена; полный тёзка с той же датой у одного
-            # родителя в реальности не встречается
+            # родителя в реальности не встречается. Только среди неархивных —
+            # удалённого ребёнка родитель вправе добавить заново
             models.UniqueConstraint(
                 fields=("parent", "full_name", "dob"),
-                name="uq_student_per_parent_name_dob",
+                condition=Q(archived_at__isnull=True),
+                name="uq_student_active_per_parent_name_dob",
             ),
         ]
 

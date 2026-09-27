@@ -147,6 +147,200 @@ class TestChildren:
 
         assert response.status_code == status.HTTP_404_NOT_FOUND
 
+    def test_rename_into_sibling_rejected_not_500(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        # ПОЧЕМУ: раньше IntegrityError уходил клиенту 500-й
+        StudentFactory(parent=parent, full_name="Иванов Иван", dob=_DOB)
+        other = StudentFactory(parent=parent, full_name="Иванов Пётр", dob=_DOB)
+
+        response = api_client.patch(
+            f"{CHILDREN_URL}{other.pk}/", {"full_name": "Иванов Иван"}, format="json"
+        )
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        assert response.json()["code"] == "VALIDATION_ERROR"
+        other.refresh_from_db()
+        assert other.full_name == "Иванов Пётр"
+
+
+_DOB = datetime.date(2015, 3, 12)
+
+
+def _child_url(child: Student) -> str:
+    return f"{CHILDREN_URL}{child.pk}/"
+
+
+class TestChildDelete:
+    def test_deletes_child_without_enrollments(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        child = StudentFactory(parent=parent)
+
+        response = api_client.delete(_child_url(child))
+
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+        child.refresh_from_db()
+        assert child.archived_at is not None
+
+    def test_history_is_kept(self, api_client: APIClient, parent: Parent) -> None:
+        # Отменённый абонемент и прошедшее пробное — история, не помеха
+        child = StudentFactory(parent=parent)
+        canceled = EnrollmentFactory(student=child, status=EnrollmentStatus.CANCELED)
+        past_trial = EnrollmentFactory(
+            student=child,
+            trial=True,
+            trial_date=timezone.localdate() - datetime.timedelta(days=1),
+        )
+
+        response = api_client.delete(_child_url(child))
+
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+        assert set(child.enrollments.values_list("pk", flat=True)) == {
+            canceled.pk,
+            past_trial.pk,
+        }
+
+    @pytest.mark.parametrize(
+        ("kind", "enrollment_status"),
+        [
+            ("REGULAR", EnrollmentStatus.ENROLLED),
+            ("REGULAR", EnrollmentStatus.HELD),
+            ("TRIAL", EnrollmentStatus.HELD),
+            ("TRIAL", EnrollmentStatus.ENROLLED),
+        ],
+    )
+    def test_active_enrollment_blocks_delete(
+        self,
+        api_client: APIClient,
+        parent: Parent,
+        kind: str,
+        enrollment_status: str,
+    ) -> None:
+        child = StudentFactory(parent=parent)
+        enrollment = EnrollmentFactory(
+            student=child,
+            status=enrollment_status,
+            trial=kind == "TRIAL",
+            schedule=ScheduleFactory(
+                activity=ActivityFactory(name="Робототехника"), group_name="Группа А"
+            ),
+        )
+
+        response = api_client.delete(_child_url(child))
+
+        assert response.status_code == status.HTTP_409_CONFLICT
+        payload = response.json()
+        assert payload["code"] == "CHILD_HAS_ACTIVE_ENROLLMENTS"
+        (item,) = payload["extensions"]["active_enrollments"]
+        assert item["id"] == enrollment.pk
+        assert item["type"] == kind
+        assert item["status"] == enrollment_status
+        assert item["activity_name"] == "Робототехника"
+        assert item["group_name"] == "Группа А"
+        child.refresh_from_db()
+        assert child.archived_at is None
+
+    def test_409_payload_shape_for_subscription_and_trial(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        child = StudentFactory(parent=parent)
+        regular = EnrollmentFactory(student=child)
+        trial_date = timezone.localdate() + datetime.timedelta(days=3)
+        trial = EnrollmentFactory(student=child, trial=True, trial_date=trial_date)
+
+        response = api_client.delete(_child_url(child))
+
+        items = response.json()["extensions"]["active_enrollments"]
+        assert [item["id"] for item in items] == [regular.pk, trial.pk]
+        assert items[0]["subscription_id"] == regular.subscription_id
+        assert items[0]["trial_date"] is None
+        assert items[1]["subscription_id"] is None
+        assert items[1]["trial_date"] == trial_date.isoformat()
+
+    def test_foreign_child_is_404(self, api_client: APIClient) -> None:
+        foreign_child = StudentFactory()
+
+        response = api_client.delete(_child_url(foreign_child))
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+        assert response.json()["code"] == "NOT_FOUND"
+        foreign_child.refresh_from_db()
+        assert foreign_child.archived_at is None
+
+    def test_repeat_delete_is_404(self, api_client: APIClient, parent: Parent) -> None:
+        child = StudentFactory(parent=parent)
+        api_client.delete(_child_url(child))
+
+        response = api_client.delete(_child_url(child))
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_requires_auth(self, parent: Parent) -> None:
+        child = StudentFactory(parent=parent)
+
+        response = APIClient().delete(_child_url(child))
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_allowed_before_onboarding_form(
+        self, new_client: APIClient, new_parent: Parent
+    ) -> None:
+        child = StudentFactory(parent=new_parent)
+
+        response = new_client.delete(_child_url(child))
+
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+
+    def test_deleted_child_hidden_from_profile(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        kept = StudentFactory(parent=parent)
+        deleted = StudentFactory(parent=parent)
+        api_client.delete(_child_url(deleted))
+
+        children = api_client.get(PROFILE_URL).json()["children"]
+
+        assert [child["id"] for child in children] == [kept.pk]
+
+    def test_deleted_child_cannot_be_edited(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        child = StudentFactory(parent=parent)
+        api_client.delete(_child_url(child))
+
+        response = api_client.patch(
+            _child_url(child), {"school_grade": "6"}, format="json"
+        )
+
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    def test_same_child_can_be_added_again(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        payload = {"full_name": "Иванов Иван", "dob": _DOB.isoformat()}
+        first_id = api_client.post(CHILDREN_URL, payload, format="json").json()["id"]
+        api_client.delete(f"{CHILDREN_URL}{first_id}/")
+
+        again = api_client.post(CHILDREN_URL, payload, format="json")
+
+        assert again.status_code == status.HTTP_201_CREATED
+        assert again.json()["id"] != first_id
+        assert Student.objects.filter(parent=parent).count() == 2
+
+    def test_rename_into_deleted_sibling_allowed(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        deleted = StudentFactory(parent=parent, full_name="Иванов Иван", dob=_DOB)
+        api_client.delete(_child_url(deleted))
+        other = StudentFactory(parent=parent, full_name="Иванов Пётр", dob=_DOB)
+
+        response = api_client.patch(
+            _child_url(other), {"full_name": "Иванов Иван"}, format="json"
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+
 
 class TestSubscriptions:
     def test_lists_subscriptions_with_slots(

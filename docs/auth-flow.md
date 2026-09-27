@@ -129,7 +129,7 @@ email → [код на почту] → verify (доказано владение
 | Открыто после входа | Закрыто до анкеты (`403 PROFILE_INCOMPLETE`) |
 | ------------------- | -------------------------------------------- |
 | `GET/PATCH /me/profile/` | `/me/subscriptions/`, `/me/trials/`, `/me/upcoming/` |
-| `POST /me/children/`, `PATCH /me/children/{id}/` | `/me/deposit/`, `/me/deposit/entries/` |
+| `POST /me/children/`, `PATCH`/`DELETE /me/children/{id}/` | `/me/deposit/`, `/me/deposit/entries/` |
 | `/auth/*` (refresh, logout) | `POST /checkout/subscription`, `POST /checkout/trial` |
 
 Без токена закрытые ручки по-прежнему отвечают `401`, а не `403`. Формат ответа —
