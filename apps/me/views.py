@@ -3,15 +3,22 @@ from __future__ import annotations
 from typing import cast
 
 from django.db.models import QuerySet
-from drf_spectacular.utils import OpenApiParameter, extend_schema
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiResponse,
+    extend_schema,
+    extend_schema_view,
+)
 from rest_framework import generics, status
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
+from rest_framework.serializers import BaseSerializer
 from rest_framework.views import APIView
 
 from apps.me.serializers import (
+    ActiveEnrollmentSerializer,
     ChildSerializer,
     DepositBalanceSerializer,
     DepositEntryViewSerializer,
@@ -23,12 +30,16 @@ from apps.me.serializers import (
 from apps.me.services import (
     UPCOMING_DEFAULT_WEEKS,
     UPCOMING_MAX_WEEKS,
+    ActiveEnrollmentView,
+    ChildHasActiveEnrollmentsError,
+    archive_child,
     build_upcoming_feed,
     create_child,
     get_parent_deposit_balance,
     list_parent_deposit_entries,
     list_parent_subscriptions,
     list_parent_trials,
+    update_child,
 )
 from apps.users.models import Parent, Student
 
@@ -75,19 +86,71 @@ class ChildCreateView(APIView):
         return Response(ChildSerializer(child).data, status=status.HTTP_201_CREATED)
 
 
-@extend_schema(
-    operation_id="me_child_update",
-    summary="Изменить данные ребёнка",
-    responses=ChildSerializer,
+class ChildHasActiveEnrollmentsConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = (
+        "У ребёнка есть действующий абонемент, неоплаченная бронь или "
+        "предстоящее пробное. Удалить можно после их окончания."
+    )
+    default_code = "CHILD_HAS_ACTIVE_ENROLLMENTS"
+
+    def __init__(self, enrollments: list[ActiveEnrollmentView]) -> None:
+        super().__init__()
+        # Попадает в extensions ответа — фронт показывает, что именно мешает
+        self.extensions = {
+            "active_enrollments": ActiveEnrollmentSerializer(
+                enrollments, many=True
+            ).data
+        }
+
+
+@extend_schema_view(
+    patch=extend_schema(
+        operation_id="me_child_update",
+        summary="Изменить данные ребёнка",
+        responses=ChildSerializer,
+    ),
+    delete=extend_schema(
+        operation_id="me_child_delete",
+        summary="Удалить ребёнка (архивация)",
+        description=(
+            "Мягкое удаление: ребёнок пропадает из профиля и чекаута, история "
+            "покупок и посещений сохраняется. 409 CHILD_HAS_ACTIVE_ENROLLMENTS, "
+            "пока есть действующий абонемент, неоплаченная бронь или предстоящее "
+            "пробное — список в extensions.active_enrollments."
+        ),
+        responses={
+            status.HTTP_204_NO_CONTENT: OpenApiResponse(description="Удалён"),
+            status.HTTP_404_NOT_FOUND: OpenApiResponse(
+                description="Чужой, несуществующий или уже удалённый ребёнок"
+            ),
+            status.HTTP_409_CONFLICT: OpenApiResponse(
+                description="CHILD_HAS_ACTIVE_ENROLLMENTS"
+            ),
+        },
+    ),
 )
-class ChildUpdateView(generics.UpdateAPIView[Student]):
+class ChildDetailView(generics.UpdateAPIView[Student]):
     permission_classes = _ONBOARDING_PERMISSIONS
     serializer_class = ChildSerializer
-    http_method_names = ("patch", "options")
+    http_method_names = ("patch", "delete", "options")
 
     def get_queryset(self) -> QuerySet[Student]:
-        # Чужой ребёнок неотличим от несуществующего - 404
-        return Student.objects.filter(parent=_current_parent(self.request))
+        # Чужой ребёнок неотличим от несуществующего - 404; удалённый - тоже
+        return Student.objects.active().filter(parent=_current_parent(self.request))
+
+    def perform_update(self, serializer: BaseSerializer[Student]) -> None:
+        serializer.instance = update_child(
+            cast(Student, serializer.instance),
+            cast("dict[str, object]", serializer.validated_data),
+        )
+
+    def delete(self, request: Request, pk: int) -> Response:
+        try:
+            archive_child(_current_parent(request), pk)
+        except ChildHasActiveEnrollmentsError as exc:
+            raise ChildHasActiveEnrollmentsConflict(exc.enrollments) from exc
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 @extend_schema(

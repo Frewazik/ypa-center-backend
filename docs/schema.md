@@ -45,8 +45,13 @@ erDiagram
 Анкета заполнена, когда непусты `full_name`, `phone`, `referral_source` и `pd_consent_at`
 — вычисляется на лету (`Parent.is_profile_completed`), флага в БД нет (`auth-flow.md` §4.1).
 
-**student** — `parent` FK (CASCADE), `full_name`, `school_grade`, `dob`, `health_issues`.
-Уникальность `(parent, full_name, dob)` — защита от дабл-сабмита формы.
+**student** — `parent` FK (CASCADE), `full_name`, `school_grade`, `dob`, `health_issues`,
+`archived_at` (мягкое удаление родителем, `NULL` — активен). Физически ребёнка с историей
+не удалить: `enrollment.student` — `PROTECT`, и это учёт. Архивный скрыт из профиля и
+чекаута (`Student.objects.active()`), в админке и истории покупок виден.
+Уникальность `(parent, full_name, dob)` только среди неархивных
+(`uq_student_active_per_parent_name_dob`, partial `WHERE archived_at IS NULL`) — защита от
+дабл-сабмита формы; удалённого ребёнка можно добавить заново.
 `health_issues` — сведения о здоровье, специальная категория ПД (`personal-data.md` §5).
 
 **personal_data_consent** (`users_personaldataconsent`) — журнал согласий на обработку ПД,

@@ -380,9 +380,9 @@ def create_payment(
             plan_id, plan.slots_count, len(normalized_slot_ids)
         )
 
-    # ПОЧЕМУ: защита от IDOR, проверяем принадлежность ребенка плательщику
-    if not Student.objects.filter(pk=student_id, parent_id=parent_id).exists():
-        raise StudentNotOwnedError(student_id)
+    # ПОЧЕМУ: защита от IDOR, проверяем принадлежность ребенка плательщику.
+    # Быстрый отказ до резервации ключа; под локом проверка повторяется
+    _ensure_student_owned(student_id, parent_id)
 
     replay, lock_token = _reserve_idempotency(idempotency_key, request_fingerprint)
     if replay is not None:
@@ -390,6 +390,7 @@ def create_payment(
 
     try:
         with db_transaction.atomic():
+            _lock_owned_student(student_id, parent_id)
             subscription = Subscription.objects.create(
                 parent_id=parent_id,
                 plan=plan,
@@ -628,8 +629,7 @@ def create_trial_payment(
     schedule_port: SchedulePort,
 ) -> CheckoutResult:
     # ПОЧЕМУ: защита от IDOR — принадлежность ребёнка плательщику
-    if not Student.objects.filter(pk=student_id, parent_id=parent_id).exists():
-        raise StudentNotOwnedError(student_id)
+    _ensure_student_owned(student_id, parent_id)
     if trial_date < timezone.localdate():
         raise TrialDateUnavailableError(
             schedule_id, trial_date, "дата пробного уже в прошлом."
@@ -641,6 +641,7 @@ def create_trial_payment(
 
     try:
         with db_transaction.atomic():
+            _lock_owned_student(student_id, parent_id)
             _lock_slot_for_booking(schedule_id)
             hold_expired_before = timezone.now() - _PENDING_TRANSACTION_TTL
             Enrollment.objects.filter(
@@ -822,6 +823,29 @@ def _fulfill_prepaid_order(tx: Transaction, schedule_port: SchedulePort) -> None
             for slot_id in slot_ids
         ]
     )
+
+
+def _ensure_student_owned(student_id: int, parent_id: int) -> None:
+    # Удалённый родителем (архивный) ребёнок для чекаута — как чужой
+    owned = Student.objects.active().filter(pk=student_id, parent_id=parent_id)
+    if not owned.exists():
+        raise StudentNotOwnedError(student_id)
+
+
+def _lock_owned_student(student_id: int, parent_id: int) -> None:
+    # !!!: первый лок транзакции чекаута (ребёнок -> слоты -> депозит).
+    # FOR NO KEY UPDATE конфликтует с таким же локом в archive_child: иначе
+    # родитель мог удалить ребёнка между проверкой владения и созданием брони.
+    # Неявный FOR KEY SHARE от FK при INSERT брони с UPDATE не конфликтует
+    locked = (
+        Student.objects.active()
+        .select_for_update(no_key=True)
+        .filter(pk=student_id, parent_id=parent_id)
+        .values_list("pk", flat=True)
+        .first()
+    )
+    if locked is None:
+        raise StudentNotOwnedError(student_id)
 
 
 def _lock_slot_for_booking(slot_id: int) -> None:

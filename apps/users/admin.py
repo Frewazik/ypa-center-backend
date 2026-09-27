@@ -12,7 +12,9 @@ from apps.users.models import Parent, PersonalDataConsent, Student, TeacherProfi
 class StudentInline(TabularInline):
     model = Student
     extra = 0
-    fields = ("full_name", "dob", "school_grade", "health_issues")
+    # ПОЧЕМУ archived_at редактируемый: восстановить удалённого родителем
+    # ребёнка можно только здесь — очистить поле (решение 2026-09-26)
+    fields = ("full_name", "dob", "school_grade", "health_issues", "archived_at")
 
 
 class SubscriptionInline(TabularInline):
@@ -57,8 +59,12 @@ class ParentAdmin(ModelAdmin):
 
 @admin.register(Student)
 class StudentAdmin(ModelAdmin):
-    list_display = ("id", "full_name", "school_grade", "parent", "dob")
-    list_filter = (("school_grade", admin.AllValuesFieldListFilter),)
+    list_display = ("id", "full_name", "school_grade", "parent", "dob", "archived_at")
+    # ПОЧЕМУ архивных не прячем: это история учёта; фильтр — чтобы отделить
+    list_filter = (
+        ("archived_at", admin.EmptyFieldListFilter),
+        ("school_grade", admin.AllValuesFieldListFilter),
+    )
     list_select_related = ("parent",)
     # ПОЧЕМУ: поиск по контактам родителя — CRM-сценарий
     # «найти ребёнка по телефону/почте из заявки»

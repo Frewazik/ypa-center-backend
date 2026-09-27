@@ -102,8 +102,10 @@ curl-ом и читать логи. Группировка по аудитори
   `throttled` → `RATE_LIMITED` и т.д.); любая `422` — `VALIDATION_ERROR`; необработанное
   исключение — `500 INTERNAL_SERVER_ERROR`.
 - `extensions` *(необязательное)* — есть, только если есть что положить:
-  `request_id` (эхо заголовка `X-Request-ID`) и `invalid_params[]` (поля с ошибками
-  валидации, `name` — путь поля вида `items[0].date`).
+  `request_id` (эхо заголовка `X-Request-ID`), `invalid_params[]` (поля с ошибками
+  валидации, `name` — путь поля вида `items[0].date`) и данные конкретной ошибки
+  (например, `active_enrollments` у `409 CHILD_HAS_ACTIVE_ENROLLMENTS`). Исключение
+  кладёт их в свой атрибут `extensions`, обработчик сливает в ответ.
 - Ответы, собранные вручную (например, `409 PAYMENT_IN_PROGRESS` с `Retry-After`),
   дополнительно содержат `instance` — путь запроса; `code` там тоже на верхнем уровне.
 
@@ -119,6 +121,7 @@ curl-ом и читать логи. Группировка по аудитори
 | 409  | `NO_AVAILABLE_SEATS`       | Нет мест в слоте/ивенте |
 | 409  | `TRIAL_LIMIT_EXCEEDED`     | Уже было пробное по этому кружку |
 | 409  | `STUDENT_ALREADY_ENROLLED` | Ребёнок уже на абонементе в этой группе (повторный абонемент или пробное поверх него) |
+| 409  | `CHILD_HAS_ACTIVE_ENROLLMENTS` | Удаление ребёнка с живыми записями; список — `extensions.active_enrollments` |
 | 409  | `SUBSCRIPTION_EXPIRED`     | Абонемент просрочен (списание/возврат фишки) |
 | 409  | `IDEMPOTENCY_KEY_REUSED`   | Ключ переиспользован с другим телом запроса |
 | 409  | `PAYMENT_IN_PROGRESS`      | Платёж по этому ключу ещё обрабатывается (с `Retry-After`) |
@@ -351,8 +354,49 @@ GET /api/v1/public/activities/{id}/
   его в анкете нельзя.
 - Передать пустое `full_name`/`phone`/`referral_source` нельзя — `422 VALIDATION_ERROR`.
   Непереданные поля не трогаются.
-- Добавлять и править детей (`POST /me/children/`, `PATCH /me/children/{id}/`) можно
-  до заполнения анкеты — дети часть онбординга.
+- Добавлять, править и удалять детей (`POST /me/children/`, `PATCH` и `DELETE
+  /me/children/{id}/`) можно до заполнения анкеты — дети часть онбординга.
+- Ребёнок с такими же ФИО и датой рождения у того же родителя → `422 VALIDATION_ERROR`
+  (`invalid_params[].name = "full_name"`) и при добавлении, и при переименовании.
+
+**Удаление ребёнка — мягкое (архивация).** На ребёнка ссылаются записи, посещения и
+оплаты — это учёт, стирать его нельзя. `DELETE /api/v1/me/children/{id}/` ставит
+`archived_at`: ребёнок пропадает из `children` профиля, его нельзя править (`404`) и
+выбрать в чекауте (`403 FORBIDDEN_RESOURCE`, как чужого). История покупок и посещений в
+`/me/subscriptions`, `/me/trials` сохраняется с его именем. Того же ребёнка можно
+добавить заново — это новая карточка с новым `id`. Восстановить удалённого — только
+администратор в админке. `health_issues` при удалении пока не стираются.
+
+Удалить нельзя, пока есть живая запись: абонемент (запись `HELD` или `ENROLLED`),
+неоплаченная бронь пробного (`HELD`) или оплаченное пробное с датой сегодня или позже.
+Прошедшее пробное и отменённые записи — история, удалению не мешают.
+
+```json
+// DELETE /api/v1/me/children/7/ → 204, без тела
+
+// DELETE /api/v1/me/children/7/ → 409, есть живые записи
+{
+  "type": "urn:problem-type:childhasactiveenrollmentsconflict",
+  "title": "ChildHasActiveEnrollmentsConflict",
+  "status": 409,
+  "detail": "У ребёнка есть действующий абонемент, неоплаченная бронь или предстоящее пробное. Удалить можно после их окончания.",
+  "code": "CHILD_HAS_ACTIVE_ENROLLMENTS",
+  "extensions": {
+    "active_enrollments": [
+      { "id": 31, "type": "REGULAR", "status": "ENROLLED",
+        "activity_name": "Робототехника", "group_name": "Группа А",
+        "subscription_id": 12, "trial_date": null },
+      { "id": 40, "type": "TRIAL", "status": "ENROLLED",
+        "activity_name": "Английский язык", "group_name": "",
+        "subscription_id": null, "trial_date": "2026-10-03" }
+    ]
+  }
+}
+```
+
+Чужой, несуществующий или уже удалённый ребёнок → `404 NOT_FOUND` (неотличимы).
+Гонка «удаление против покупки» закрыта локом строки ребёнка (`FOR NO KEY UPDATE`) и в
+удалении, и в чекауте: одна операция дожидается другой.
 
 **Закрытая ручка до анкеты** — `/me/subscriptions`, `/me/trials`, `/me/upcoming`,
 `/me/deposit/`, `/me/deposit/entries/`, `POST /checkout/subscription`,
@@ -711,6 +755,7 @@ POST /api/v1/webhooks/yookassa
 | GET/PATCH | `/api/v1/me/profile` | да (анкета не нужна) | — |
 | POST  | `/api/v1/me/children/` | да (анкета не нужна) | — |
 | PATCH | `/api/v1/me/children/{id}/` | да (анкета не нужна) | — |
+| DELETE | `/api/v1/me/children/{id}/` | да (анкета не нужна) | — |
 | GET   | `/api/v1/me/subscriptions` | да + анкета | — |
 | GET   | `/api/v1/me/upcoming` | да + анкета | — |
 | GET   | `/api/v1/me/trials` | да + анкета | — |

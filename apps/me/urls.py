@@ -4,7 +4,7 @@ from django.urls import path
 
 from apps.me.views import (
     ChildCreateView,
-    ChildUpdateView,
+    ChildDetailView,
     DepositBalanceView,
     DepositEntryListView,
     ProfileView,
@@ -18,7 +18,7 @@ app_name = "me"
 urlpatterns = [
     path("profile/", ProfileView.as_view(), name="profile"),
     path("children/", ChildCreateView.as_view(), name="child-create"),
-    path("children/<int:pk>/", ChildUpdateView.as_view(), name="child-update"),
+    path("children/<int:pk>/", ChildDetailView.as_view(), name="child-detail"),
     path("subscriptions/", SubscriptionListView.as_view(), name="subscriptions"),
     path("trials/", TrialListView.as_view(), name="trials"),
     path("deposit/", DepositBalanceView.as_view(), name="deposit"),
