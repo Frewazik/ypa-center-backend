@@ -4,6 +4,7 @@ from django.urls import path
 
 from apps.public_api.views import (
     ActivityDetailView,
+    ActivityTrialSlotsView,
     PopularActivitiesView,
     PublicActivityListView,
     PublicEventListView,
@@ -22,6 +23,11 @@ urlpatterns = [
         name="activities-popular",
     ),
     path("activities/<int:pk>/", ActivityDetailView.as_view(), name="activity-detail"),
+    path(
+        "activities/<int:pk>/next-slots/",
+        ActivityTrialSlotsView.as_view(),
+        name="activity-next-slots",
+    ),
     path("teachers/", PublicTeacherListView.as_view(), name="teachers-list"),
     path("gallery/", PublicGalleryListView.as_view(), name="gallery-list"),
     path("events/", PublicEventListView.as_view(), name="events-list"),

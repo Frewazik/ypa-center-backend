@@ -7,7 +7,7 @@ from __future__ import annotations
 import datetime
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, Final, TypeAlias
 
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, models, transaction
@@ -313,15 +313,21 @@ def _collided_fields(
     return fields
 
 
-def build_week_grid(week_start: datetime.date) -> list[WeekSlot]:
+def build_week_grid(
+    week_start: datetime.date, *, activity_id: int | None = None
+) -> list[WeekSlot]:
     # ПОЧЕМУ: Вся логика завязана на недельную сетку,
-    # любая дата нормализуется к понедельнику
+    # любая дата нормализуется к понедельнику.
+    # activity_id сужает сетку до одного кружка (запись на пробное) —
+    # маски и места считаются тем же кодом, без второй копии правил
     week_start = normalize_week_start(week_start)
     week_end = week_start + datetime.timedelta(days=6)
 
+    groups = Schedule.objects.filter(is_active=True, activity__is_active=True)
+    if activity_id is not None:
+        groups = groups.filter(activity_id=activity_id)
     schedules = list(
-        Schedule.objects.filter(is_active=True, activity__is_active=True)
-        .select_related("activity", "teacher__user", "room")
+        groups.select_related("activity", "teacher__user", "room")
         # FIXME: capacity_taken считает по базовой сетке, игнорируя даты
         # приземления RESCHEDULE-масок
         # ПОЧЕМУ ignore: capacity_taken объявлен на модели ради типизации
@@ -353,6 +359,70 @@ def build_week_grid(week_start: datetime.date) -> list[WeekSlot]:
     ]
     slots.sort(key=lambda slot: (slot.day_of_week, slot.start_time, slot.schedule_id))
     return slots
+
+
+# ПОЧЕМУ: «две недели вперёд» — скользящее окно «сегодня + 13 дней», а не
+# календарные недели: каждый день недели попадает в него ровно дважды,
+# и в воскресенье родитель видит те же две недели, что и в понедельник
+TRIAL_WINDOW_DAYS: Final[int] = 14
+
+# ПОЧЕМУ: граница «ещё можно записаться» — за сколько до начала занятия
+# закрывается запись. Решение бизнеса (2026-09-27): до самого начала.
+# Задача 06 (lesson-time-cutoff) переиспользует is_lesson_bookable в чекауте
+BOOKING_CUTOFF: Final[datetime.timedelta] = datetime.timedelta(0)
+
+
+@dataclass(frozen=True, slots=True)
+class TrialSlots:
+    date_from: datetime.date
+    date_to: datetime.date
+    slots: list[WeekSlot]
+
+
+def lesson_starts_at(
+    session_date: datetime.date, start_time: datetime.time
+) -> datetime.datetime:
+    # ПОЧЕМУ: время групп хранится местным (Новосибирск) без пояса;
+    # make_aware берёт текущий пояс проекта, сравнение с now() идёт в UTC
+    return timezone.make_aware(datetime.datetime.combine(session_date, start_time))
+
+
+def is_lesson_bookable(
+    session_date: datetime.date,
+    start_time: datetime.time,
+    *,
+    now: datetime.datetime,
+) -> bool:
+    # ПОЧЕМУ: на вход — фактические дата и время занятия (после маски
+    # переноса), их отдаёт сетка; сама функция маски не применяет
+    return now < lesson_starts_at(session_date, start_time) - BOOKING_CUTOFF
+
+
+def list_trial_slots(activity_id: int, *, now: datetime.datetime) -> TrialSlots:
+    # ПОЧЕМУ: окно режется из недельных сеток build_week_grid — единственного
+    # места, где проецируются маски и считаются места на дату. Окно из 14 дней
+    # задевает 2–3 недели с понедельника; бюджет — 2 запроса на неделю.
+    # Известное ограничение — FIXME в build_week_grid: на перенесённом занятии
+    # пробные считаются по исходной дате, чекаут перепроверит места сам
+    date_from = timezone.localdate(now)
+    date_to = date_from + datetime.timedelta(days=TRIAL_WINDOW_DAYS - 1)
+
+    candidates: list[WeekSlot] = []
+    week_start = normalize_week_start(date_from)
+    while week_start <= date_to:
+        candidates.extend(build_week_grid(week_start, activity_id=activity_id))
+        week_start += datetime.timedelta(weeks=1)
+
+    slots = [
+        slot
+        for slot in candidates
+        if not slot.is_cancelled
+        and slot.capacity_free > 0
+        and date_from <= slot.date <= date_to
+        and is_lesson_bookable(slot.date, slot.start_time, now=now)
+    ]
+    slots.sort(key=lambda slot: (slot.date, slot.start_time, slot.schedule_id))
+    return TrialSlots(date_from=date_from, date_to=date_to, slots=slots)
 
 
 def _load_masks(
