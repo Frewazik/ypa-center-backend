@@ -22,7 +22,11 @@ from apps.billing.models import (
     SubscriptionStatus,
     TransactionStatus,
 )
-from apps.events.models import SEAT_BLOCKING_STATUSES, EventRegistration
+from apps.events.models import (
+    SEAT_BLOCKING_STATUSES,
+    EventRegistration,
+    RegistrationStatus,
+)
 from apps.schedule.models import MaskType, ScheduleMask
 from apps.users.models import Parent, Student
 
@@ -32,6 +36,13 @@ UPCOMING_MAX_WEEKS: Final[int] = 8
 _HISTORY_STATUSES: Final = (SubscriptionStatus.ACTIVE, SubscriptionStatus.EXPIRED)
 
 UpcomingKind: TypeAlias = Literal["SUBSCRIPTION_SESSION", "TRIAL", "EVENT"]
+BookingKind: TypeAlias = Literal["TRIAL", "EVENT"]
+BookingPeriod: TypeAlias = Literal["upcoming", "past", "all"]
+BookingStatus: TypeAlias = Literal["PENDING", "CONFIRMED"]
+
+BOOKING_KINDS: Final[tuple[BookingKind, ...]] = ("TRIAL", "EVENT")
+BOOKING_PERIODS: Final[tuple[BookingPeriod, ...]] = ("upcoming", "past", "all")
+BOOKING_DEFAULT_PERIOD: Final[BookingPeriod] = "upcoming"
 
 
 _WEEKDAY_ABBR_RU: Final = ("ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС")
@@ -80,6 +91,26 @@ class TrialView:
     status: str
     cost: int | None
     created_at: datetime.datetime
+
+
+@dataclass(frozen=True, slots=True)
+class BookingView:
+    kind: BookingKind
+    id: int
+    title: str
+    group_name: str | None
+    date: datetime.date
+    start_time: datetime.time
+    end_time: datetime.time
+    cost: int | None
+    child_name: str
+    student_id: int | None
+    attendees_count: int | None
+    status: BookingStatus
+    status_display: str
+    is_past: bool
+    activity_id: int | None
+    event_id: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -505,11 +536,6 @@ def build_trial_views(trials: Iterable[Enrollment]) -> list[TrialView]:
     # прайс мог измениться после оформления
     views: list[TrialView] = []
     for trial in trials:
-        cost: int | None = None
-        for tx in trial.transactions.all():
-            if tx.status in (TransactionStatus.PENDING, TransactionStatus.SUCCEEDED):
-                cost = tx.amount
-                break
         views.append(
             TrialView(
                 id=trial.pk,
@@ -521,29 +547,45 @@ def build_trial_views(trials: Iterable[Enrollment]) -> list[TrialView]:
                 start_time=trial.schedule.start_time,
                 end_time=trial.schedule.end_time,
                 status=trial.status,
-                cost=cost,
+                cost=_trial_cost(trial),
                 created_at=trial.created_at,
             )
         )
     return views
 
 
+def _trial_cost(trial: Enrollment) -> int | None:
+    # Перебор в Python, а не filter(): транзакции уже догружены prefetch'ем,
+    # filter() дал бы по запросу на каждое пробное
+    for tx in trial.transactions.all():
+        if tx.status in (TransactionStatus.PENDING, TransactionStatus.SUCCEEDED):
+            return tx.amount
+    return None
+
+
+def parent_event_registrations(parent: Parent) -> QuerySet[EventRegistration]:
+    # ПОЧЕМУ не по телефону: телефон в анкете не подтверждается — вписав
+    # чужой номер, можно было увидеть чужих детей. Email подтверждён кодом
+    # при входе. Гостевые (без входа) дотягиваем только по email и только
+    # ничьи: регистрацию другого родителя с нашим email не показываем.
+    # Пустой email гостя ни с чем не совпадёт — у родителя email есть всегда
+    ownership = Q(parent=parent)
+    if parent.email:
+        ownership |= Q(parent__isnull=True, email__iexact=parent.email)
+    return EventRegistration.objects.filter(ownership)
+
+
 def _upcoming_event_items(
     parent: Parent, *, start: datetime.date, end: datetime.date
 ) -> list[UpcomingItem]:
-    # Гостевые регистрации дотягиваются в ЛК по совпадению номера телефона
-    ownership = Q(parent=parent)
-    if parent.phone:
-        ownership |= Q(phone=parent.phone)
     registrations = (
-        EventRegistration.objects.filter(
-            ownership,
+        parent_event_registrations(parent)
+        .filter(
             status__in=SEAT_BLOCKING_STATUSES,
             event__start_datetime__date__gte=start,
             event__start_datetime__date__lt=end,
         )
         .select_related("event")
-        .distinct()
     )
     items: list[UpcomingItem] = []
     for registration in registrations:
@@ -568,3 +610,139 @@ def _upcoming_event_items(
             )
         )
     return items
+
+
+_TRIAL_BOOKING_STATUS: Final[dict[str, BookingStatus]] = {
+    EnrollmentStatus.HELD: "PENDING",
+    EnrollmentStatus.ENROLLED: "CONFIRMED",
+}
+_EVENT_BOOKING_STATUS: Final[dict[str, BookingStatus]] = {
+    RegistrationStatus.NEW: "PENDING",
+    RegistrationStatus.PENDING_PAYMENT: "PENDING",
+    RegistrationStatus.CONFIRMED: "CONFIRMED",
+}
+# Текст по исходному статусу: NEW и PENDING_PAYMENT для фронта оба PENDING,
+# но родителю важно, чего именно ждём
+_TRIAL_STATUS_DISPLAY: Final[dict[str, str]] = {
+    EnrollmentStatus.HELD: "Ожидает оплаты",
+    EnrollmentStatus.ENROLLED: "Записан",
+}
+_EVENT_STATUS_DISPLAY: Final[dict[str, str]] = {
+    RegistrationStatus.NEW: "Ожидает подтверждения",
+    RegistrationStatus.PENDING_PAYMENT: "Ожидает оплаты",
+    RegistrationStatus.CONFIRMED: "Записан",
+}
+
+
+def build_bookings(
+    parent: Parent,
+    *,
+    period: BookingPeriod,
+    kind: BookingKind | None = None,
+) -> list[BookingView]:
+    # ПОЧЕМУ слияние в Python, а не UNION в SQL: у родителя десятки таких
+    # записей (пробное — одно на ребёнка на кружок), а дата в таблицах разной
+    # формы: «дата + время группы» против момента с часовым поясом. Запросов
+    # не больше трёх при любом объёме: пробные, их транзакции, регистрации.
+    # Отменённые не показываем — это в основном брошенные оплаты
+    today = timezone.localdate()
+    bookings: list[BookingView] = []
+    if kind in (None, "TRIAL"):
+        bookings.extend(_trial_bookings(parent, period=period, today=today))
+    if kind in (None, "EVENT"):
+        bookings.extend(_event_bookings(parent, period=period, today=today))
+
+    # ПОЧЕМУ хвост (kind, id): две записи в одну минуту иначе меняются
+    # местами между запросами и при листании попадают на две страницы
+    def sort_key(
+        booking: BookingView,
+    ) -> tuple[datetime.date, datetime.time, str, int]:
+        return (booking.date, booking.start_time, booking.kind, booking.id)
+
+    # Предстоящие — ближайшие сверху, прошедшие — свежие сверху; в «all»
+    # сначала предстоящие, за ними история
+    upcoming = sorted((b for b in bookings if not b.is_past), key=sort_key)
+    past = sorted((b for b in bookings if b.is_past), key=sort_key, reverse=True)
+    return upcoming + past
+
+
+def _trial_bookings(
+    parent: Parent, *, period: BookingPeriod, today: datetime.date
+) -> list[BookingView]:
+    trials = parent_trials_query(parent)
+    if period == "upcoming":
+        trials = trials.filter(trial_date__gte=today)
+    elif period == "past":
+        trials = trials.filter(trial_date__lt=today)
+    bookings: list[BookingView] = []
+    for trial in trials:
+        # ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ: время — штатное время группы, маски переноса
+        # не учитываются (как в /me/trials и /me/upcoming). Лечится общей
+        # функцией «занятие группы на дату» в schedule
+        trial_date = cast(datetime.date, trial.trial_date)
+        bookings.append(
+            BookingView(
+                kind="TRIAL",
+                id=trial.pk,
+                title=trial.schedule.activity.name,
+                group_name=trial.schedule.group_name,
+                date=trial_date,
+                start_time=trial.schedule.start_time,
+                end_time=trial.schedule.end_time,
+                cost=_trial_cost(trial),
+                child_name=trial.student.full_name,
+                student_id=trial.student.pk,
+                attendees_count=None,
+                status=_TRIAL_BOOKING_STATUS[trial.status],
+                status_display=_TRIAL_STATUS_DISPLAY[trial.status],
+                is_past=trial_date < today,
+                activity_id=trial.schedule.activity_id,
+                event_id=None,
+            )
+        )
+    return bookings
+
+
+def _event_bookings(
+    parent: Parent, *, period: BookingPeriod, today: datetime.date
+) -> list[BookingView]:
+    # ПОЧЕМУ граница — начало местных суток, а не now(): «прошло» считаем
+    # по дате, как у пробных — сегодняшнее событие предстоящее до полуночи
+    day_start = timezone.make_aware(datetime.datetime.combine(today, datetime.time.min))
+    registrations = (
+        parent_event_registrations(parent)
+        .exclude(status=RegistrationStatus.CANCELED)
+        .select_related("event")
+    )
+    if period == "upcoming":
+        registrations = registrations.filter(event__start_datetime__gte=day_start)
+    elif period == "past":
+        registrations = registrations.filter(event__start_datetime__lt=day_start)
+    bookings: list[BookingView] = []
+    for registration in registrations:
+        event = registration.event
+        event_start = timezone.localtime(event.start_datetime)
+        event_end = event_start + datetime.timedelta(minutes=event.duration_minutes)
+        bookings.append(
+            BookingView(
+                kind="EVENT",
+                id=registration.pk,
+                title=event.title,
+                group_name=None,
+                date=event_start.date(),
+                start_time=event_start.time(),
+                end_time=event_end.time(),
+                # ПОЧЕМУ не снапшот: цены в регистрации нет, а модель не
+                # меняем — после смены цены события карточка покажет новую
+                cost=event.price * registration.attendees_count,
+                child_name=registration.child_name,
+                student_id=None,
+                attendees_count=registration.attendees_count,
+                status=_EVENT_BOOKING_STATUS[registration.status],
+                status_display=_EVENT_STATUS_DISPLAY[registration.status],
+                is_past=event_start.date() < today,
+                activity_id=None,
+                event_id=event.pk,
+            )
+        )
+    return bookings

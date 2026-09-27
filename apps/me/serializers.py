@@ -152,6 +152,39 @@ class TrialViewSerializer(serializers.Serializer):
     created_at = serializers.DateTimeField(read_only=True)
 
 
+class BookingSerializer(serializers.Serializer):
+    kind = serializers.ChoiceField(
+        choices=[("TRIAL", "Пробное занятие"), ("EVENT", "Событие")],
+        read_only=True,
+    )
+    # id строки своей таблицы: у пробного и события могут совпасть —
+    # уникальный ключ карточки только пара (kind, id)
+    id = serializers.IntegerField(read_only=True)
+    title = serializers.CharField(read_only=True)
+    group_name = serializers.CharField(
+        read_only=True, allow_null=True, allow_blank=True
+    )
+    date = serializers.DateField(read_only=True)
+    start_time = serializers.TimeField(read_only=True, format=TIME_FORMAT)
+    end_time = serializers.TimeField(read_only=True, format=TIME_FORMAT)
+    cost = serializers.IntegerField(
+        read_only=True,
+        allow_null=True,
+        help_text="Копейки. Событие — цена × участники; null — цены не из чего взять",
+    )
+    child_name = serializers.CharField(read_only=True)
+    student_id = serializers.IntegerField(read_only=True, allow_null=True)
+    attendees_count = serializers.IntegerField(read_only=True, allow_null=True)
+    status = serializers.ChoiceField(
+        choices=[("PENDING", "Ожидает"), ("CONFIRMED", "Записан")],
+        read_only=True,
+    )
+    status_display = serializers.CharField(read_only=True)
+    is_past = serializers.BooleanField(read_only=True)
+    activity_id = serializers.IntegerField(read_only=True, allow_null=True)
+    event_id = serializers.IntegerField(read_only=True, allow_null=True)
+
+
 class DepositBalanceSerializer(serializers.Serializer):
     balance = serializers.IntegerField(read_only=True)
 

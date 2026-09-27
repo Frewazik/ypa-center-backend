@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import cast
 
 from django.db.models import QuerySet
@@ -10,7 +11,7 @@ from drf_spectacular.utils import (
     extend_schema_view,
 )
 from rest_framework import generics, status
-from rest_framework.exceptions import APIException
+from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -24,6 +25,7 @@ from apps.core.pagination import (
 )
 from apps.me.serializers import (
     ActiveEnrollmentSerializer,
+    BookingSerializer,
     ChildSerializer,
     DepositBalanceSerializer,
     DepositEntryViewSerializer,
@@ -33,11 +35,17 @@ from apps.me.serializers import (
     UpcomingItemSerializer,
 )
 from apps.me.services import (
+    BOOKING_DEFAULT_PERIOD,
+    BOOKING_KINDS,
+    BOOKING_PERIODS,
     UPCOMING_DEFAULT_WEEKS,
     UPCOMING_MAX_WEEKS,
     ActiveEnrollmentView,
+    BookingKind,
+    BookingPeriod,
     ChildHasActiveEnrollmentsError,
     archive_child,
+    build_bookings,
     build_deposit_entry_views,
     build_subscription_views,
     build_trial_views,
@@ -193,8 +201,13 @@ class SubscriptionListView(APIView):
 
 @extend_schema(
     operation_id="me_trials",
-    summary="Пробные занятия детей родителя",
-    description="Новые по дате пробного сверху." + _PAGINATION_NOTE,
+    summary="Пробные занятия детей родителя (устарела)",
+    description=(
+        "Устарела: используйте GET /me/bookings/?kind=TRIAL — там пробные "
+        "вместе с событиями в одном формате. Работает, пока фронт не перейдёт. "
+        "Новые по дате пробного сверху." + _PAGINATION_NOTE
+    ),
+    deprecated=True,
     parameters=LIMIT_OFFSET_PARAMETERS,
     responses=TrialViewSerializer(many=True),
 )
@@ -204,6 +217,67 @@ class TrialListView(APIView):
             request,
             parent_trials_query(_current_parent(request)),
             lambda page: TrialViewSerializer(build_trial_views(page), many=True).data,
+        )
+
+
+def _parse_choice_param(
+    raw: str | None, field: str, choices: Sequence[str]
+) -> str | None:
+    # Пустое значение = параметра нет, как у parse_int_param
+    if raw is None or raw == "":
+        return None
+    if raw not in choices:
+        raise ValidationError(
+            {field: [f"Допустимые значения: {', '.join(choices)}."]},
+            code="VALIDATION_ERROR",
+        )
+    return raw
+
+
+@extend_schema(
+    operation_id="me_bookings",
+    summary="Мои записи: пробные занятия и события одной лентой",
+    description=(
+        "period=upcoming (по умолчанию) — ближайшие сверху; past — свежие "
+        "сверху; all — сначала предстоящие, потом прошедшие. «Прошло» — по "
+        "дате: сегодняшнее ещё предстоящее. Отменённые не показываются. "
+        "status: PENDING — ждёт оплаты/подтверждения, CONFIRMED — записан. "
+        "Уникальный ключ карточки — пара (kind, id)." + _PAGINATION_NOTE
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="period",
+            type=str,
+            required=False,
+            enum=list(BOOKING_PERIODS),
+        ),
+        OpenApiParameter(
+            name="kind",
+            type=str,
+            required=False,
+            enum=list(BOOKING_KINDS),
+            description="Без параметра — оба вида.",
+        ),
+        *LIMIT_OFFSET_PARAMETERS,
+    ],
+    responses=BookingSerializer(many=True),
+)
+class BookingListView(APIView):
+    def get(self, request: Request) -> Response:
+        params = request.query_params
+        period = _parse_choice_param(params.get("period"), "period", BOOKING_PERIODS)
+        kind = _parse_choice_param(params.get("kind"), "kind", BOOKING_KINDS)
+        # ПОЧЕМУ срез в Python: лента склеивается из двух таблиц, у родителя
+        # в ней десятки строк — см. build_bookings
+        items = build_bookings(
+            _current_parent(request),
+            period=cast(BookingPeriod, period or BOOKING_DEFAULT_PERIOD),
+            kind=cast("BookingKind | None", kind),
+        )
+        return paginated_response(
+            request,
+            items,
+            lambda page: BookingSerializer(page, many=True).data,
         )
 
 
