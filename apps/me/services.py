@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import datetime
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Final, Literal, TypeAlias, cast
+from typing import Any, Final, Literal, TypeAlias, cast
 
 from django.db import IntegrityError, transaction
-from django.db.models import Prefetch, Q
+from django.db.models import Case, IntegerField, Prefetch, Q, QuerySet, When
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework.exceptions import NotFound, ValidationError
@@ -27,6 +28,8 @@ from apps.users.models import Parent, Student
 
 UPCOMING_DEFAULT_WEEKS: Final[int] = 4
 UPCOMING_MAX_WEEKS: Final[int] = 8
+
+_HISTORY_STATUSES: Final = (SubscriptionStatus.ACTIVE, SubscriptionStatus.EXPIRED)
 
 UpcomingKind: TypeAlias = Literal["SUBSCRIPTION_SESSION", "TRIAL", "EVENT"]
 
@@ -216,25 +219,64 @@ def _active_enrollments(child: Student) -> list[ActiveEnrollmentView]:
     ]
 
 
-def list_parent_subscriptions(parent: Parent) -> list[SubscriptionView]:
-    enrollments_qs = Enrollment.objects.filter(
-        status=EnrollmentStatus.ENROLLED
-    ).select_related("student", "schedule__activity")
-    subscriptions = (
-        Subscription.objects.filter(parent=parent)
-        .exclude(status=SubscriptionStatus.DRAFT)
+def parent_subscriptions_query(parent: Parent) -> QuerySet[Subscription]:
+    # ПОЧЕМУ только ACTIVE/EXPIRED: в них абонемент попадает лишь после
+    # оплаты (вебхук PENDING → ACTIVE, свипер ACTIVE → EXPIRED). PENDING и
+    # CANCELED — незавершённые и брошенные оплаты, это не история покупок
+    # ПОЧЕМУ записи всех статусов: при истечении свипер отменяет все записи
+    # абонемента, а имя ребёнка и группы истории берутся именно из них
+    enrollments_qs = Enrollment.objects.select_related(
+        "student", "schedule__activity"
+    ).order_by("pk")
+    return (
+        Subscription.objects.filter(parent=parent, status__in=_HISTORY_STATUSES)
         .prefetch_related("slots", Prefetch("enrollments", queryset=enrollments_qs))
-        .order_by("-created_at")
+        # Действующие сверху; -pk делает порядок однозначным — иначе при
+        # равном created_at абонемент мог попасть на две страницы
+        .order_by(
+            Case(
+                When(status=SubscriptionStatus.ACTIVE, then=0),
+                default=1,
+                output_field=IntegerField(),
+            ),
+            "-created_at",
+            "-pk",
+        )
     )
 
+
+def build_subscription_views(
+    subscriptions: Iterable[Subscription],
+) -> list[SubscriptionView]:
     views: list[SubscriptionView] = []
     for subscription in subscriptions:
-        slots_by_schedule = {slot.slot_id: slot for slot in subscription.slots.all()}
+        slots = sorted(subscription.slots.all(), key=lambda slot: slot.pk)
+        slots_by_schedule = {slot.slot_id: slot for slot in slots}
+        enrollments = list(subscription.enrollments.all())
+        # Абонемент всегда на одного ребёнка: чекаут принимает один student_id
+        student_name = enrollments[0].student.full_name if enrollments else ""
+        if subscription.status == SubscriptionStatus.ACTIVE:
+            # ПОЧЕМУ: действующий — куда ребёнок ходит сейчас, только живые записи
+            schedules = [
+                enrollment.schedule
+                for enrollment in enrollments
+                if enrollment.status == EnrollmentStatus.ENROLLED
+            ]
+        else:
+            # История — что было куплено: состав покупки лежит в слотах,
+            # записи свипер уже отменил. Остаток фишек у истёкшего 0 — он
+            # ушёл деньгами на депозит (_credit_unused_sessions)
+            schedule_by_id = {
+                enrollment.schedule_id: enrollment.schedule
+                for enrollment in enrollments
+            }
+            schedules = [
+                schedule_by_id[slot.slot_id]
+                for slot in slots
+                if slot.slot_id in schedule_by_id
+            ]
         slot_views: list[SubscriptionSlotView] = []
-        student_name = ""
-        for enrollment in subscription.enrollments.all():
-            schedule = enrollment.schedule
-            student_name = enrollment.student.full_name
+        for schedule in schedules:
             slot = slots_by_schedule.get(schedule.pk)
             schedule_str = (
                 f"{_WEEKDAY_ABBR_RU[schedule.day_of_week]} "
@@ -279,11 +321,13 @@ def get_parent_deposit_balance(parent: Parent) -> int:
     return balance or 0
 
 
-def list_parent_deposit_entries(parent: Parent) -> list[DepositEntryView]:
+def parent_deposit_entries_query(
+    parent: Parent,
+) -> QuerySet[DepositEntry, Mapping[str, Any]]:
     # ПОЧЕМУ Coalesce: начисление при истечении ссылается на абонемент
     # напрямую, а списание и возврат — через транзакцию чекаута. Фронту
     # отдаём один subscription_id, склейка — одним LEFT JOIN в том же запросе
-    rows = (
+    return (
         DepositEntry.objects.filter(deposit__parent=parent)
         .annotate(
             source_subscription_id=Coalesce(
@@ -293,6 +337,11 @@ def list_parent_deposit_entries(parent: Parent) -> list[DepositEntryView]:
         .order_by("-created_at", "-pk")
         .values("pk", "amount", "reason", "created_at", "source_subscription_id")
     )
+
+
+def build_deposit_entry_views(
+    rows: Iterable[Mapping[str, Any]],
+) -> list[DepositEntryView]:
     views: list[DepositEntryView] = []
     for row in rows:
         reason = row["reason"]
@@ -384,7 +433,18 @@ def build_upcoming_feed(
     if child_id is None:
         items.extend(_upcoming_event_items(parent, start=start, end=end))
 
-    items.sort(key=lambda item: (item.date, item.start_time))
+    # ПОЧЕМУ хвост ключа: занятия двух детей в одно время иначе меняются
+    # местами между запросами (выборка записей без order_by), и при
+    # постраничной выдаче одно попадает на две страницы, а другое ни на одну
+    items.sort(
+        key=lambda item: (
+            item.date,
+            item.start_time,
+            item.kind,
+            item.student_id or 0,
+            item.source_id,
+        )
+    )
     return items
 
 
@@ -427,10 +487,8 @@ def _upcoming_trial_items(
     ]
 
 
-def list_parent_trials(parent: Parent) -> list[TrialView]:
-    # ПОЧЕМУ: cost — снапшот из транзакции покупки, а не текущая цена кружка;
-    # прайс мог измениться после оформления
-    trials = (
+def parent_trials_query(parent: Parent) -> QuerySet[Enrollment]:
+    return (
         Enrollment.objects.filter(
             student__parent=parent,
             type=EnrollmentType.TRIAL,
@@ -440,6 +498,11 @@ def list_parent_trials(parent: Parent) -> list[TrialView]:
         .prefetch_related("transactions")
         .order_by("-trial_date", "-id")
     )
+
+
+def build_trial_views(trials: Iterable[Enrollment]) -> list[TrialView]:
+    # ПОЧЕМУ: cost — снапшот из транзакции покупки, а не текущая цена кружка;
+    # прайс мог измениться после оформления
     views: list[TrialView] = []
     for trial in trials:
         cost: int | None = None

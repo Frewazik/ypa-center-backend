@@ -300,14 +300,44 @@ class TestPublicGallery:
         assert second.status_code == status.HTTP_200_OK
 
     def test_limit_is_capped_at_max(self, api_client: APIClient) -> None:
-        for i in range(3):
-            GalleryImageFactory(order=i)
+        GalleryImageFactory.create_batch(61)
 
         response = api_client.get(f"{GALLERY_URL}?limit=9999")
 
         assert response.status_code == status.HTTP_200_OK
         # max_limit=60 — запрос выше потолка не роняется, просто ограничивается
-        assert len(response.json()["results"]) == 3
+        body = response.json()
+        assert body["count"] == 61
+        assert len(body["results"]) == 60
+        assert body["next"] is not None
+
+    @pytest.mark.parametrize(
+        "query",
+        ["limit=0", "limit=-1", "limit=abc", "limit=²", "limit=2&offset=-1"],
+    )
+    def test_bad_limit_or_offset_is_422_not_whole_list(
+        self, api_client: APIClient, query: str
+    ) -> None:
+        # ПОЧЕМУ: DRF на такие значения молча выключал пагинацию и отдавал
+        # весь список в обход max_limit
+        GalleryImageFactory.create_batch(2)
+
+        response = api_client.get(f"{GALLERY_URL}?{query}")
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        body = response.json()
+        assert body["code"] == "VALIDATION_ERROR"
+        field = query.rsplit("&", 1)[-1].split("=")[0]
+        invalid = body["extensions"]["invalid_params"]
+        assert [p["name"] for p in invalid] == [field]
+
+    def test_empty_limit_means_no_pagination(self, api_client: APIClient) -> None:
+        GalleryImageFactory.create_batch(2)
+
+        response = api_client.get(f"{GALLERY_URL}?limit=")
+
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.json()) == 2
 
 
 class TestPublicEvents:

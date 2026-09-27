@@ -10,13 +10,18 @@ from drf_spectacular.utils import (
     extend_schema_view,
 )
 from rest_framework import generics, status
-from rest_framework.exceptions import APIException, ValidationError
+from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.serializers import BaseSerializer
 from rest_framework.views import APIView
 
+from apps.core.pagination import (
+    LIMIT_OFFSET_PARAMETERS,
+    paginated_response,
+    parse_int_param,
+)
 from apps.me.serializers import (
     ActiveEnrollmentSerializer,
     ChildSerializer,
@@ -33,12 +38,15 @@ from apps.me.services import (
     ActiveEnrollmentView,
     ChildHasActiveEnrollmentsError,
     archive_child,
+    build_deposit_entry_views,
+    build_subscription_views,
+    build_trial_views,
     build_upcoming_feed,
     create_child,
     get_parent_deposit_balance,
-    list_parent_deposit_entries,
-    list_parent_subscriptions,
-    list_parent_trials,
+    parent_deposit_entries_query,
+    parent_subscriptions_query,
+    parent_trials_query,
     update_child,
 )
 from apps.users.models import Parent, Student
@@ -153,26 +161,50 @@ class ChildDetailView(generics.UpdateAPIView[Student]):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+_PAGINATION_NOTE = (
+    " Без limit — весь список массивом; с ?limit=N&offset=M — конверт "
+    "{count, next, previous, results}, где results — те же элементы."
+)
+
+
 @extend_schema(
     operation_id="me_subscriptions",
-    summary="Мои абонементы с балансом по слотам",
+    summary="Мои абонементы: действующие и история",
+    description=(
+        "Только оплаченные: ACTIVE (сверху) и EXPIRED, внутри — новые сверху. "
+        "У истёкшего — все купленные слоты, остаток 0 (он ушёл на депозит)."
+        + _PAGINATION_NOTE
+    ),
+    parameters=LIMIT_OFFSET_PARAMETERS,
     responses=SubscriptionViewSerializer(many=True),
 )
 class SubscriptionListView(APIView):
     def get(self, request: Request) -> Response:
-        views = list_parent_subscriptions(_current_parent(request))
-        return Response(SubscriptionViewSerializer(views, many=True).data)
+        return paginated_response(
+            request,
+            parent_subscriptions_query(_current_parent(request)),
+            lambda page: (
+                SubscriptionViewSerializer(
+                    build_subscription_views(page), many=True
+                ).data
+            ),
+        )
 
 
 @extend_schema(
     operation_id="me_trials",
     summary="Пробные занятия детей родителя",
+    description="Новые по дате пробного сверху." + _PAGINATION_NOTE,
+    parameters=LIMIT_OFFSET_PARAMETERS,
     responses=TrialViewSerializer(many=True),
 )
 class TrialListView(APIView):
     def get(self, request: Request) -> Response:
-        views = list_parent_trials(_current_parent(request))
-        return Response(TrialViewSerializer(views, many=True).data)
+        return paginated_response(
+            request,
+            parent_trials_query(_current_parent(request)),
+            lambda page: TrialViewSerializer(build_trial_views(page), many=True).data,
+        )
 
 
 @extend_schema(
@@ -194,44 +226,53 @@ class DepositBalanceView(APIView):
     operation_id="me_deposit_entries",
     summary="История движений депозита",
     description=(
-        "Новые сверху. amount со знаком: плюс — начисление, минус — списание. "
-        "Пока без пагинации — весь список массивом."
+        "Новые сверху. amount со знаком: плюс — начисление, минус — списание."
+        + _PAGINATION_NOTE
     ),
+    parameters=LIMIT_OFFSET_PARAMETERS,
     responses=DepositEntryViewSerializer(many=True),
 )
 class DepositEntryListView(APIView):
     def get(self, request: Request) -> Response:
-        views = list_parent_deposit_entries(_current_parent(request))
-        return Response(DepositEntryViewSerializer(views, many=True).data)
+        return paginated_response(
+            request,
+            parent_deposit_entries_query(_current_parent(request)),
+            lambda page: (
+                DepositEntryViewSerializer(
+                    build_deposit_entry_views(page), many=True
+                ).data
+            ),
+        )
 
 
 @extend_schema(
     operation_id="me_upcoming",
     summary="Лента ближайших активностей (занятия + события)",
+    description=(
+        "Хронологически, ближайшие сверху. Горизонт weeks (по умолчанию 4, "
+        "максимум 8)." + _PAGINATION_NOTE
+    ),
     parameters=[
         OpenApiParameter(name="weeks", type=int, required=False),
         OpenApiParameter(name="child_id", type=int, required=False),
+        *LIMIT_OFFSET_PARAMETERS,
     ],
     responses=UpcomingItemSerializer(many=True),
 )
 class UpcomingFeedView(APIView):
     def get(self, request: Request) -> Response:
-        weeks = _positive_int(request.query_params.get("weeks"), "weeks")
-        child_id = _positive_int(request.query_params.get("child_id"), "child_id")
+        params = request.query_params
+        weeks = parse_int_param(params.get("weeks"), "weeks", minimum=1)
+        child_id = parse_int_param(params.get("child_id"), "child_id", minimum=1)
+        # ПОЧЕМУ срез в Python: будущих занятий нет в БД, лента собирается
+        # циклом по датам. Горизонт ≤ 8 недель — это десятки строк
         items = build_upcoming_feed(
             _current_parent(request),
             weeks=min(weeks or UPCOMING_DEFAULT_WEEKS, UPCOMING_MAX_WEEKS),
             child_id=child_id,
         )
-        return Response(UpcomingItemSerializer(items, many=True).data)
-
-
-def _positive_int(raw: str | None, field: str) -> int | None:
-    if raw is None or raw == "":
-        return None
-    if not raw.isdigit() or int(raw) < 1:
-        raise ValidationError(
-            {field: ["Ожидается целое число больше нуля."]},
-            code="VALIDATION_ERROR",
+        return paginated_response(
+            request,
+            items,
+            lambda page: UpcomingItemSerializer(page, many=True).data,
         )
-    return int(raw)

@@ -26,8 +26,10 @@ from apps.users.consent import (
 TIME_FORMAT = "%H:%M"
 DATE_FORMAT = "%d.%m.%Y"
 
-_NON_DRAFT_STATUS_CHOICES = [
-    c for c in SubscriptionStatus.choices if c[0] != SubscriptionStatus.DRAFT
+# ЛК показывает только оплаченные абонементы (parent_subscriptions_query)
+_HISTORY_STATUS_CHOICES = [
+    (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.ACTIVE.label),
+    (SubscriptionStatus.EXPIRED.value, SubscriptionStatus.EXPIRED.label),
 ]
 
 # ПОЧЕМУ: UNKNOWN ставит только миграция старым родителям — выбрать его
@@ -122,7 +124,7 @@ class SubscriptionViewSerializer(serializers.Serializer):
     id = serializers.IntegerField(read_only=True)
     display_id = serializers.CharField(read_only=True)
     status = serializers.ChoiceField(
-        choices=_NON_DRAFT_STATUS_CHOICES,
+        choices=_HISTORY_STATUS_CHOICES,
         read_only=True,
     )
     student_name = serializers.CharField(read_only=True, allow_blank=True)
