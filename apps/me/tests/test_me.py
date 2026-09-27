@@ -11,7 +11,8 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from apps.events.services import RegistrationSubmission, register_for_event
-from apps.events.tests.factories import EventFactory
+from apps.events.models import Event, EventRegistration, RegistrationStatus
+from apps.events.tests.factories import EventFactory, EventRegistrationFactory
 from apps.schedule.models import MaskType
 from apps.schedule.tests.factories import (
     ActivityFactory,
@@ -26,6 +27,7 @@ from apps.users.models import ConsentPurpose, Parent, PersonalDataConsent, Stude
 from apps.billing.models import (
     DepositEntry,
     DepositEntryReason,
+    Enrollment,
     EnrollmentStatus,
     ParentDeposit,
     Subscription,
@@ -48,6 +50,7 @@ UPCOMING_URL = "/api/v1/me/upcoming/"
 TRIALS_URL = "/api/v1/me/trials/"
 DEPOSIT_URL = "/api/v1/me/deposit/"
 DEPOSIT_ENTRIES_URL = "/api/v1/me/deposit/entries/"
+BOOKINGS_URL = "/api/v1/me/bookings/"
 
 
 @pytest.fixture
@@ -582,7 +585,13 @@ class TestSubscriptionHistory:
 
 
 # Ручки ЛК со списками: без ?limit — массив, с ?limit — конверт
-_PAGINATED_URLS = [SUBSCRIPTIONS_URL, TRIALS_URL, UPCOMING_URL, DEPOSIT_ENTRIES_URL]
+_PAGINATED_URLS = [
+    SUBSCRIPTIONS_URL,
+    TRIALS_URL,
+    UPCOMING_URL,
+    DEPOSIT_ENTRIES_URL,
+    BOOKINGS_URL,
+]
 
 
 class TestCabinetPagination:
@@ -804,31 +813,35 @@ class TestUpcomingFeed:
         dates = {item["date"] for item in response.json()}
         assert first_session.strftime("%d.%m.%Y") not in dates
 
-    def test_event_matched_by_phone(
+    def test_guest_event_matched_by_verified_email(
         self, api_client: APIClient, parent: Parent
     ) -> None:
         event = EventFactory(
             title="Настольные игры",
             start_datetime=timezone.now() + datetime.timedelta(days=3),
         )
-        register_for_event(
-            event.pk,
-            RegistrationSubmission(
-                child_name="Иван",
-                parent_name="Ольга",
-                phone=str(parent.phone),
-                email="",
-                attendees_count=2,
-                source="",
-                comment="",
-            ),
-        )
+        _guest_registration(event, email=parent.email.upper())
 
         response = api_client.get(UPCOMING_URL)
 
         events = [item for item in response.json() if item["kind"] == "EVENT"]
         assert len(events) == 1
         assert events[0]["title"] == "Настольные игры"
+
+    def test_event_not_matched_by_phone(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        # Телефон в анкете не подтверждается: вписав чужой номер, раньше
+        # можно было увидеть чужие регистрации с именами детей
+        event = EventFactory(start_datetime=timezone.now() + datetime.timedelta(days=3))
+        _guest_registration(event, phone=str(parent.phone))
+        EventRegistrationFactory(
+            event=event, parent=ParentFactory(), phone=str(parent.phone)
+        )
+
+        response = api_client.get(UPCOMING_URL)
+
+        assert [item for item in response.json() if item["kind"] == "EVENT"] == []
 
     def test_child_filter(self, api_client: APIClient, parent: Parent) -> None:
         first = StudentFactory(parent=parent)
@@ -931,6 +944,369 @@ class TestUpcomingTrials:
         response = api_client.get(UPCOMING_URL, {"child_id": student.pk})
 
         assert [item["kind"] for item in response.json()] == ["TRIAL"]
+
+
+def _guest_registration(
+    event: Event, *, email: str = "", phone: str = "+79130000000"
+) -> EventRegistration:
+    # Регистрация с сайта без входа — parent не заполнен
+    return register_for_event(
+        event.pk,
+        RegistrationSubmission(
+            child_name="Иван",
+            parent_name="Ольга",
+            phone=phone,
+            email=email,
+            attendees_count=1,
+            source="",
+            comment="",
+        ),
+    )
+
+
+def _local_moment(day: datetime.date, hour: int, minute: int = 0) -> datetime.datetime:
+    return timezone.make_aware(
+        datetime.datetime.combine(day, datetime.time(hour, minute))
+    )
+
+
+def _paid_trial(
+    student: Student,
+    *,
+    days: int,
+    cost: int = 50_000,
+    status: str = "ENROLLED",
+    **extra: object,
+) -> Enrollment:
+    trial = EnrollmentFactory(
+        student=student,
+        trial=True,
+        status=status,
+        trial_date=timezone.localdate() + datetime.timedelta(days=days),
+        **extra,
+    )
+    Transaction.objects.create(
+        parent=student.parent,
+        enrollment=trial,
+        amount=cost,
+        status=(
+            TransactionStatus.CANCELED
+            if status == "CANCELED"
+            else TransactionStatus.SUCCEEDED
+        ),
+    )
+    return trial
+
+
+def _my_event(
+    parent: Parent, *, days: int, hour: int = 11, **extra: object
+) -> EventRegistration:
+    event = EventFactory(
+        start_datetime=_local_moment(
+            timezone.localdate() + datetime.timedelta(days=days), hour
+        )
+    )
+    return EventRegistrationFactory(
+        event=event,
+        parent=parent,
+        **{"status": RegistrationStatus.CONFIRMED, **extra},
+    )
+
+
+def _keys(items: list[dict[str, object]]) -> list[tuple[object, object]]:
+    return [(item["kind"], item["id"]) for item in items]
+
+
+class TestBookings:
+    def test_trial_card(self, api_client: APIClient, parent: Parent) -> None:
+        student = StudentFactory(parent=parent, full_name="Иванов Иван")
+        schedule = ScheduleFactory(
+            activity=ActivityFactory(name="Английский язык"),
+            group_name="Начинающие",
+        )
+        trial = _paid_trial(student, days=3, cost=120_000, schedule=schedule)
+
+        (card,) = api_client.get(BOOKINGS_URL).json()
+
+        assert card == {
+            "kind": "TRIAL",
+            "id": trial.pk,
+            "title": "Английский язык",
+            "group_name": "Начинающие",
+            "date": trial.trial_date.isoformat(),
+            "start_time": schedule.start_time.strftime("%H:%M"),
+            "end_time": schedule.end_time.strftime("%H:%M"),
+            "cost": 120_000,
+            "child_name": "Иванов Иван",
+            "student_id": student.pk,
+            "attendees_count": None,
+            "status": "CONFIRMED",
+            "status_display": "Записан",
+            "is_past": False,
+            "activity_id": schedule.activity_id,
+            "event_id": None,
+        }
+
+    def test_event_card_in_local_time_with_total_cost(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        day = timezone.localdate() + datetime.timedelta(days=4)
+        event = EventFactory(
+            title="Театральные игры",
+            start_datetime=_local_moment(day, 11),
+            duration_minutes=90,
+            price=60_000,
+        )
+        registration = EventRegistrationFactory(
+            event=event,
+            parent=parent,
+            child_name="Ваня",
+            attendees_count=2,
+            status=RegistrationStatus.PENDING_PAYMENT,
+        )
+
+        (card,) = api_client.get(BOOKINGS_URL).json()
+
+        assert card == {
+            "kind": "EVENT",
+            "id": registration.pk,
+            "title": "Театральные игры",
+            "group_name": None,
+            "date": day.isoformat(),
+            "start_time": "11:00",
+            "end_time": "12:30",
+            "cost": 120_000,
+            "child_name": "Ваня",
+            "student_id": None,
+            "attendees_count": 2,
+            "status": "PENDING",
+            "status_display": "Ожидает оплаты",
+            "is_past": False,
+            "activity_id": None,
+            "event_id": event.pk,
+        }
+
+    def test_free_event_costs_zero_and_new_awaits_confirmation(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        _my_event(parent, days=2, status=RegistrationStatus.NEW)
+
+        (card,) = api_client.get(BOOKINGS_URL).json()
+
+        assert card["cost"] == 0
+        assert card["status"] == "PENDING"
+        assert card["status_display"] == "Ожидает подтверждения"
+
+    def test_unpaid_trial_hold_is_pending(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        _paid_trial(StudentFactory(parent=parent), days=2, status="HELD")
+
+        (card,) = api_client.get(BOOKINGS_URL).json()
+
+        assert (card["status"], card["status_display"]) == (
+            "PENDING",
+            "Ожидает оплаты",
+        )
+
+    def test_mixed_feed_sorted_by_date(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        student = StudentFactory(parent=parent)
+        trial_in_3 = _paid_trial(student, days=3)
+        trial_in_5 = _paid_trial(student, days=5)
+        event_in_1 = _my_event(parent, days=1)
+        event_in_4 = _my_event(parent, days=4)
+
+        items = api_client.get(BOOKINGS_URL).json()
+
+        assert _keys(items) == [
+            ("EVENT", event_in_1.pk),
+            ("TRIAL", trial_in_3.pk),
+            ("EVENT", event_in_4.pk),
+            ("TRIAL", trial_in_5.pk),
+        ]
+
+    def test_same_day_sorted_by_time(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        late = _my_event(parent, days=2, hour=18)
+        early = _my_event(parent, days=2, hour=9)
+
+        items = api_client.get(BOOKINGS_URL).json()
+
+        assert _keys(items) == [("EVENT", early.pk), ("EVENT", late.pk)]
+
+    def test_periods(self, api_client: APIClient, parent: Parent) -> None:
+        student = StudentFactory(parent=parent)
+        future_trial = _paid_trial(student, days=2)
+        future_event = _my_event(parent, days=1)
+        old_trial = _paid_trial(student, days=-10)
+        recent_event = _my_event(parent, days=-2)
+
+        upcoming = api_client.get(BOOKINGS_URL).json()
+        past = api_client.get(BOOKINGS_URL, {"period": "past"}).json()
+        everything = api_client.get(BOOKINGS_URL, {"period": "all"}).json()
+
+        future = [("EVENT", future_event.pk), ("TRIAL", future_trial.pk)]
+        # Прошедшие — свежие сверху
+        history = [("EVENT", recent_event.pk), ("TRIAL", old_trial.pk)]
+        assert _keys(upcoming) == future
+        assert _keys(past) == history
+        assert _keys(everything) == future + history
+        assert [item["is_past"] for item in everything] == [False, False, True, True]
+
+    def test_today_counts_as_upcoming_until_midnight(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        # Событие сегодня в 00:30 уже началось, но «прошло» считаем по дате
+        event = EventFactory(start_datetime=_local_moment(timezone.localdate(), 0, 30))
+        registration = EventRegistrationFactory(event=event, parent=parent)
+        trial = _paid_trial(StudentFactory(parent=parent), days=0)
+
+        upcoming = api_client.get(BOOKINGS_URL).json()
+        past = api_client.get(BOOKINGS_URL, {"period": "past"}).json()
+
+        assert set(_keys(upcoming)) == {
+            ("EVENT", registration.pk),
+            ("TRIAL", trial.pk),
+        }
+        assert past == []
+
+    def test_kind_filter(self, api_client: APIClient, parent: Parent) -> None:
+        trial = _paid_trial(StudentFactory(parent=parent), days=2)
+        registration = _my_event(parent, days=2)
+
+        trials = api_client.get(BOOKINGS_URL, {"kind": "TRIAL"}).json()
+        events = api_client.get(BOOKINGS_URL, {"kind": "EVENT"}).json()
+
+        assert _keys(trials) == [("TRIAL", trial.pk)]
+        assert _keys(events) == [("EVENT", registration.pk)]
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("period", "future"), ("period", "UPCOMING"), ("kind", "trial")],
+    )
+    def test_bad_filter_is_422(
+        self, api_client: APIClient, field: str, value: str
+    ) -> None:
+        response = api_client.get(BOOKINGS_URL, {field: value})
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        body = response.json()
+        assert body["code"] == "VALIDATION_ERROR"
+        assert [p["name"] for p in body["extensions"]["invalid_params"]] == [field]
+
+    def test_empty_filter_means_default(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        _paid_trial(StudentFactory(parent=parent), days=-3)
+
+        response = api_client.get(f"{BOOKINGS_URL}?period=&kind=")
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == []
+
+    def test_pages_keep_order_and_filters(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        student = StudentFactory(parent=parent)
+        expected = []
+        for days in (1, 2, 3):
+            expected.append(("EVENT", _my_event(parent, days=days).pk))
+            expected.append(("TRIAL", _paid_trial(student, days=days + 10).pk))
+        # События (через 1-3 дня) раньше всех пробных (через 11-13 дней)
+        expected.sort(key=lambda key: key[0] == "TRIAL")
+
+        first = api_client.get(BOOKINGS_URL, {"period": "all", "limit": 4}).json()
+        second = api_client.get(first["next"]).json()
+
+        assert first["count"] == 6
+        assert "period=all" in first["next"]
+        assert _keys(first["results"] + second["results"]) == expected
+        assert second["next"] is None
+
+    def test_foreign_bookings_are_invisible(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        _paid_trial(StudentFactory(), days=2)
+        _my_event(ParentFactory(), days=2)
+
+        assert api_client.get(BOOKINGS_URL, {"period": "all"}).json() == []
+
+    def test_same_phone_other_parent_is_invisible(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        event = EventFactory()
+        EventRegistrationFactory(
+            event=event, parent=ParentFactory(), phone=str(parent.phone)
+        )
+        _guest_registration(event, phone=str(parent.phone))
+
+        assert api_client.get(BOOKINGS_URL, {"period": "all"}).json() == []
+
+    def test_guest_registration_found_by_email(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        event = EventFactory()
+        mine = _guest_registration(event, email=parent.email.upper())
+        # Чужую регистрацию с моим email не показываем: у неё есть хозяин
+        EventRegistrationFactory(
+            event=event, parent=ParentFactory(), email=parent.email
+        )
+        # Гость без email ни с кем не совпадает
+        _guest_registration(event, email="")
+
+        items = api_client.get(BOOKINGS_URL).json()
+
+        assert _keys(items) == [("EVENT", mine.pk)]
+
+    def test_canceled_are_hidden(self, api_client: APIClient, parent: Parent) -> None:
+        _paid_trial(StudentFactory(parent=parent), days=2, status="CANCELED")
+        _my_event(parent, days=2, status=RegistrationStatus.CANCELED)
+
+        assert api_client.get(BOOKINGS_URL, {"period": "all"}).json() == []
+
+    def test_deleted_child_trial_stays(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        student = StudentFactory(parent=parent, full_name="Иванов Иван")
+        _paid_trial(student, days=-5)
+        student.archived_at = timezone.now()
+        student.save(update_fields=["archived_at"])
+
+        (card,) = api_client.get(BOOKINGS_URL, {"period": "past"}).json()
+
+        assert card["child_name"] == "Иванов Иван"
+
+    def test_query_count_is_fixed(
+        self,
+        api_client: APIClient,
+        parent: Parent,
+        django_assert_num_queries: DjangoAssertNumQueries,
+    ) -> None:
+        student = StudentFactory(parent=parent)
+        _paid_trial(student, days=1)
+        _my_event(parent, days=1)
+
+        # пробные + их транзакции + регистрации (с событием JOIN'ом)
+        with django_assert_num_queries(3):
+            api_client.get(BOOKINGS_URL)
+
+        for days in range(2, 7):
+            _paid_trial(StudentFactory(parent=parent), days=days)
+            _my_event(parent, days=days)
+
+        with django_assert_num_queries(3):
+            small = api_client.get(BOOKINGS_URL, {"limit": 2}).json()
+        with django_assert_num_queries(3):
+            whole = api_client.get(BOOKINGS_URL).json()
+        # Ненужную таблицу не трогаем
+        with django_assert_num_queries(1):
+            api_client.get(BOOKINGS_URL, {"kind": "EVENT"})
+
+        assert small["count"] == 12
+        assert len(whole) == 12
 
 
 class TestDeposit:
@@ -1084,6 +1460,7 @@ _GATED_ENDPOINTS = [
     ("get", UPCOMING_URL),
     ("get", DEPOSIT_URL),
     ("get", DEPOSIT_ENTRIES_URL),
+    ("get", BOOKINGS_URL),
     ("post", CHECKOUT_SUBSCRIPTION_URL),
     ("post", CHECKOUT_TRIAL_URL),
 ]
