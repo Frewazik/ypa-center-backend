@@ -29,6 +29,7 @@ class CallbackRequestCreateView(APIView):
     throttle_classes = (CallbackIPThrottle,)
 
     @extend_schema(
+        tags=["forms"],
         request=CallbackRequestCreateSerializer,
         responses={status.HTTP_202_ACCEPTED: SubmissionAcceptedSerializer},
         summary="Заказ обратного звонка",
@@ -49,6 +50,7 @@ class FeedbackRequestCreateView(APIView):
     throttle_classes = (FeedbackIPThrottle,)
 
     @extend_schema(
+        tags=["forms"],
         request=FeedbackRequestCreateSerializer,
         responses={status.HTTP_202_ACCEPTED: SubmissionAcceptedSerializer},
         summary="Обратная связь",

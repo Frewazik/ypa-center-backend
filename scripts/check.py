@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -46,6 +47,20 @@ def build_steps(*, fast: bool, fix: bool) -> list[Step]:
         Step(
             "makemigrations --check",
             [PY, "manage.py", "makemigrations", "--check", "--dry-run"],
+        ),
+        # ПОЧЕМУ: битый декоратор extend_schema не роняет тесты, а только
+        # портит Swagger — ловим любую ошибку или предупреждение генерации
+        Step(
+            "spectacular --fail-on-warn",
+            [
+                PY,
+                "manage.py",
+                "spectacular",
+                "--fail-on-warn",
+                "--validate",
+                "--file",
+                os.devnull,
+            ],
         ),
     ]
     if not fast:

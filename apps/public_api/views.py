@@ -5,7 +5,7 @@ from typing import Final
 
 from django.db.models import Count, Prefetch, Q, QuerySet
 from django.utils import timezone
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import extend_schema, extend_schema_view
 from rest_framework import generics
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
@@ -45,10 +45,13 @@ def _active_groups_queryset() -> QuerySet[Schedule]:
     )
 
 
-@extend_schema(
-    operation_id="public_activities_popular",
-    summary="Топ-3 популярных кружка",
-    responses=ActivityCardSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_activities_popular",
+        summary="Топ-3 популярных кружка",
+        responses=ActivityCardSerializer(many=True),
+        tags=["catalog"],
+    )
 )
 class PopularActivitiesView(generics.ListAPIView[Activity]):
     permission_classes = (AllowAny,)
@@ -81,10 +84,13 @@ class PopularActivitiesView(generics.ListAPIView[Activity]):
         )
 
 
-@extend_schema(
-    operation_id="public_activities_list",
-    summary="Полный каталог кружков («Все кружки»)",
-    responses=ActivityDetailSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_activities_list",
+        summary="Полный каталог кружков («Все кружки»)",
+        responses=ActivityDetailSerializer(many=True),
+        tags=["catalog"],
+    )
 )
 class PublicActivityListView(generics.ListAPIView[Activity]):
     permission_classes = (AllowAny,)
@@ -109,10 +115,13 @@ class PublicActivityListView(generics.ListAPIView[Activity]):
         )
 
 
-@extend_schema(
-    operation_id="public_activity_detail",
-    summary="Детальная карточка кружка с подгруппами",
-    responses=ActivityDetailSerializer,
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_activity_detail",
+        summary="Детальная карточка кружка с подгруппами",
+        responses=ActivityDetailSerializer,
+        tags=["catalog"],
+    )
 )
 class ActivityDetailView(generics.RetrieveAPIView[Activity]):
     permission_classes = (AllowAny,)
@@ -135,10 +144,13 @@ class ActivityDetailView(generics.RetrieveAPIView[Activity]):
         )
 
 
-@extend_schema(
-    operation_id="public_teachers_list",
-    summary="Преподаватели с их кружками",
-    responses=TeacherPublicSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_teachers_list",
+        summary="Преподаватели с их кружками",
+        responses=TeacherPublicSerializer(many=True),
+        tags=["catalog"],
+    )
 )
 class PublicTeacherListView(generics.ListAPIView[TeacherProfile]):
     permission_classes = (AllowAny,)
@@ -175,14 +187,17 @@ class PublicTeacherListView(generics.ListAPIView[TeacherProfile]):
         )
 
 
-@extend_schema(
-    operation_id="public_gallery_list",
-    summary="Опубликованные фото галереи",
-    description=(
-        "Без query-параметров — весь список массивом (обратная совместимость). "
-        "С ?limit=N (опц. &offset=M) — постраничная выдача в конверте "
-        "{count, next, previous, results} для подгрузки по кнопке/скроллу."
-    ),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_gallery_list",
+        summary="Опубликованные фото галереи",
+        description=(
+            "Без query-параметров — весь список массивом (обратная совместимость). "
+            "С ?limit=N (опц. &offset=M) — постраничная выдача в конверте "
+            "{count, next, previous, results} для подгрузки по кнопке/скроллу."
+        ),
+        tags=["catalog"],
+    )
 )
 class PublicGalleryListView(generics.ListAPIView[GalleryImage]):
     permission_classes = (AllowAny,)
@@ -208,10 +223,13 @@ class PublicGalleryListView(generics.ListAPIView[GalleryImage]):
         )
 
 
-@extend_schema(
-    operation_id="public_plans_list",
-    summary="Тарифные планы абонементов",
-    responses=SubscriptionPlanPublicSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_plans_list",
+        summary="Тарифные планы абонементов",
+        responses=SubscriptionPlanPublicSerializer(many=True),
+        tags=["catalog"],
+    )
 )
 class PublicPlanListView(generics.ListAPIView[SubscriptionPlan]):
     permission_classes = (AllowAny,)
@@ -233,10 +251,13 @@ class PublicPlanListView(generics.ListAPIView[SubscriptionPlan]):
         )
 
 
-@extend_schema(
-    operation_id="public_events_list",
-    summary="Афиша: будущие события и прошедшие за 7 дней",
-    responses=EventPublicSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_events_list",
+        summary="Афиша: будущие события и прошедшие за 7 дней",
+        responses=EventPublicSerializer(many=True),
+        tags=["catalog"],
+    )
 )
 class PublicEventListView(generics.ListAPIView[Event]):
     permission_classes = (AllowAny,)

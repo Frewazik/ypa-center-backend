@@ -263,10 +263,42 @@ SIMPLE_JWT = {
 
 SPECTACULAR_SETTINGS = {
     "TITLE": "Улица Радости API",
-    "DESCRIPTION": "Детский центр развития - спецификация контрактов ядра.",
+    "DESCRIPTION": (
+        "Детский центр развития - спецификация контрактов ядра.\n\n"
+        "**Как войти:** `POST /api/v1/auth/otp/request/` с email → код из "
+        "письма (локально — в консоли воркера `taskiq worker`) →`POST /api/v1/auth/otp/verify/` "
+        "→ скопировать "
+        "`access` → кнопка **Authorize**, вставить токен без слова `Bearer`."
+    ),
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
     "COMPONENT_SPLIT_REQUEST": True,
+    # Токен из Authorize переживает перезагрузку страницы; у каждой ручки
+    # своя ссылка (#/profile/me_profile) — удобно кидать в чат
+    "SWAGGER_UI_SETTINGS": {"persistAuthorization": True, "deepLinking": True},
+    # Порядок групп в Swagger. Новая ручка обязана получить один из этих
+    # тегов — проверяет apps/core/tests/test_openapi_schema.py
+    "TAGS": [
+        {"name": "auth", "description": "Вход по коду из письма, JWT-токены"},
+        {"name": "catalog", "description": "Открытые данные для сайта, без входа"},
+        {"name": "schedule", "description": "Сетка занятий"},
+        {
+            "name": "forms",
+            "description": "Заявки с сайта: звонок, обратная связь, регистрация "
+            "на событие. Вход необязателен",
+        },
+        {"name": "profile", "description": "Анкета родителя и дети"},
+        {
+            "name": "checkout",
+            "description": "Покупка абонемента и пробного. Нужен заголовок "
+            "X-Idempotency-Key",
+        },
+        {
+            "name": "my",
+            "description": "Мои абонементы, пробные, записи, лента и депозит",
+        },
+        {"name": "webhooks", "description": "Служебное, фронт не вызывает"},
+    ],
 }
 
 if _env.AWS_STORAGE_BUCKET_NAME:
