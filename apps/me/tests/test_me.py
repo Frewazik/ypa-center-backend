@@ -28,10 +28,12 @@ from apps.billing.models import (
     DepositEntryReason,
     EnrollmentStatus,
     ParentDeposit,
+    Subscription,
     SubscriptionStatus,
     Transaction,
     TransactionStatus,
 )
+from apps.billing.services import sweep_expired_subscriptions
 from apps.billing.tests.factories import SubscriptionSlotFactory
 
 if TYPE_CHECKING:
@@ -450,6 +452,310 @@ class TestSubscriptions:
 
         # total_remaining сходится с суммой по видимым слотам (4, а не 4 + 2 = 6)
         assert sub_data["total_remaining"] == 4
+
+
+def _paid_subscription(
+    parent: Parent,
+    student: Student,
+    *,
+    slots: int = 1,
+    created_days_ago: int = 0,
+    expires_in_days: int = 20,
+) -> Subscription:
+    # Как после вебхука: ACTIVE, слоты с фишками, записи ENROLLED
+    subscription = SubscriptionFactory(
+        parent=parent,
+        status=SubscriptionStatus.ACTIVE,
+        start_date=timezone.localdate() - datetime.timedelta(days=10),
+        expires_at=timezone.now() + datetime.timedelta(days=expires_in_days),
+    )
+    for _ in range(slots):
+        schedule = ScheduleFactory()
+        SubscriptionSlotFactory(
+            subscription=subscription,
+            slot_id=schedule.pk,
+            granted_tokens=4,
+            remaining_tokens=3,
+        )
+        EnrollmentFactory(student=student, subscription=subscription, schedule=schedule)
+    Subscription.objects.filter(pk=subscription.pk).update(
+        created_at=timezone.now() - datetime.timedelta(days=created_days_ago)
+    )
+    return subscription
+
+
+class TestSubscriptionHistory:
+    def test_expired_subscription_keeps_slots_and_child_name(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        student = StudentFactory(parent=parent, full_name="Иванов Иван")
+        schedule = ScheduleFactory(
+            activity=ActivityFactory(name="Шахматы"),
+            time_slot__day_of_week=5,
+            time_slot__start_time=datetime.time(16, 0),
+            time_slot__end_time=datetime.time(17, 0),
+        )
+        subscription = SubscriptionFactory(
+            parent=parent,
+            status=SubscriptionStatus.ACTIVE,
+            expires_at=timezone.now() - datetime.timedelta(days=1),
+        )
+        SubscriptionSlotFactory(
+            subscription=subscription,
+            slot_id=schedule.pk,
+            granted_tokens=4,
+            remaining_tokens=1,
+        )
+        EnrollmentFactory(student=student, subscription=subscription, schedule=schedule)
+        # Настоящий свипер: EXPIRED, записи → CANCELED, остаток → депозит
+        assert sweep_expired_subscriptions() == 1
+
+        response = api_client.get(SUBSCRIPTIONS_URL)
+
+        assert response.status_code == status.HTTP_200_OK
+        (card,) = response.json()
+        assert card["status"] == "EXPIRED"
+        assert card["student_name"] == "Иванов Иван"
+        (slot,) = card["slots"]
+        assert slot["schedule_id"] == schedule.pk
+        assert slot["activity_name"] == "Шахматы"
+        assert slot["schedule"] == "СБ 16:00-17:00"
+        assert slot["total_sessions"] == 4
+        # Неиспользованная фишка ушла деньгами на депозит — в абонементе 0
+        assert slot["remaining_sessions"] == 0
+        assert card["total_remaining"] == 0
+
+    def test_deleted_child_name_stays_in_history(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        student = StudentFactory(parent=parent, full_name="Петров Пётр")
+        _paid_subscription(parent, student, expires_in_days=-1)
+        sweep_expired_subscriptions()
+        Student.objects.filter(pk=student.pk).update(archived_at=timezone.now())
+
+        (card,) = api_client.get(SUBSCRIPTIONS_URL).json()
+
+        assert card["student_name"] == "Петров Пётр"
+        assert len(card["slots"]) == 1
+
+    @pytest.mark.parametrize(
+        "subscription_status",
+        [
+            SubscriptionStatus.DRAFT,
+            SubscriptionStatus.PENDING,
+            SubscriptionStatus.CANCELED,
+        ],
+    )
+    def test_unpaid_orders_are_not_history(
+        self, api_client: APIClient, parent: Parent, subscription_status: str
+    ) -> None:
+        # Незавершённая или брошенная оплата: слотов нет, деньги не пришли
+        order = SubscriptionFactory(parent=parent, status=subscription_status)
+        EnrollmentFactory(
+            student=StudentFactory(parent=parent),
+            subscription=order,
+            status=EnrollmentStatus.CANCELED,
+        )
+
+        response = api_client.get(SUBSCRIPTIONS_URL)
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == []
+
+    def test_active_first_then_newest(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        student = StudentFactory(parent=parent)
+        old_active = _paid_subscription(parent, student, created_days_ago=40)
+        older_expired = _paid_subscription(
+            parent, student, created_days_ago=90, expires_in_days=-30
+        )
+        newer_expired = _paid_subscription(
+            parent, student, created_days_ago=60, expires_in_days=-1
+        )
+        assert sweep_expired_subscriptions() == 2
+        new_active = _paid_subscription(parent, student, created_days_ago=1)
+
+        ids = [card["id"] for card in api_client.get(SUBSCRIPTIONS_URL).json()]
+
+        assert ids == [new_active.pk, old_active.pk, newer_expired.pk, older_expired.pk]
+
+
+# Ручки ЛК со списками: без ?limit — массив, с ?limit — конверт
+_PAGINATED_URLS = [SUBSCRIPTIONS_URL, TRIALS_URL, UPCOMING_URL, DEPOSIT_ENTRIES_URL]
+
+
+class TestCabinetPagination:
+    @pytest.mark.parametrize("url", _PAGINATED_URLS)
+    def test_without_limit_whole_list_as_array(
+        self, api_client: APIClient, url: str
+    ) -> None:
+        response = api_client.get(url)
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == []
+
+    @pytest.mark.parametrize("url", _PAGINATED_URLS)
+    def test_with_limit_envelope(self, api_client: APIClient, url: str) -> None:
+        response = api_client.get(url, {"limit": 5})
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == {
+            "count": 0,
+            "next": None,
+            "previous": None,
+            "results": [],
+        }
+
+    @pytest.mark.parametrize("url", _PAGINATED_URLS)
+    @pytest.mark.parametrize("query", ["limit=0", "limit=-3", "limit=2&offset=x"])
+    def test_bad_limit_is_422(
+        self, api_client: APIClient, url: str, query: str
+    ) -> None:
+        response = api_client.get(f"{url}?{query}")
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        assert response.json()["code"] == "VALIDATION_ERROR"
+
+    def test_subscriptions_pages(self, api_client: APIClient, parent: Parent) -> None:
+        student = StudentFactory(parent=parent)
+        newest_first = [
+            _paid_subscription(parent, student, created_days_ago=days).pk
+            for days in (1, 2, 3, 4, 5)
+        ]
+
+        first = api_client.get(SUBSCRIPTIONS_URL, {"limit": 2}).json()
+        last = api_client.get(SUBSCRIPTIONS_URL, {"limit": 2, "offset": 4}).json()
+
+        assert first["count"] == 5
+        assert [card["id"] for card in first["results"]] == newest_first[:2]
+        assert first["previous"] is None
+        assert "offset=2" in first["next"]
+        assert [card["id"] for card in last["results"]] == newest_first[4:]
+        assert last["next"] is None
+
+    def test_limit_above_max_is_capped(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        # Сам потолок 60 проверен на галерее — класс общий; здесь только то,
+        # что большой limit не ломает ручку ЛК
+        student = StudentFactory(parent=parent)
+        _paid_subscription(parent, student)
+
+        body = api_client.get(SUBSCRIPTIONS_URL, {"limit": 1000}).json()
+
+        assert body["count"] == 1
+        assert len(body["results"]) == 1
+
+    def test_subscriptions_query_count_does_not_grow_with_page(
+        self,
+        api_client: APIClient,
+        parent: Parent,
+        django_assert_num_queries: DjangoAssertNumQueries,
+    ) -> None:
+        student = StudentFactory(parent=parent)
+        for days in range(6):
+            _paid_subscription(parent, student, slots=2, created_days_ago=days)
+
+        # COUNT + страница + слоты + записи (с ребёнком, группой, кружком JOIN'ом)
+        # — и на 2 абонемента, и на 6; prefetch грузит только строки страницы
+        with django_assert_num_queries(4):
+            small = api_client.get(SUBSCRIPTIONS_URL, {"limit": 2})
+        with django_assert_num_queries(4):
+            big = api_client.get(SUBSCRIPTIONS_URL, {"limit": 6})
+        # Без пагинации — те же запросы без COUNT
+        with django_assert_num_queries(3):
+            api_client.get(SUBSCRIPTIONS_URL)
+
+        assert len(small.json()["results"]) == 2
+        assert len(big.json()["results"]) == 6
+
+    def test_trials_pages_and_query_count(
+        self,
+        api_client: APIClient,
+        parent: Parent,
+        django_assert_num_queries: DjangoAssertNumQueries,
+    ) -> None:
+        student = StudentFactory(parent=parent)
+        today = timezone.localdate()
+        trials = [
+            EnrollmentFactory(
+                student=student,
+                trial=True,
+                trial_date=today + datetime.timedelta(days=days),
+            )
+            for days in (1, 2, 3)
+        ]
+        for trial in trials:
+            Transaction.objects.create(
+                parent=parent,
+                enrollment=trial,
+                amount=50_000,
+                status=TransactionStatus.SUCCEEDED,
+            )
+
+        # COUNT + страница + транзакции страницы
+        with django_assert_num_queries(3):
+            first = api_client.get(TRIALS_URL, {"limit": 1}).json()
+        with django_assert_num_queries(3):
+            rest = api_client.get(TRIALS_URL, {"limit": 3, "offset": 1}).json()
+
+        assert first["count"] == 3
+        assert [item["id"] for item in first["results"]] == [trials[2].pk]
+        assert [item["id"] for item in rest["results"]] == [
+            trials[1].pk,
+            trials[0].pk,
+        ]
+        assert all(item["cost"] == 50_000 for item in rest["results"])
+
+    def test_upcoming_pages_are_stable_for_same_time_sessions(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        # Два ребёнка в одной группе — занятия в одну минуту. Порядок обязан
+        # быть однозначным, иначе одно занятие попадёт на две страницы
+        schedule = ScheduleFactory()
+        kids = [StudentFactory(parent=parent), StudentFactory(parent=parent)]
+        # Записи создаём в обратном порядке id, чтобы порядок вставки не
+        # совпал с ожидаемым случайно
+        for kid in sorted(kids, key=lambda kid: -kid.pk):
+            EnrollmentFactory(student=kid, schedule=schedule)
+
+        pages = [
+            api_client.get(UPCOMING_URL, {"weeks": 1, "limit": 1, "offset": offset})
+            for offset in (0, 1)
+        ]
+
+        seen = [page.json()["results"][0]["student_id"] for page in pages]
+        assert pages[0].json()["count"] == 2
+        assert seen == sorted(kid.pk for kid in kids)
+
+    def test_upcoming_pagination_keeps_filters(
+        self, api_client: APIClient, parent: Parent
+    ) -> None:
+        mine = StudentFactory(parent=parent)
+        other = StudentFactory(parent=parent)
+        EnrollmentFactory(student=mine, schedule=ScheduleFactory())
+        EnrollmentFactory(student=other, schedule=ScheduleFactory())
+
+        body = api_client.get(
+            UPCOMING_URL, {"weeks": 4, "child_id": mine.pk, "limit": 3}
+        ).json()
+
+        assert body["count"] == 4
+        assert len(body["results"]) == 3
+        assert {item["student_id"] for item in body["results"]} == {mine.pk}
+        assert "child_id=" in body["next"]
+        assert "weeks=4" in body["next"]
+
+    def test_deposit_entries_pages(self, api_client: APIClient, parent: Parent) -> None:
+        TestDeposit()._history(parent)
+
+        body = api_client.get(DEPOSIT_ENTRIES_URL, {"limit": 3, "offset": 3}).json()
+
+        assert body["count"] == 4
+        # Новые сверху: последняя строка — самая старая, начисление за абонемент
+        (oldest,) = body["results"]
+        assert oldest["reason"] == "SUBSCRIPTION_EXPIRY_CREDIT"
 
 
 class TestUpcomingFeed:

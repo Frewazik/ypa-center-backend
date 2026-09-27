@@ -7,7 +7,6 @@ from django.db.models import Count, Prefetch, Q, QuerySet
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics
-from rest_framework.pagination import LimitOffsetPagination
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -16,6 +15,7 @@ from apps.billing.models import EnrollmentStatus, SubscriptionPlan
 from apps.catalog.models import Activity
 from apps.content.models import GalleryImage
 from apps.core.caching import cached_payload, payload_cache_key
+from apps.core.pagination import LimitOffsetListPagination
 from apps.events.models import Event
 from apps.public_api.serializers import (
     ActivityCardSerializer,
@@ -175,14 +175,6 @@ class PublicTeacherListView(generics.ListAPIView[TeacherProfile]):
         )
 
 
-class GalleryPagination(LimitOffsetPagination):
-    # ПОЧЕМУ default_limit=None: без ?limit клиент получает полный список,
-    # как раньше (главная берёт первые N сама). С ?limit=N&offset=M —
-    # постраничная подгрузка для страницы /gallery
-    default_limit = None
-    max_limit = 60
-
-
 @extend_schema(
     operation_id="public_gallery_list",
     summary="Опубликованные фото галереи",
@@ -196,7 +188,9 @@ class PublicGalleryListView(generics.ListAPIView[GalleryImage]):
     permission_classes = (AllowAny,)
     authentication_classes = ()
     serializer_class = GalleryImagePublicSerializer
-    pagination_class = GalleryPagination
+    # Без ?limit — весь список (главная берёт первые N сама), с ?limit —
+    # постраничная подгрузка для страницы /gallery
+    pagination_class = LimitOffsetListPagination
     queryset = GalleryImage.objects.filter(is_published=True)
 
     def get(self, request: Request, *args: object, **kwargs: object) -> Response:
