@@ -6,6 +6,7 @@ from datetime import date, time, timedelta
 
 import pytest
 from django.core.exceptions import ValidationError
+from django.utils import timezone
 from pytest_django import DjangoAssertNumQueries
 from rest_framework import status
 from rest_framework.test import APIRequestFactory
@@ -38,7 +39,8 @@ WEDNESDAY = MONDAY + timedelta(days=2)
 
 # ПОЧЕМУ: маски запрещают создание на прошедшие даты
 # используем плавающий будущий понедельник для защиты CI от падений со временем
-FUTURE_MONDAY = date.today() + timedelta(days=7 - date.today().weekday())
+_TODAY = timezone.localdate()
+FUTURE_MONDAY = _TODAY + timedelta(days=7 - _TODAY.weekday())
 FUTURE_WEDNESDAY = FUTURE_MONDAY + timedelta(days=2)
 
 

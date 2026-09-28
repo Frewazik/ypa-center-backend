@@ -37,7 +37,7 @@ pytestmark = pytest.mark.django_db
 # ПОЧЕМУ: «сейчас» задаётся явно, а даты — от будущего понедельника: маски
 # и пробные в прошлом бессмысленны, а фиксированная дата в прошлом
 # сломала бы сквозные проверки через чекаут
-_TODAY = datetime.date.today()
+_TODAY = timezone.localdate()
 MONDAY = _TODAY + datetime.timedelta(days=7 - _TODAY.weekday())
 WEDNESDAY = MONDAY + datetime.timedelta(days=2)
 FRIDAY = MONDAY + datetime.timedelta(days=4)
