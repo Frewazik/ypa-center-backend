@@ -38,7 +38,7 @@ from apps.billing.models import (
     TransactionStatus,
 )
 from apps.billing.ports import SchedulePort, UnknownSlotError
-from apps.billing.selectors import active_seat_q
+from apps.billing.selectors import active_seat_q, attendances_awaiting_debit
 from apps.core.locks import advisory_xact_lock, advisory_xact_lock_many
 from apps.users.models import Student
 
@@ -336,23 +336,30 @@ def debit_token(attendance_id: int) -> None:
         if subscription.status != SubscriptionStatus.ACTIVE or is_expired:
             raise SubscriptionNotSpendableError(subscription.pk, subscription.status)
 
-        try:
-            slot = SubscriptionSlot.objects.select_for_update(of=("self",)).get(
-                subscription_id=enrollment.subscription_id,
-                slot_id=enrollment.schedule_id,
-            )
-        except SubscriptionSlot.DoesNotExist as exc:
-            raise SlotBalanceNotFoundError(
-                enrollment.subscription_id, enrollment.schedule_id
-            ) from exc
+        _spend_slot_token(attendance, subscription.pk)
 
-        if slot.remaining_tokens <= 0:
-            raise InsufficientTokensError(slot.pk)
 
-        slot.remaining_tokens -= 1
-        slot.save(update_fields=["remaining_tokens"])
-        attendance.token_debited = True
-        attendance.save(update_fields=["token_debited"])
+def _spend_slot_token(attendance: Attendance, subscription_id: int) -> None:
+    # ПОЧЕМУ: общий хвост debit_token и добора в свипере истечения. Вызывающий
+    # уже держит FOR UPDATE на отметке и проверил, что списывать можно;
+    # исключения бросаются до записи — откатывать нечего
+    try:
+        slot = SubscriptionSlot.objects.select_for_update(of=("self",)).get(
+            subscription_id=subscription_id,
+            slot_id=attendance.enrollment.schedule_id,
+        )
+    except SubscriptionSlot.DoesNotExist as exc:
+        raise SlotBalanceNotFoundError(
+            subscription_id, attendance.enrollment.schedule_id
+        ) from exc
+
+    if slot.remaining_tokens <= 0:
+        raise InsufficientTokensError(slot.pk)
+
+    slot.remaining_tokens -= 1
+    slot.save(update_fields=["remaining_tokens"])
+    attendance.token_debited = True
+    attendance.save(update_fields=["token_debited"])
 
 
 def create_payment(
@@ -1425,6 +1432,9 @@ def sweep_expired_subscriptions(*, now: datetime | None = None) -> int:
             )
             if subscription is None:
                 continue  # конкурентный тик успел первым
+            # !!!: до расчёта остатка и до отмены записей — иначе занятие
+            # последнего дня, не списанное ночной задачей, вернулось бы деньгами
+            _debit_attended_before_expiry(subscription)
             subscription.status = SubscriptionStatus.EXPIRED
             subscription.save(update_fields=["status"])
             Enrollment.objects.filter(
@@ -1434,6 +1444,29 @@ def sweep_expired_subscriptions(*, now: datetime | None = None) -> int:
             _credit_unused_sessions(subscription)
             swept += 1
     return swept
+
+
+def _debit_attended_before_expiry(subscription: Subscription) -> None:
+    # ПОЧЕМУ: страховка ночной задачи (journal.debit_attended_lessons) —
+    # упала, не успела до 23:59:59 последнего дня или отметку вернули в
+    # «пришёл» после неё. debit_token здесь не подходит: срок по дате уже
+    # вышел, а блокировка абонемента у свипера и так взята
+    assert subscription.expires_at is not None  # сужение: свипер фильтрует по нему
+    last_day = timezone.localdate(subscription.expires_at)
+    attendances = (
+        attendances_awaiting_debit()
+        .filter(enrollment__subscription=subscription, date__lte=last_day)
+        .select_related("enrollment")
+        .select_for_update(of=("self",))
+        .order_by("pk")
+    )
+    for attendance in attendances:
+        try:
+            _spend_slot_token(attendance, subscription.pk)
+        except (InsufficientTokensError, SlotBalanceNotFoundError) as exc:
+            # ПОЧЕМУ: пятое занятие месяца при 4 фишках бесплатно (решение
+            # бизнеса) — не причина срывать закрытие абонемента
+            logger.info("Отметка #%s не списана при истечении: %s", attendance.pk, exc)
 
 
 def _credit_unused_sessions(subscription: Subscription) -> int:

@@ -1922,17 +1922,20 @@ class TestExpiryCreditRace:
 
         monkeypatch.setattr(SubscriptionSlot, "save", stalling_save)
 
+        # ПОЧЕМУ сигнал на входе в добор списаний: это первая точка после
+        # claim абонемента. Дальше свипер встаёт на FOR UPDATE отметки, которую
+        # держит debit, и после коммита видит token_debited=True — не спишет
+        # второй раз
         sweeper_claimed = Event()
-        original_sub_save = Subscription.save
+        original_catch_up = billing_services._debit_attended_before_expiry
 
-        def signalling_sub_save(
-            self: Subscription, *args: object, **kwargs: object
-        ) -> None:
-            original_sub_save(self, *args, **kwargs)
-            if self.status == SubscriptionStatus.EXPIRED:
-                sweeper_claimed.set()
+        def signalling_catch_up(subscription: Subscription) -> None:
+            sweeper_claimed.set()
+            original_catch_up(subscription)
 
-        monkeypatch.setattr(Subscription, "save", signalling_sub_save)
+        monkeypatch.setattr(
+            billing_services, "_debit_attended_before_expiry", signalling_catch_up
+        )
 
         def run_debit() -> None:
             try:
