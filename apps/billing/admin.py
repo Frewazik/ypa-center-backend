@@ -234,7 +234,10 @@ class AttendanceAdmin(ModelAdmin):
         "enrollment__schedule__activity",
     )
     search_fields = ("enrollment__student__full_name",)
-    readonly_fields = ("token_debited", "created_at")
+    # ПОЧЕМУ status read-only: сохранение формы писало бы поле напрямую, мимо
+    # set_attendance_status — без списания и возврата фишки. Статус меняется
+    # только кнопками строки
+    readonly_fields = ("status", "token_debited", "created_at")
     actions_row = ("row_mark_attended", "row_mark_absent_ok", "row_mark_absent_err")
 
     def get_queryset(self, request: HttpRequest) -> QuerySet[Attendance]:
