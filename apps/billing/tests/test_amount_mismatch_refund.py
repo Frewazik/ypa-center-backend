@@ -107,7 +107,7 @@ class TestAmountMismatchRefund:
         tx.refresh_from_db()
         assert gateway.refund_calls == [(f"yk-{tx.pk}", 350_000, f"refund-{tx.pk}")]
         assert tx.requires_compensation is False
-        assert tx.metadata["refund_status"] == "succeeded"
+        assert tx.refund_status == "SUCCEEDED"
 
     def test_overpayment_is_refunded_in_full(self) -> None:
         # Решение бизнеса: пришло больше — заказ отменяем, возвращаем всё
@@ -127,7 +127,7 @@ class TestAmountMismatchRefund:
         tx.refresh_from_db()
         assert gateway.refund_calls == []
         assert tx.requires_compensation is False
-        assert tx.metadata["refund_status"] == "failed"
+        assert tx.refund_status == "FAILED"
         assert "USD" in tx.metadata["refund_error"]
 
 
@@ -171,7 +171,7 @@ class TestLatePaymentRefundAmount:
 
         tx.refresh_from_db()
         assert tx.requires_compensation is False
-        assert tx.metadata["refund_status"] == "succeeded"
+        assert tx.refund_status == "SUCCEEDED"
 
 
 def _awaiting_manual() -> Transaction:
@@ -189,7 +189,7 @@ class TestResolveRefundManually:
         resolve_refund_manually(tx.pk, resolved_by="manager")
 
         tx.refresh_from_db()
-        assert tx.metadata["refund_status"] == "manual"
+        assert tx.refund_status == "MANUAL"
         assert tx.metadata["refund_resolved_by"] == "manager"
         assert "USD" in tx.metadata["refund_error"]
 
@@ -246,5 +246,5 @@ class TestTransactionAdmin:
 
         tx.refresh_from_db()
         assert response.status_code == 302
-        assert tx.metadata["refund_status"] == "manual"
+        assert tx.refund_status == "MANUAL"
         assert tx.metadata["refund_resolved_by"] == admin_user.get_username()

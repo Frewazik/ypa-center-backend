@@ -9,6 +9,7 @@ from datetime import date, datetime, time, timedelta
 from dataclasses import dataclass
 from typing import Literal
 
+from asgiref.sync import async_to_sync
 from django.db import IntegrityError
 from django.db import transaction as db_transaction
 from django.db.models import Count, Q
@@ -30,6 +31,7 @@ from apps.billing.models import (
     EnrollmentType,
     IdempotencyRecord,
     ParentDeposit,
+    RefundStatus,
     Subscription,
     SubscriptionPlan,
     SubscriptionSlot,
@@ -292,11 +294,11 @@ _REFUND_CHUNK_SIZE = 500
 # ПОЧЕМУ: lease обязан переживать сетевой вызов к шлюзу с ретраями,
 # но не блокировать возврат надолго после смерти воркера
 _REFUND_CLAIM_TTL = timedelta(minutes=10)
-_REFUND_FAILED_STATUS = "failed"
-_REFUND_MANUAL_STATUS = "manual"
-# ПОЧЕМУ: "canceled" — ответ ЮКассы «возврат не прошёл»; вместе с нашим
+# ПОЧЕМУ: CANCELED — ответ ЮКассы «возврат не прошёл»; вместе с нашим
 # карантином это всё, что требует рук менеджера
-REFUND_STATUSES_AWAITING_MANUAL = frozenset({_REFUND_FAILED_STATUS, "canceled"})
+REFUND_STATUSES_AWAITING_MANUAL = frozenset(
+    {RefundStatus.FAILED, RefundStatus.CANCELED}
+)
 
 
 # ПОЧЕМУ: дефолтное значение для снапшота, бизнес-правила могут меняться,
@@ -1222,13 +1224,13 @@ def _queue_refund(tx: Transaction, currency: str, extra: dict[str, object]) -> N
     if currency == _EXPECTED_CURRENCY:
         _mark_for_compensation(tx, extra)
         return
+    tx.refund_status = RefundStatus.FAILED
     tx.metadata = {
         **tx.metadata,
         **extra,
-        "refund_status": _REFUND_FAILED_STATUS,
         "refund_error": f"валюта платежа {currency} — возврат вручную",
     }
-    tx.save(update_fields=["metadata"])
+    tx.save(update_fields=["refund_status", "metadata"])
     logger.error(
         "Транзакция %s: оплата в валюте %s — возврат требует ручного разбора.",
         tx.pk,
@@ -1633,21 +1635,91 @@ def issue_pending_refunds(
                 continue
             locked.requires_compensation = False
             locked.compensation_claimed_until = None
-            locked.metadata = {
-                **locked.metadata,
-                "compensation_required": False,
-                "refund_id": refund.id,
-                "refund_status": refund.status,
-            }
+            locked.refund_id = refund.id
+            locked.refund_status = RefundStatus(refund.status.upper())
+            locked.metadata = {**locked.metadata, "compensation_required": False}
             locked.save(
                 update_fields=[
                     "requires_compensation",
                     "compensation_claimed_until",
+                    "refund_id",
+                    "refund_status",
                     "metadata",
                 ]
             )
+            if locked.refund_status == RefundStatus.SUCCEEDED:
+                _schedule_refund_email(locked.pk)
             issued += 1
     return issued
+
+
+def sync_pending_refunds(*, gateway: PaymentGateway) -> int:
+    # ПОЧЕМУ: ЮКасса может принять возврат в обработку и позже отменить его.
+    # Итог узнаём опросом API, а не из вебхука: тело вебхука не доверенное,
+    # и повторный GET по тому же возврату идемпотентен
+    candidates = list(
+        Transaction.objects.filter(
+            refund_status=RefundStatus.PENDING, refund_id__isnull=False
+        )
+        .order_by("created_at")
+        .values_list("pk", "refund_id")[:_REFUND_CHUNK_SIZE]
+    )
+
+    changed = 0
+    for tx_id, refund_id in candidates:
+        assert refund_id is not None  # сужение: выборка фильтрует NULL
+        error: str | None = None
+        try:
+            refund = gateway.get_refund(refund_id)
+        except GatewayContractError as exc:
+            new_status, error = RefundStatus.FAILED, str(exc)
+        else:
+            if refund.status == "pending":
+                continue
+            new_status = RefundStatus(refund.status.upper())
+        # ПОЧЕМУ: транзитные сбои (GatewayNetworkError) пробрасываются наружу —
+        # незавершённые возвраты доопросит ретрай или следующий тик
+
+        with db_transaction.atomic():
+            locked = (
+                Transaction.objects.select_for_update()
+                .filter(pk=tx_id, refund_status=RefundStatus.PENDING)
+                .first()
+            )
+            if locked is None:
+                continue  # параллельный тик успел первым
+            locked.refund_status = new_status
+            if error is not None:
+                locked.metadata = {**locked.metadata, "refund_error": error}
+            locked.save(update_fields=["refund_status", "metadata"])
+            if new_status == RefundStatus.SUCCEEDED:
+                _schedule_refund_email(locked.pk)
+            changed += 1
+    return changed
+
+
+def _schedule_refund_email(transaction_id: uuid.UUID) -> None:
+    # ПОЧЕМУ: письмо только о выполненном возврате — обещать деньги, пока
+    # ЮКасса ещё может отменить возврат, нельзя. on_commit: без него воркер
+    # может прочитать транзакцию раньше коммита
+    db_transaction.on_commit(lambda: _enqueue_refund_email(transaction_id))
+
+
+def _enqueue_refund_email(transaction_id: uuid.UUID) -> None:
+    # ПОЧЕМУ: локальный импорт — tasks импортирует services на уровне модуля
+    from apps.billing.tasks import send_refund_email_task
+
+    # ПОЧЕМУ: сбой брокера не должен откатывать уже выполненный возврат —
+    # в on_commit-колбэке исключение ушло бы наружу из обработчика
+    try:
+        async_to_sync(send_refund_email_task.kiq)(str(transaction_id))
+    except Exception:
+        logger.exception("Не удалось поставить письмо о возврате %s", transaction_id)
+    finally:
+        # ПОЧЕМУ: как в users.services — async_to_sync закрывает локальный
+        # event loop, без сброса пул брокера переиспользует мёртвый сокет
+        if hasattr(send_refund_email_task.broker, "connection_pool"):
+            send_refund_email_task.broker.connection_pool.reset()
 
 
 def _quarantine_refund(tx_id: uuid.UUID, reason: str) -> None:
@@ -1657,16 +1729,17 @@ def _quarantine_refund(tx_id: uuid.UUID, reason: str) -> None:
             return
         locked.requires_compensation = False
         locked.compensation_claimed_until = None
+        locked.refund_status = RefundStatus.FAILED
         locked.metadata = {
             **locked.metadata,
             "compensation_required": False,
-            "refund_status": _REFUND_FAILED_STATUS,
             "refund_error": reason,
         }
         locked.save(
             update_fields=[
                 "requires_compensation",
                 "compensation_claimed_until",
+                "refund_status",
                 "metadata",
             ]
         )
@@ -1680,16 +1753,16 @@ def resolve_refund_manually(transaction_id: uuid.UUID, *, resolved_by: str) -> N
         if (
             tx is None
             or tx.requires_compensation
-            or tx.metadata.get("refund_status") not in REFUND_STATUSES_AWAITING_MANUAL
+            or tx.refund_status not in REFUND_STATUSES_AWAITING_MANUAL
         ):
             raise RefundNotAwaitingManualError(transaction_id)
+        tx.refund_status = RefundStatus.MANUAL
         tx.metadata = {
             **tx.metadata,
-            "refund_status": _REFUND_MANUAL_STATUS,
             "refund_resolved_by": resolved_by,
             "refund_resolved_at": timezone.now().isoformat(),
         }
-        tx.save(update_fields=["metadata"])
+        tx.save(update_fields=["refund_status", "metadata"])
 
 
 def sweep_finalized_idempotency_records(*, now: datetime | None = None) -> int:

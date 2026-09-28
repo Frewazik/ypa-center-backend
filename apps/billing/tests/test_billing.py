@@ -24,6 +24,7 @@ from apps.billing.adapters import (
     PaymentInfo,
     PaymentNotFoundError,
     RefundInfo,
+    RefundStatus,
     _parse_payment_body,
 )
 from apps.billing.models import (
@@ -170,6 +171,9 @@ class FakeGateway:
     refund_calls: list[tuple[str, int, str]] = field(default_factory=list)
     failing_refund_ids: set[str] = field(default_factory=set)
     created_payments: list[tuple[str, int, str]] = field(default_factory=list)
+    # ПОЧЕМУ: статус, с которым ЮКасса принимает возврат, и итог при опросе
+    new_refund_status: RefundStatus = "succeeded"
+    refund_outcomes: dict[str, RefundStatus] = field(default_factory=dict)
 
     def get_payment(self, payment_id: str) -> PaymentInfo:
         found = self.payments.get(payment_id)
@@ -200,7 +204,14 @@ class FakeGateway:
         if payment_id in self.failing_refund_ids:
             raise GatewayContractError(f"провайдер отверг возврат {payment_id}")
         self.refund_calls.append((payment_id, amount_kopecks, idempotence_key))
-        return RefundInfo(id=f"rf-{len(self.refund_calls)}", status="succeeded")
+        return RefundInfo(
+            id=f"rf-{len(self.refund_calls)}", status=self.new_refund_status
+        )
+
+    def get_refund(self, refund_id: str) -> RefundInfo:
+        return RefundInfo(
+            id=refund_id, status=self.refund_outcomes.get(refund_id, "pending")
+        )
 
 
 @dataclass
@@ -223,6 +234,9 @@ class RaisingGateway:
     def create_refund(
         self, payment_id: str, amount_kopecks: int, idempotence_key: str
     ) -> RefundInfo:
+        raise self.error_factory("сбой шлюза")
+
+    def get_refund(self, refund_id: str) -> RefundInfo:
         raise self.error_factory("сбой шлюза")
 
 
@@ -1262,8 +1276,8 @@ class TestLateSuccessCompensationFlow:
         assert second_run == 0
         assert gateway.refund_calls == [(payment_id, tx.amount, f"refund-{tx.pk}")]
         assert tx.metadata["compensation_required"] is False
-        assert tx.metadata["refund_id"] == "rf-1"
-        assert tx.metadata["refund_status"] == "succeeded"
+        assert tx.refund_id == "rf-1"
+        assert tx.refund_status == "SUCCEEDED"
 
     def test_overbooking_compensation_is_refunded_by_same_pipeline(self) -> None:
         port = _port(s101=1)
@@ -1298,7 +1312,7 @@ class TestLateSuccessCompensationFlow:
         # ПОЧЕМУ: невыполнимый возврат выводится из очереди в карантин
         # чтобы избежать вечного блокирования refund-воркера
         assert tx.requires_compensation is False
-        assert tx.metadata["refund_status"] == "failed"
+        assert tx.refund_status == "FAILED"
 
     def test_refund_skipped_when_payment_id_missing(self) -> None:
         # ПОЧЕМУ: страховка на случай порчи данных — транзакции без external_id
@@ -1316,7 +1330,7 @@ class TestLateSuccessCompensationFlow:
         assert gateway.refund_calls == []
         tx.refresh_from_db()
         assert tx.requires_compensation is False
-        assert tx.metadata["refund_status"] == "failed"
+        assert tx.refund_status == "FAILED"
 
     def test_active_claim_blocks_parallel_tick_before_network_call(self) -> None:
         # ПОЧЕМУ: claim check — конкурентный тик (дубль крона, ручной запуск)
@@ -1344,7 +1358,7 @@ class TestLateSuccessCompensationFlow:
         tx.refresh_from_db()
         assert tx.requires_compensation is False
         assert tx.compensation_claimed_until is None
-        assert tx.metadata["refund_status"] == "succeeded"
+        assert tx.refund_status == "SUCCEEDED"
 
     def test_successful_refund_releases_claim(self) -> None:
         tx = _make_refundable_payment([101])
@@ -1792,10 +1806,10 @@ class TestRefundQueueDiscipline:
         healthy.refresh_from_db()
         assert issued == 1
         assert poisoned.requires_compensation is False
-        assert poisoned.metadata["refund_status"] == "failed"
+        assert poisoned.refund_status == "FAILED"
         assert "отверг" in poisoned.metadata["refund_error"]
         assert healthy.requires_compensation is False
-        assert healthy.metadata["refund_id"] == "rf-1"
+        assert healthy.refund_id == "rf-1"
 
 
 @pytest.mark.django_db

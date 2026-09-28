@@ -29,6 +29,7 @@ from apps.billing.models import (
     Enrollment,
     EnrollmentStatus,
     EnrollmentType,
+    RefundStatus,
     Subscription,
     SubscriptionPlan,
     SubscriptionStatus,
@@ -161,6 +162,7 @@ class RefundStateFilter(admin.SimpleListFilter):
     ) -> list[tuple[str, str]]:
         return [
             ("queued", "В очереди"),
+            ("in_progress", "В обработке у ЮКассы"),
             ("manual", "Нужен ручной разбор"),
             ("done", "Выполнен"),
         ]
@@ -168,18 +170,18 @@ class RefundStateFilter(admin.SimpleListFilter):
     def queryset(
         self, request: HttpRequest, queryset: QuerySet[Transaction]
     ) -> QuerySet[Transaction]:
-        # ПОЧЕМУ фильтр по JSON: экран для менеджера на единицы строк, логика
-        # возвратов по metadata не ветвится — колонка ради фильтра не нужна
         if self.value() == "queued":
             return queryset.filter(requires_compensation=True)
+        if self.value() == "in_progress":
+            return queryset.filter(refund_status=RefundStatus.PENDING)
         if self.value() == "manual":
             return queryset.filter(
                 requires_compensation=False,
-                metadata__refund_status__in=REFUND_STATUSES_AWAITING_MANUAL,
+                refund_status__in=REFUND_STATUSES_AWAITING_MANUAL,
             )
         if self.value() == "done":
             return queryset.filter(
-                metadata__refund_status__in=("pending", "succeeded", "manual")
+                refund_status__in=(RefundStatus.SUCCEEDED, RefundStatus.MANUAL)
             )
         return queryset
 
@@ -236,11 +238,10 @@ class TransactionAdmin(ModelAdmin):
     @display(description="Возврат")
     def display_refund(self, obj: Transaction) -> str:
         if obj.requires_compensation:
-            return "в очереди"
-        refund_status = obj.metadata.get("refund_status")
-        if refund_status in REFUND_STATUSES_AWAITING_MANUAL:
-            return "нужен ручной разбор"
-        return str(refund_status or "—")
+            return "В очереди"
+        if obj.refund_status in REFUND_STATUSES_AWAITING_MANUAL:
+            return f"Нужен ручной разбор ({obj.get_refund_status_display()})"
+        return obj.get_refund_status_display() or "—"
 
     @admin.display(description="Причина")
     def refund_error(self, obj: Transaction) -> str:
