@@ -110,7 +110,10 @@ erDiagram
 (id из домена schedule, намеренно без FK через границу домена), `granted_tokens`,
 `remaining_tokens` (по умолчанию 4 на слот).
 
-**transaction** — платёж: UUID PK, `parent`, `subscription` (nullable), `amount`,
+**transaction** — платёж: UUID PK, `parent`, `subscription` (nullable), `amount`
+(ожидаемая сумма к оплате картой), `received_amount` (nullable — сколько фактически
+пришло по подтверждённому платежу; `NULL` = успешной оплаты ещё не было; на неё
+делается возврат и по ней повторный вебхук не ставит возврат второй раз),
 `external_id` (id платежа ЮКассы, unique), `status`
 (`PENDING` / `SUCCEEDED` / `CANCELED` / `FAILED`), `selected_slot_ids` (JSON),
 `metadata` (JSONB, аудит сверки), `requires_compensation` с partial-индексом

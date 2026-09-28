@@ -152,6 +152,12 @@ class Transaction(models.Model):
         verbose_name="Абонемент",
     )
     amount = models.IntegerField("Сумма, в копейках")
+    # ПОЧЕМУ: фактически полученное от провайдера (может не совпасть с amount).
+    # NULL — успешной оплаты ещё не видели; заполненное поле — маркер
+    # «деньги пришли», по нему возврат берёт сумму и не ставится дважды
+    received_amount = models.IntegerField(
+        "Получено от провайдера, в копейках", null=True, blank=True
+    )
     external_id = models.CharField(
         "ID платежа ЮКассы",
         max_length=255,

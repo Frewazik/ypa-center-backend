@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+
 from django import forms
 from django.contrib import admin, messages
 from django.contrib.admin import helpers
@@ -30,8 +32,10 @@ from apps.billing.models import (
     Subscription,
     SubscriptionPlan,
     SubscriptionStatus,
+    Transaction,
+    TransactionStatus,
 )
-from apps.billing.services import BillingError
+from apps.billing.services import REFUND_STATUSES_AWAITING_MANUAL, BillingError
 
 
 class FreezeSubscriptionActionForm(forms.Form):
@@ -146,6 +150,124 @@ class SubscriptionAdmin(ModelAdmin):
                 "opts": self.model._meta,
             },
         )
+
+
+class RefundStateFilter(admin.SimpleListFilter):
+    title = "Возврат"
+    parameter_name = "refund"
+
+    def lookups(
+        self, request: HttpRequest, model_admin: admin.ModelAdmin[Transaction]
+    ) -> list[tuple[str, str]]:
+        return [
+            ("queued", "В очереди"),
+            ("manual", "Нужен ручной разбор"),
+            ("done", "Выполнен"),
+        ]
+
+    def queryset(
+        self, request: HttpRequest, queryset: QuerySet[Transaction]
+    ) -> QuerySet[Transaction]:
+        # ПОЧЕМУ фильтр по JSON: экран для менеджера на единицы строк, логика
+        # возвратов по metadata не ветвится — колонка ради фильтра не нужна
+        if self.value() == "queued":
+            return queryset.filter(requires_compensation=True)
+        if self.value() == "manual":
+            return queryset.filter(
+                requires_compensation=False,
+                metadata__refund_status__in=REFUND_STATUSES_AWAITING_MANUAL,
+            )
+        if self.value() == "done":
+            return queryset.filter(
+                metadata__refund_status__in=("pending", "succeeded", "manual")
+            )
+        return queryset
+
+
+@admin.register(Transaction)
+class TransactionAdmin(ModelAdmin):
+    # ПОЧЕМУ read-only: деньги двигают только сервисы (вебхук, возвраты);
+    # единственное ручное действие — закрыть разобранный возврат кнопкой строки
+    list_display = (
+        "created_at",
+        "parent",
+        "amount",
+        "received_amount",
+        "display_status",
+        "display_refund",
+        "refund_error",
+        "external_id",
+    )
+    list_filter = (
+        RefundStateFilter,
+        ("status", ChoicesDropdownFilter),
+        ("created_at", RangeDateFilter),
+    )
+    list_select_related = ("parent",)
+    search_fields = ("parent__email", "parent__phone", "external_id")
+    ordering = ("-created_at",)
+    actions_row = ("row_resolve_refund",)
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+    def has_change_permission(
+        self, request: HttpRequest, obj: Transaction | None = None
+    ) -> bool:
+        return False
+
+    def has_delete_permission(
+        self, request: HttpRequest, obj: Transaction | None = None
+    ) -> bool:
+        return False
+
+    @display(
+        description="Статус",
+        label={
+            TransactionStatus.SUCCEEDED: "success",
+            TransactionStatus.PENDING: "warning",
+            TransactionStatus.FAILED: "danger",
+            TransactionStatus.CANCELED: "danger",
+        },
+    )
+    def display_status(self, obj: Transaction) -> str:
+        return obj.status
+
+    @display(description="Возврат")
+    def display_refund(self, obj: Transaction) -> str:
+        if obj.requires_compensation:
+            return "в очереди"
+        refund_status = obj.metadata.get("refund_status")
+        if refund_status in REFUND_STATUSES_AWAITING_MANUAL:
+            return "нужен ручной разбор"
+        return str(refund_status or "—")
+
+    @admin.display(description="Причина")
+    def refund_error(self, obj: Transaction) -> str:
+        return str(obj.metadata.get("refund_error", ""))
+
+    # ПОЧЕМУ право строкой: has_change_permission закрыт ради read-only формы,
+    # а закрытие возврата — отдельное осознанное действие
+    @action(
+        description="Возврат разобран вручную",
+        permissions=["billing.change_transaction"],
+    )
+    def row_resolve_refund(
+        self, request: HttpRequest, object_id: str
+    ) -> HttpResponseRedirect:
+        try:
+            services.resolve_refund_manually(
+                uuid.UUID(object_id), resolved_by=request.user.get_username()
+            )
+        except (BillingError, ValueError) as exc:
+            self.message_user(request, str(exc), level=messages.ERROR)
+        else:
+            self.message_user(
+                request,
+                f"Возврат по транзакции {object_id} закрыт вручную.",
+                level=messages.SUCCESS,
+            )
+        return redirect(reverse("admin:billing_transaction_changelist"))
 
 
 @admin.register(Enrollment)
