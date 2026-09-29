@@ -288,9 +288,13 @@ _REFUND_CHUNK_SIZE = 500
 # в интервал крона (5 мин), тогда как весь чанк в 1000 занял бы больше часа
 _RECONCILE_CHUNK_SIZE = 50
 # ПОЧЕМУ: если ЮКасса недоступна дольше этого срока, заказ снимается без сверки —
-# иначе сломанные ключи API держали бы места в группах бесконечно. Опоздавший
-# вебхук об успехе всё равно уйдёт в возврат (_REFUNDABLE_CANCEL_REASONS)
+# иначе сломанные ключи API держали бы места в группах бесконечно. Оплату
+# поймают опоздавший вебхук или досверка и отправят в возврат
 _RECONCILE_GIVE_UP_AFTER = timedelta(hours=2)
+# ПОЧЕМУ: неоплаченный платёж ЮКасса отменяет сама (expired_on_confirmation), срок
+# зависит от способа оплаты. Сутки с запасом накрывают его; не получили
+# окончательного статуса — алерт и ручная проверка в кабинете ЮКассы
+_POST_EXPIRY_RECHECK_WINDOW = timedelta(hours=24)
 # ПОЧЕМУ: lease обязан переживать сетевой вызов к шлюзу с ретраями,
 # но не блокировать возврат надолго после смерти воркера
 _REFUND_CLAIM_TTL = timedelta(minutes=10)
@@ -1430,40 +1434,50 @@ def sweep_stale_pending_transactions(
                 settled = _reconcile_stale_payment(
                     tx_id, external_id, gateway, schedule_port
                 )
-            except GatewayNetworkError:
-                # ПОЧЕМУ: ЮКасса лежит — остальные запросы тика упрутся в тот же
-                # таймаут; прекращаем сверку до следующего тика
-                logger.warning(
-                    "Сверка %s: ЮКасса недоступна, сверка отложена до следующего тика.",
-                    tx_id,
-                    exc_info=True,
-                )
-                gateway_down = True
-                continue
-            except GatewayContractError:
-                logger.critical(
-                    "Сверка %s: нарушение контракта API ЮКассы (ключи/схема ответа) — "
-                    "сверка отложена; заказы снимутся вслепую через %s.",
-                    tx_id,
-                    _RECONCILE_GIVE_UP_AFTER,
-                    exc_info=True,
-                )
+            except GatewayError as exc:
+                # ПОЧЕМУ: ЮКасса лежит или отвергает наши запросы — остальные
+                # запросы тика упрутся в то же; прекращаем сверку до следующего тика
+                _log_reconcile_postponed(tx_id, exc)
                 gateway_down = True
                 continue
             if settled:
                 continue
 
-        if _expire_pending_transaction(tx_id):
+        if _expire_pending_transaction(
+            tx_id, recheck_until=moment + _POST_EXPIRY_RECHECK_WINDOW
+        ):
             swept += 1
             if gave_up:
                 logger.critical(
                     "Сверка %s: платёж %s не удалось сверить за %s — заказ снят "
-                    "без сверки; проверьте оплату в кабинете ЮКассы.",
+                    "без сверки; досверка продолжится.",
                     tx_id,
                     external_id,
                     _RECONCILE_GIVE_UP_AFTER,
                 )
+
+    # ПОЧЕМУ: досверке снятых заказов — остаток бюджета тика. Снятие по TTL
+    # важнее: оно держит места в группах
+    _close_overdue_rechecks(moment)
+    if not gateway_down and reconcile_budget > 0:
+        _recheck_expired_payments(gateway, schedule_port, moment, reconcile_budget)
     return swept
+
+
+def _log_reconcile_postponed(tx_id: uuid.UUID, exc: GatewayError) -> None:
+    if isinstance(exc, GatewayNetworkError):
+        logger.warning(
+            "Сверка %s: ЮКасса недоступна, сверка отложена до следующего тика.",
+            tx_id,
+            exc_info=exc,
+        )
+        return
+    logger.critical(
+        "Сверка %s: нарушение контракта API ЮКассы (ключи/схема ответа) — "
+        "сверка отложена до следующего тика.",
+        tx_id,
+        exc_info=exc,
+    )
 
 
 def _reconcile_stale_payment(
@@ -1491,8 +1505,8 @@ def _reconcile_stale_payment(
 
     if info.status not in ("succeeded", "canceled"):
         # ПОЧЕМУ: pending/waiting_for_capture — за TTL не оплачено. Заказ снимается,
-        # места освобождаются; оплата позже уйдёт в возврат через ветку
-        # позднего успеха в _apply_success
+        # места освобождаются; оплату позже поймает вебхук или досверка
+        # (_recheck_expired_payments) и отправит в возврат
         return False
 
     if info.transaction_id != str(tx_id):
@@ -1534,7 +1548,7 @@ def _reconcile_stale_payment(
     return True
 
 
-def _expire_pending_transaction(tx_id: uuid.UUID) -> bool:
+def _expire_pending_transaction(tx_id: uuid.UUID, *, recheck_until: datetime) -> bool:
     with db_transaction.atomic():
         tx = (
             Transaction.objects.select_for_update()
@@ -1545,9 +1559,139 @@ def _expire_pending_transaction(tx_id: uuid.UUID) -> bool:
             return False  # вебхук успел первым — не трогаем
         tx.status = TransactionStatus.CANCELED
         tx.metadata = {**tx.metadata, "canceled_reason": _TTL_EXPIRED_REASON}
-        tx.save(update_fields=["status", "metadata"])
+        # ПОЧЕМУ: платёж заведён в ЮКассе — родитель ещё может оплатить по
+        # старой ссылке, ставим заказ в очередь досверки
+        if tx.external_id is not None:
+            tx.payment_recheck_until = recheck_until
+        tx.save(update_fields=["status", "metadata", "payment_recheck_until"])
         _release_order_resources(tx)
         return True
+
+
+def _recheck_expired_payments(
+    gateway: PaymentGateway,
+    schedule_port: SchedulePort,
+    moment: datetime,
+    budget: int,
+) -> None:
+    # ПОЧЕМУ: «спросить перед снятием» не ловит оплату, случившуюся после
+    # снятия: вебхук потерян — возврата нет. Досверка спрашивает ЮКассу, пока
+    # та не даст окончательный статус (неоплаченный платёж она отменяет сама —
+    # expired_on_confirmation). Раньше снятые — первыми
+    # ПОЧЕМУ верхняя граница: заказ, снятый в этом же тике, получил срок ровно
+    # moment + окно — его только что спросили, повторный GET бессмыслен
+    due = list(
+        Transaction.objects.filter(
+            payment_recheck_until__gte=moment,
+            payment_recheck_until__lt=moment + _POST_EXPIRY_RECHECK_WINDOW,
+        )
+        .order_by("payment_recheck_until")
+        .values_list("pk", "external_id")[:budget]
+    )
+    for tx_id, external_id in due:
+        if external_id is None:
+            _finish_recheck(tx_id)
+            continue
+        try:
+            final = _recheck_expired_payment(tx_id, external_id, gateway, schedule_port)
+        except GatewayError as exc:
+            _log_reconcile_postponed(tx_id, exc)
+            return
+        if final:
+            _finish_recheck(tx_id)
+
+
+def _recheck_expired_payment(
+    tx_id: uuid.UUID,
+    payment_id: str,
+    gateway: PaymentGateway,
+    schedule_port: SchedulePort,
+) -> bool:
+    # ПОЧЕМУ: True — статус окончательный, досверку закрываем; False —
+    # платёж ещё открыт, спросим в следующем тике.
+    # !!!: как и сверка — сеть вне транзакции, запись в _apply_verified_payment.
+    # Смерть процесса до _finish_recheck безопасна: следующий тик увидит, что
+    # возврат уже поставлен, и просто закроет досверку
+    try:
+        info = gateway.get_payment(payment_id)
+    except (PaymentNotFoundError, InvalidPaymentIdError):
+        logger.error(
+            "Досверка %s: платёж %s неизвестен ЮКассе — досверка закрыта.",
+            tx_id,
+            payment_id,
+        )
+        return True
+
+    if info.status == "canceled":
+        return True
+    if info.status != "succeeded":
+        return False
+
+    if info.transaction_id != str(tx_id):
+        logger.error(
+            "Досверка %s: платёж %s ссылается на транзакцию %r — досверка закрыта, "
+            "требуется ручной разбор.",
+            tx_id,
+            payment_id,
+            info.transaction_id,
+        )
+        return True
+
+    # ПОЧЕМУ: вебхук мог успеть — возврат уже поставлен (или выплачен и флаг
+    # сброшен). Ключ compensation_required остаётся в metadata и после выплаты
+    tx = Transaction.objects.only("status", "metadata").get(pk=tx_id)
+    if (
+        tx.status != TransactionStatus.CANCELED
+        or "compensation_required" in tx.metadata
+    ):
+        return True
+
+    logger.critical(
+        "Досверка %s: платёж %s оплачен после снятия заказа, вебхук не пришёл — "
+        "поставлен возврат. Проверьте доставку вебхуков ЮКассы.",
+        tx_id,
+        payment_id,
+    )
+    try:
+        _apply_verified_payment(info, tx_id, schedule_port)
+    except PaymentSucceededAfterExpiryError:
+        pass  # ожидаемый исход: заказ не восстанавливается, возврат поставлен
+    except BillingError:
+        logger.exception(
+            "Досверка %s: платёж %s проведён с бизнес-ошибкой — требуется ручной "
+            "разбор.",
+            tx_id,
+            payment_id,
+        )
+    return True
+
+
+def _finish_recheck(tx_id: uuid.UUID) -> bool:
+    # ПОЧЕМУ: условный UPDATE — параллельный тик, закрывший досверку первым,
+    # не получит второй записи и второго алерта
+    return (
+        Transaction.objects.filter(
+            pk=tx_id, payment_recheck_until__isnull=False
+        ).update(payment_recheck_until=None)
+        == 1
+    )
+
+
+def _close_overdue_rechecks(moment: datetime) -> None:
+    overdue = list(
+        Transaction.objects.filter(payment_recheck_until__lt=moment)
+        .order_by("payment_recheck_until")
+        .values_list("pk", "external_id")[:_SWEEP_CHUNK_SIZE]
+    )
+    for tx_id, external_id in overdue:
+        if _finish_recheck(tx_id):
+            logger.critical(
+                "Досверка %s: платёж %s не получил окончательного статуса за %s — "
+                "проверьте оплату в кабинете ЮКассы.",
+                tx_id,
+                external_id,
+                _POST_EXPIRY_RECHECK_WINDOW,
+            )
 
 
 def sweep_expired_subscriptions(*, now: datetime | None = None) -> int:

@@ -51,10 +51,12 @@ def _stale_order(
     return tx
 
 
-def _sweep(gateway: PaymentGateway) -> int:
+def _sweep(gateway: PaymentGateway, *, later: timedelta = timedelta(0)) -> int:
+    # ПОЧЕМУ later: следующий тик крона — сдвиг «сейчас» вперёд
     return sweep_stale_pending_transactions(
         gateway=gateway,
         schedule_port=FakeSchedulePort(),
+        now=timezone.now() + later,
     )
 
 
@@ -404,3 +406,176 @@ class TestReconciliationWebhookRace:
             == 1
         )
         assert gateway.refund_calls == []
+
+
+_NEXT_TICK = timedelta(minutes=5)
+
+
+def _expired_unpaid(slot_id: int = 101) -> Transaction:
+    # Родитель не оплатил за TTL: сверка видит pending и снимает заказ
+    tx = _stale_order(slot_id)
+    _, pending = _gateway_for(tx, "pending")
+    assert _sweep(pending) == 1
+    tx.refresh_from_db()
+    assert tx.status == TransactionStatus.CANCELED
+    return tx
+
+
+@pytest.mark.django_db
+class TestPostExpiryRecheck:
+    def test_expired_order_with_payment_is_queued_for_recheck(self) -> None:
+        tx = _stale_order()
+        gateway = CountingGateway(payments=_gateway_for(tx, "pending")[1].payments)
+
+        assert _sweep(gateway) == 1
+
+        tx.refresh_from_db()
+        assert tx.payment_recheck_until is not None
+        # ПОЧЕМУ: только что спрошенный заказ досверка в том же тике не трогает
+        assert len(gateway.get_calls) == 1
+
+    def test_payment_after_expiry_without_webhook_is_refunded(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Оплатил на 16-й минуте, вебхук потерян — досверка ставит возврат
+        tx = _expired_unpaid()
+        payment_id, paid = _gateway_for(tx, "succeeded")
+
+        with caplog.at_level(logging.CRITICAL, logger="apps.billing.services"):
+            _sweep(paid, later=_NEXT_TICK)
+
+        tx.refresh_from_db()
+        assert tx.status == TransactionStatus.CANCELED
+        assert tx.requires_compensation is True
+        assert tx.metadata["reason"] == "PAYMENT_SUCCEEDED_AFTER_EXPIRY"
+        assert tx.payment_recheck_until is None
+        assert any("оплачен после снятия" in m for m in _critical_messages(caplog))
+        assert issue_pending_refunds(gateway=paid) == 1
+        assert paid.refund_calls == [(payment_id, tx.amount, f"refund-{tx.pk}")]
+
+    def test_still_pending_stays_in_queue(self) -> None:
+        tx = _expired_unpaid()
+        _, pending = _gateway_for(tx, "pending")
+
+        _sweep(pending, later=_NEXT_TICK)
+
+        tx.refresh_from_db()
+        assert tx.payment_recheck_until is not None
+        assert tx.requires_compensation is False
+
+    def test_canceled_by_provider_closes_recheck(self) -> None:
+        tx = _expired_unpaid()
+        _, canceled = _gateway_for(tx, "canceled")
+
+        _sweep(canceled, later=_NEXT_TICK)
+
+        tx.refresh_from_db()
+        assert tx.payment_recheck_until is None
+        assert tx.requires_compensation is False
+
+    def test_refund_already_paid_by_webhook_path_is_not_queued_again(self) -> None:
+        # Вебхук пришёл, возврат выплачен (флаг сброшен) — досверка не должна
+        # поставить второй возврат
+        tx = _expired_unpaid()
+        payment_id, paid = _gateway_for(tx, "succeeded")
+        with pytest.raises(PaymentSucceededAfterExpiryError):
+            confirm_payment(
+                payment_id=payment_id, gateway=paid, schedule_port=FakeSchedulePort()
+            )
+        assert issue_pending_refunds(gateway=paid) == 1
+
+        _sweep(paid, later=_NEXT_TICK)
+
+        tx.refresh_from_db()
+        assert tx.payment_recheck_until is None
+        assert tx.requires_compensation is False
+        assert issue_pending_refunds(gateway=paid) == 0
+        assert len(paid.refund_calls) == 1
+
+    def test_webhook_between_recheck_answer_and_write_is_not_doubled(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tx = _expired_unpaid()
+        payment_id, base = _gateway_for(tx, "succeeded")
+
+        class WebhookInTheMiddle(FakeGateway):
+            def get_payment(self, requested_id: str) -> PaymentInfo:
+                info = base.get_payment(requested_id)
+                with pytest.raises(PaymentSucceededAfterExpiryError):
+                    confirm_payment(
+                        payment_id=requested_id,
+                        gateway=base,
+                        schedule_port=FakeSchedulePort(),
+                    )
+                return info
+
+        with caplog.at_level(logging.CRITICAL, logger="apps.billing.services"):
+            _sweep(WebhookInTheMiddle(), later=_NEXT_TICK)
+
+        tx.refresh_from_db()
+        assert tx.requires_compensation is True
+        assert tx.payment_recheck_until is None
+        # ПОЧЕМУ: вебхук дошёл — тревога «вебхук не пришёл» была бы ложной
+        assert _critical_messages(caplog) == []
+
+    def test_overdue_recheck_is_closed_with_alert_without_asking(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tx = _expired_unpaid()
+        gateway = CountingGateway(payments=_gateway_for(tx, "pending")[1].payments)
+
+        with caplog.at_level(logging.CRITICAL, logger="apps.billing.services"):
+            _sweep(gateway, later=timedelta(hours=25))
+
+        tx.refresh_from_db()
+        assert tx.payment_recheck_until is None
+        assert gateway.get_calls == []
+        assert any("окончательного статуса" in m for m in _critical_messages(caplog))
+
+    def test_gateway_down_keeps_queue_and_stops_calls(self) -> None:
+        first = _stale_order(101)
+        second = _stale_order(102)
+        pending = FakeGateway(
+            payments={
+                **_gateway_for(first, "pending")[1].payments,
+                **_gateway_for(second, "pending")[1].payments,
+            }
+        )
+        assert _sweep(pending) == 2
+        gateway = CountingRaisingGateway(error_factory=GatewayNetworkError)
+
+        _sweep(gateway, later=_NEXT_TICK)
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        assert first.payment_recheck_until is not None
+        assert second.payment_recheck_until is not None
+        assert len(gateway.get_calls) == 1
+
+    def test_order_without_payment_is_not_queued(self) -> None:
+        tx = _stale_order()
+        Transaction.objects.filter(pk=tx.pk).update(external_id=None)
+
+        assert _sweep(CountingGateway()) == 1
+
+        tx.refresh_from_db()
+        assert tx.status == TransactionStatus.CANCELED
+        assert tx.payment_recheck_until is None
+
+    def test_recheck_uses_budget_left_after_pending_sweep(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ПОЧЕМУ: снятие по TTL держит места — оно тратит бюджет первым
+        expired = _expired_unpaid(101)
+        monkeypatch.setattr(billing_services, "_RECONCILE_CHUNK_SIZE", 1)
+        fresh = _stale_order(102)
+        gateway = CountingGateway(
+            payments={
+                **_gateway_for(expired, "pending")[1].payments,
+                **_gateway_for(fresh, "pending")[1].payments,
+            }
+        )
+
+        _sweep(gateway, later=_NEXT_TICK)
+
+        assert gateway.get_calls == [fresh.external_id]

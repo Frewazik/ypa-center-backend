@@ -115,7 +115,8 @@ erDiagram
 (`PENDING` / `SUCCEEDED` / `CANCELED` / `FAILED`), `selected_slot_ids` (JSON),
 `metadata` (JSONB, аудит сверки), `requires_compensation` с partial-индексом
 (очередь возвратов), `compensation_claimed_until` — lease claim-check процессора
-возвратов.
+возвратов, `payment_recheck_until` с partial-индексом — очередь досверки: заказ снят
+по TTL, а платёж в ЮКассе ещё открыт (`api-core-contracts.md` §2.2).
 
 **enrollment** — запись ребёнка в группу: `student`, `subscription`, `schedule`,
 `status` (`HELD` — бронь на время оплаты, `ENROLLED`, `CANCELED`). HELD старше TTL
