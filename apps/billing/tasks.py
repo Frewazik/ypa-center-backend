@@ -69,8 +69,12 @@ def verify_and_process_payment(payment_id: str) -> None:
 @broker.task(schedule=[{"cron": "*/5 * * * *"}])
 def sweep_billing_states() -> None:
     # ПОЧЕМУ: операция абсолютно идемпотентна, настройка ретраев не требуется,
-    # в случае сбоя стейт будет консистентно починен в следующий тик крона
-    canceled = sweep_stale_pending_transactions()
+    # в случае сбоя стейт будет консистентно починен в следующий тик крона.
+    # Сбои ЮКассы при сверке гасятся внутри свипера — истечение абонементов
+    # ниже не зависит от доступности провайдера
+    canceled = sweep_stale_pending_transactions(
+        gateway=YookassaHttpGateway(), schedule_port=resolve_schedule_port()
+    )
     expired = sweep_expired_subscriptions()
     purged_keys = sweep_finalized_idempotency_records()
     if canceled or expired or purged_keys:

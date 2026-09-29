@@ -17,8 +17,11 @@ from django.utils import timezone
 from apps.billing.adapters import (
     GatewayContractError,
     GatewayError,
+    GatewayNetworkError,
+    InvalidPaymentIdError,
     PaymentGateway,
     PaymentInfo,
+    PaymentNotFoundError,
 )
 from apps.billing.models import (
     Attendance,
@@ -281,6 +284,13 @@ _SLOT_LOCK_CLASS = 815_001
 # при массовой отмене или падении БД
 _SWEEP_CHUNK_SIZE = 1_000
 _REFUND_CHUNK_SIZE = 500
+# ПОЧЕМУ: каждая сверка — GET в ЮКассу с таймаутом до 5 с. 50 × 5 с укладываются
+# в интервал крона (5 мин), тогда как весь чанк в 1000 занял бы больше часа
+_RECONCILE_CHUNK_SIZE = 50
+# ПОЧЕМУ: если ЮКасса недоступна дольше этого срока, заказ снимается без сверки —
+# иначе сломанные ключи API держали бы места в группах бесконечно. Опоздавший
+# вебхук об успехе всё равно уйдёт в возврат (_REFUNDABLE_CANCEL_REASONS)
+_RECONCILE_GIVE_UP_AFTER = timedelta(hours=2)
 # ПОЧЕМУ: lease обязан переживать сетевой вызов к шлюзу с ретраями,
 # но не блокировать возврат надолго после смерти воркера
 _REFUND_CLAIM_TTL = timedelta(minutes=10)
@@ -952,13 +962,19 @@ def confirm_payment(
     # !!!: мы не доверяем payload вебхука
     # применяем строго верифицированный статус напрямую из API провайдера
     info = gateway.get_payment(payment_id)
+    _apply_verified_payment(info, _verified_transaction_id(info), schedule_port)
 
-    transaction_id = _verified_transaction_id(info)
+
+def _apply_verified_payment(
+    info: PaymentInfo, transaction_id: uuid.UUID, schedule_port: SchedulePort
+) -> None:
+    # ПОЧЕМУ: общий хвост вебхука и сверки в свипере — статус уже получен
+    # из API провайдера, обе дороги проводят его одним и тем же кодом
     if info.status == "succeeded":
         _apply_success(info, transaction_id, schedule_port)
         return
     if info.status == "canceled":
-        _apply_cancellation(transaction_id, payment_id)
+        _apply_cancellation(transaction_id, info.id)
         return
     # ПОЧЕМУ: промежуточные статусы (pending, waiting_for_capture) игнорируются,
     # ожидаем терминального состояния платежа от провайдера
@@ -1372,37 +1388,166 @@ def _activation_window(
     return first_lesson, expires_at
 
 
-def sweep_stale_pending_transactions(*, now: datetime | None = None) -> int:
+def sweep_stale_pending_transactions(
+    *,
+    gateway: PaymentGateway,
+    schedule_port: SchedulePort,
+    now: datetime | None = None,
+) -> int:
     # ПОЧЕМУ: защита от зависания забронированных слотов, если вебхук
     # от провайдера потерялся или клиент бросил оплату на полпути
+    # !!!: заказ, заведённый в ЮКассе, снимается только после сверки с ней —
+    # вебхук мог потеряться, а деньги прийти. Молча снятый оплаченный заказ
+    # никто бы не вернул: возврат запускает только опоздавший вебхук
     moment = now if now is not None else timezone.now()
     cutoff = moment - _PENDING_TRANSACTION_TTL
+    give_up_before = moment - _RECONCILE_GIVE_UP_AFTER
     # ПОЧЕМУ: LIMIT без ORDER BY недетерминирован — при переполнении чанка
     # свипер обязан снимать самые старые брони первыми
-    stale_ids = list(
+    stale = list(
         Transaction.objects.filter(
             status=TransactionStatus.PENDING, created_at__lt=cutoff
         )
         .order_by("created_at")
-        .values_list("pk", flat=True)[:_SWEEP_CHUNK_SIZE]
+        .values_list("pk", "external_id", "created_at")[:_SWEEP_CHUNK_SIZE]
     )
 
     swept = 0
-    for tx_id in stale_ids:
-        with db_transaction.atomic():
-            tx = (
-                Transaction.objects.select_for_update()
-                .filter(pk=tx_id, status=TransactionStatus.PENDING)
-                .first()
-            )
-            if tx is None:
-                continue  # вебхук успел первым — не трогаем
-            tx.status = TransactionStatus.CANCELED
-            tx.metadata = {**tx.metadata, "canceled_reason": _TTL_EXPIRED_REASON}
-            tx.save(update_fields=["status", "metadata"])
-            _release_order_resources(tx)
+    reconcile_budget = _RECONCILE_CHUNK_SIZE
+    gateway_down = False
+    for tx_id, external_id, created_at in stale:
+        # ПОЧЕМУ: без external_id платёж у провайдера не заведён (или процесс
+        # умер до сохранения id — тогда клиент не получил ссылку): спрашивать
+        # некого и платить нечем, снимаем как раньше
+        gave_up = external_id is not None and created_at < give_up_before
+        if external_id is not None and not gave_up:
+            # ПОЧЕМУ: заказ, не сверенный в этом тике, остаётся PENDING —
+            # сверим в следующем, а не снимаем вслепую
+            if gateway_down or reconcile_budget == 0:
+                continue
+            reconcile_budget -= 1
+            try:
+                settled = _reconcile_stale_payment(
+                    tx_id, external_id, gateway, schedule_port
+                )
+            except GatewayNetworkError:
+                # ПОЧЕМУ: ЮКасса лежит — остальные запросы тика упрутся в тот же
+                # таймаут; прекращаем сверку до следующего тика
+                logger.warning(
+                    "Сверка %s: ЮКасса недоступна, сверка отложена до следующего тика.",
+                    tx_id,
+                    exc_info=True,
+                )
+                gateway_down = True
+                continue
+            except GatewayContractError:
+                logger.critical(
+                    "Сверка %s: нарушение контракта API ЮКассы (ключи/схема ответа) — "
+                    "сверка отложена; заказы снимутся вслепую через %s.",
+                    tx_id,
+                    _RECONCILE_GIVE_UP_AFTER,
+                    exc_info=True,
+                )
+                gateway_down = True
+                continue
+            if settled:
+                continue
+
+        if _expire_pending_transaction(tx_id):
             swept += 1
+            if gave_up:
+                logger.critical(
+                    "Сверка %s: платёж %s не удалось сверить за %s — заказ снят "
+                    "без сверки; проверьте оплату в кабинете ЮКассы.",
+                    tx_id,
+                    external_id,
+                    _RECONCILE_GIVE_UP_AFTER,
+                )
     return swept
+
+
+def _reconcile_stale_payment(
+    tx_id: uuid.UUID,
+    payment_id: str,
+    gateway: PaymentGateway,
+    schedule_port: SchedulePort,
+) -> bool:
+    # ПОЧЕМУ: True — провайдер дал окончательный статус, и он проведён тем же
+    # путём, что и вебхук; False — снимать заказ по TTL локально.
+    # !!!: сетевой вызов строго вне транзакции и локов (контракт apps.billing.ports);
+    # запись — отдельной короткой транзакцией внутри _apply_verified_payment.
+    # Смерть процесса между ними безопасна: GET идемпотентен, следующий тик
+    # спросит заново
+    try:
+        info = gateway.get_payment(payment_id)
+    except (PaymentNotFoundError, InvalidPaymentIdError):
+        logger.error(
+            "Сверка %s: платёж %s неизвестен ЮКассе — денег нет, заказ снимается "
+            "по TTL.",
+            tx_id,
+            payment_id,
+        )
+        return False
+
+    if info.status not in ("succeeded", "canceled"):
+        # ПОЧЕМУ: pending/waiting_for_capture — за TTL не оплачено. Заказ снимается,
+        # места освобождаются; оплата позже уйдёт в возврат через ветку
+        # позднего успеха в _apply_success
+        return False
+
+    if info.transaction_id != str(tx_id):
+        logger.error(
+            "Сверка %s: платёж %s ссылается на транзакцию %r — заказ снимается "
+            "по TTL, требуется ручной разбор.",
+            tx_id,
+            payment_id,
+            info.transaction_id,
+        )
+        return False
+
+    # ПОЧЕМУ: вебхук мог успеть за время GET — тогда он уже всё провёл,
+    # и тревога «вебхук не дошёл» была бы ложной
+    if not Transaction.objects.filter(
+        pk=tx_id, status=TransactionStatus.PENDING
+    ).exists():
+        return True
+
+    if info.status == "succeeded":
+        # ПОЧЕМУ critical: оплата без вебхука — признак, что вебхуки ЮКассы
+        # до нас не доходят (URL, allowlist за прокси); чинить надо источник
+        logger.critical(
+            "Сверка %s: платёж %s оплачен, но вебхук не пришёл — проведён "
+            "сверкой. Проверьте доставку вебхуков ЮКассы.",
+            tx_id,
+            payment_id,
+        )
+    try:
+        _apply_verified_payment(info, tx_id, schedule_port)
+    except BillingError:
+        # ПОЧЕМУ: как в run_payment_verification — бизнес-исход (компенсация,
+        # несовпадение суммы) уже закоммичен, ошибка лишь сообщает о нём
+        logger.exception(
+            "Сверка %s: платёж %s проведён с бизнес-ошибкой — требуется ручной разбор.",
+            tx_id,
+            payment_id,
+        )
+    return True
+
+
+def _expire_pending_transaction(tx_id: uuid.UUID) -> bool:
+    with db_transaction.atomic():
+        tx = (
+            Transaction.objects.select_for_update()
+            .filter(pk=tx_id, status=TransactionStatus.PENDING)
+            .first()
+        )
+        if tx is None:
+            return False  # вебхук успел первым — не трогаем
+        tx.status = TransactionStatus.CANCELED
+        tx.metadata = {**tx.metadata, "canceled_reason": _TTL_EXPIRED_REASON}
+        tx.save(update_fields=["status", "metadata"])
+        _release_order_resources(tx)
+        return True
 
 
 def sweep_expired_subscriptions(*, now: datetime | None = None) -> int:

@@ -355,6 +355,29 @@ def _gateway_for(
     return payment_id, FakeGateway(payments={payment_id: info})
 
 
+def _sweep_unpaid(*, now: datetime | None = None) -> int:
+    # ПОЧЕМУ: сценарий «родитель бросил оплату» — ЮКасса по всем незавершённым
+    # платежам отвечает pending, и свипер после сверки снимает заказы по TTL
+    gateway = FakeGateway(
+        payments={
+            tx.external_id: PaymentInfo(
+                id=tx.external_id,
+                status="pending",
+                transaction_id=str(tx.pk),
+                amount_kopecks=tx.amount,
+                currency="RUB",
+            )
+            for tx in Transaction.objects.filter(
+                status=TransactionStatus.PENDING, external_id__isnull=False
+            )
+            if tx.external_id is not None
+        }
+    )
+    return sweep_stale_pending_transactions(
+        gateway=gateway, schedule_port=FakeSchedulePort(), now=now
+    )
+
+
 def _make_attendance_with_balance(
     remaining_tokens: int,
     subscription_status: str = SubscriptionStatus.ACTIVE,
@@ -1159,7 +1182,7 @@ class TestSweepers:
         )
         fresh = _make_pending_payment([102])
 
-        swept = sweep_stale_pending_transactions()
+        swept = _sweep_unpaid()
 
         stale.refresh_from_db()
         fresh.refresh_from_db()
@@ -1192,8 +1215,8 @@ class TestSweepers:
                 created_at=timezone.now() - timedelta(hours=1)
             )
 
-        first_tick = sweep_stale_pending_transactions()
-        second_tick = sweep_stale_pending_transactions()
+        first_tick = _sweep_unpaid()
+        second_tick = _sweep_unpaid()
 
         assert first_tick == 2
         assert second_tick == 1
@@ -1228,7 +1251,7 @@ class TestLateSuccessCompensationFlow:
         Transaction.objects.filter(pk=tx.pk).update(
             created_at=timezone.now() - timedelta(hours=1)
         )
-        assert sweep_stale_pending_transactions() == 1
+        assert _sweep_unpaid() == 1
         payment_id, gateway = _gateway_for(tx, "succeeded")
         return tx, payment_id, gateway
 
@@ -1727,7 +1750,7 @@ class TestDepositHoldReturn:
             created_at=timezone.now() - timedelta(hours=1)
         )
 
-        assert sweep_stale_pending_transactions() == 1
+        assert _sweep_unpaid() == 1
 
         tx.refresh_from_db()
         deposit = ParentDeposit.objects.get(parent=parent)
@@ -1753,7 +1776,7 @@ class TestDepositHoldReturn:
         assert tx.metadata["deposit_returned"] is True
         # ПОЧЕМУ: повторное освобождение депозита идемпотентно
         # баланс пользователя математически защищен от задвоения
-        sweep_stale_pending_transactions()
+        _sweep_unpaid()
         assert ParentDeposit.objects.get(parent=parent).balance == 240_000
 
 
@@ -1998,7 +2021,7 @@ class TestDuplicateEnrollmentGuard:
         plan = SubscriptionPlanFactory(slots_count=1)
         _checkout([101], parent=parent, student=student, plan=plan)
         Transaction.objects.update(created_at=timezone.now() - timedelta(hours=1))
-        assert sweep_stale_pending_transactions() == 1  # бронь → CANCELED
+        assert _sweep_unpaid() == 1  # бронь → CANCELED
 
         result = _checkout([101], parent=parent, student=student, plan=plan)
 
@@ -2281,7 +2304,7 @@ class TestEvictionReleaseDeadlock:
 
         def run_sweeper() -> None:
             try:
-                sweep_stale_pending_transactions()
+                _sweep_unpaid()
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
             finally:
