@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Protocol, runtime_checkable
 
 from django.utils.module_loading import import_string
@@ -34,7 +34,9 @@ class SchedulePort(Protocol):
 
     def get_slot_capacity(self, slot_id: int) -> int: ...
 
-    def get_next_lesson_date(self, slot_id: int, on_or_after: date) -> date: ...
+    # Дата ближайшего занятия, на которое в момент `after` ещё открыта запись:
+    # граница — фактическое начало (с учётом переноса) минус BOOKING_CUTOFF
+    def get_next_lesson_date(self, slot_id: int, after: datetime) -> date: ...
 
     def get_slot_trial_info(self, slot_id: int) -> SlotTrialInfo: ...
 

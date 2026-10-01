@@ -666,7 +666,8 @@ def create_trial_payment(
 ) -> CheckoutResult:
     # ПОЧЕМУ: защита от IDOR — принадлежность ребёнка плательщику
     _ensure_student_owned(student_id, parent_id)
-    if trial_date < timezone.localdate():
+    now = timezone.now()
+    if trial_date < timezone.localdate(now):
         raise TrialDateUnavailableError(
             schedule_id, trial_date, "дата пробного уже в прошлом."
         )
@@ -690,17 +691,21 @@ def create_trial_payment(
                 trial_info = schedule_port.get_slot_trial_info(schedule_id)
                 capacity = schedule_port.get_slot_capacity(schedule_id)
                 next_lesson = schedule_port.get_next_lesson_date(
-                    schedule_id, trial_date
+                    schedule_id,
+                    max(
+                        now, timezone.make_aware(datetime.combine(trial_date, time.min))
+                    ),
                 )
             except UnknownSlotError as exc:
                 raise SlotNotFoundError(schedule_id) from exc
-            # ПОЧЕМУ: дата валидна, только если ближайшее занятие «на дату или
-            # позже» — ровно эта дата; отмены и переносы масок учтены портом
+            # ПОЧЕМУ: дата валидна, только если ближайшее занятие с открытой
+            # записью — ровно эта дата; отмены, переносы и уже начавшееся
+            # сегодняшнее занятие учтены портом
             if next_lesson != trial_date:
                 raise TrialDateUnavailableError(
                     schedule_id,
                     trial_date,
-                    "на эту дату занятие группы не проводится.",
+                    "на эту дату нет занятия, на которое ещё открыта запись.",
                 )
 
             # Быстрая проверка лимита до capacity-работы; гонку двух параллельных
@@ -831,9 +836,10 @@ def _fulfill_prepaid_order(tx: Transaction, schedule_port: SchedulePort) -> None
         )
     slot_ids = _selected_slot_ids(tx, "deposit-prepaid")
     try:
-        start_date, expires_at = _activation_window(slot_ids, schedule_port)
+        first_lessons = _first_lessons(slot_ids, schedule_port)
     except UnknownSlotError as exc:
         raise SlotNotFoundError(exc.slot_id) from exc
+    start_date, expires_at = _activation_window(first_lessons)
 
     tx.status = TransactionStatus.SUCCEEDED
     tx.metadata = {**tx.metadata, "paid_from_deposit": True}
@@ -848,6 +854,7 @@ def _fulfill_prepaid_order(tx: Transaction, schedule_port: SchedulePort) -> None
     Enrollment.objects.filter(
         subscription_id=subscription_id, status=EnrollmentStatus.HELD
     ).update(status=EnrollmentStatus.ENROLLED)
+    _join_todays_lessons(subscription_id, first_lessons)
     SubscriptionSlot.objects.bulk_create(
         [
             SubscriptionSlot(
@@ -1094,7 +1101,7 @@ def _apply_success(
                 tx.save(update_fields=["status", "external_id", "received_amount"])
 
                 try:
-                    start_date, expires_at = _activation_window(slot_ids, schedule_port)
+                    first_lessons = _first_lessons(slot_ids, schedule_port)
                 except UnknownSlotError:
                     _mark_for_compensation(
                         tx,
@@ -1108,6 +1115,7 @@ def _apply_success(
                         info.id, tx.subscription_id or 0, "SLOT_REMOVED"
                     )
                 else:
+                    start_date, expires_at = _activation_window(first_lessons)
                     activated = Subscription.objects.filter(
                         pk=subscription_id, status=SubscriptionStatus.PENDING
                     ).update(
@@ -1152,6 +1160,7 @@ def _apply_success(
                                 info.id, subscription_id, overbook_reason
                             )
                         else:
+                            _join_todays_lessons(subscription_id, first_lessons)
                             SubscriptionSlot.objects.bulk_create(
                                 [
                                     SubscriptionSlot(
@@ -1228,6 +1237,10 @@ def _apply_trial_success(
 
     enrollment.status = EnrollmentStatus.ENROLLED
     enrollment.save(update_fields=["status"])
+    # ПОЧЕМУ без проверки времени: оплату, пришедшую после начала занятия,
+    # принимаем (решение бизнеса 2026-10-01) — ребёнок, скорее всего, уже там
+    if enrollment.trial_date == timezone.localdate():
+        _add_to_journal({enrollment.pk: enrollment.trial_date})
     return None
 
 
@@ -1434,20 +1447,58 @@ def _month_after(day: date) -> date:
     return day.replace(year=year, month=month, day=min(day.day, last_day))
 
 
-def _activation_window(
-    slot_ids: list[int], schedule_port: SchedulePort
-) -> tuple[date, datetime]:
+def _first_lessons(slot_ids: list[int], schedule_port: SchedulePort) -> dict[int, date]:
+    # ПОЧЕМУ «сейчас» — момент активации, а не оформления заказа (решение
+    # бизнеса 2026-10-01): вебхук, пришедший после начала занятия, сдвигает
+    # старт на следующее — абонемент никогда не начинается с прошедшего
+    now = timezone.now()
+    return {
+        slot_id: schedule_port.get_next_lesson_date(slot_id, now)
+        for slot_id in sorted(slot_ids)
+    }
+
+
+def _activation_window(first_lessons: dict[int, date]) -> tuple[date, datetime]:
     # ПОЧЕМУ: согласно checkout-flow.md, абонемент действует строго месяц
     # начиная с даты первого фактического занятия в выбранных слотах
-    today = timezone.localdate()
-    first_lesson = min(
-        schedule_port.get_next_lesson_date(slot_id, today)
-        for slot_id in sorted(slot_ids)
-    )
+    first_lesson = min(first_lessons.values())
     expires_at = timezone.make_aware(
         datetime.combine(_month_after(first_lesson), time(23, 59, 59))
     )
     return first_lesson, expires_at
+
+
+def _join_todays_lessons(subscription_id: int, first_lessons: dict[int, date]) -> None:
+    # ПОЧЕМУ: журнал дня собирается в 07:00 (journal.materialize_today_lessons);
+    # купивший днём до начала занятия иначе не попал бы в него до следующей недели
+    today = timezone.localdate()
+    todays_slots = [slot_id for slot_id, day in first_lessons.items() if day == today]
+    if not todays_slots:
+        return
+    enrollment_ids = Enrollment.objects.filter(
+        subscription_id=subscription_id,
+        schedule_id__in=todays_slots,
+        status=EnrollmentStatus.ENROLLED,
+    ).values_list("pk", flat=True)
+    _add_to_journal(dict.fromkeys(enrollment_ids, today))
+
+
+def _add_to_journal(lesson_dates: dict[int, date]) -> None:
+    # ПОЧЕМУ так же, как journal.open_lesson: посещаемость автоматическая,
+    # педагог только снимает отсутствующих. ignore_conflicts опирается на
+    # uq_billing_attendance_per_enrollment_date — повтор вебхука и утренняя
+    # задача журнала не задвоят отметку и не тронут выставленную педагогом
+    Attendance.objects.bulk_create(
+        [
+            Attendance(
+                enrollment_id=enrollment_id,
+                date=lesson_date,
+                status=AttendanceStatus.ATTENDED,
+            )
+            for enrollment_id, lesson_date in lesson_dates.items()
+        ],
+        ignore_conflicts=True,
+    )
 
 
 def sweep_stale_pending_transactions(
