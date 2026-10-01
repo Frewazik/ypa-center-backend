@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_MANAGER_CHAT_ID: str = ""
 
+    # Сколько минут неоплаченная бронь на платное событие ждёт «Подтвердить
+    # оплату» в админке, прежде чем свипер освободит места
+    EVENT_PENDING_PAYMENT_TTL_MINUTES: int = Field(default=30, ge=1)
+
 
 # ПОЧЕМУ ignore: обязательные поля заполняет pydantic-settings из env/.env,
 # mypy без pydantic-плагина видит их как незаполненные аргументы конструктора
@@ -325,6 +329,8 @@ EXTERNAL_HTTP_TIMEOUT_SECONDS = 5.0
 # получала отказ — и уведомления менеджерам молча не доходили нигде
 TELEGRAM_BOT_TOKEN = _env.TELEGRAM_BOT_TOKEN
 TELEGRAM_MANAGER_CHAT_ID = _env.TELEGRAM_MANAGER_CHAT_ID
+
+EVENT_PENDING_PAYMENT_TTL_MINUTES = _env.EVENT_PENDING_PAYMENT_TTL_MINUTES
 
 UNFOLD = {
     "SITE_TITLE": "Улица Радости - админка",
