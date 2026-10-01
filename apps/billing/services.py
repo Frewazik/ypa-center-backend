@@ -1694,13 +1694,11 @@ def _recheck_expired_payment(
         )
         return True
 
-    # ПОЧЕМУ: вебхук мог успеть — возврат уже поставлен (или выплачен и флаг
-    # сброшен). Ключ compensation_required остаётся в metadata и после выплаты
-    tx = Transaction.objects.only("status", "metadata").get(pk=tx_id)
-    if (
-        tx.status != TransactionStatus.CANCELED
-        or "compensation_required" in tx.metadata
-    ):
+    # ПОЧЕМУ: вебхук мог успеть — оплата уже учтена (возврат поставлен,
+    # выплачен или ушёл на ручной разбор). Маркер тот же, что в _apply_success:
+    # received_amount заполняется при первом же учёте пришедших денег
+    tx = Transaction.objects.only("status", "received_amount").get(pk=tx_id)
+    if tx.status != TransactionStatus.CANCELED or tx.received_amount is not None:
         return True
 
     logger.critical(

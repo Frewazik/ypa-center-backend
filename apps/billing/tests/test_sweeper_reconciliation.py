@@ -492,6 +492,27 @@ class TestPostExpiryRecheck:
         assert issue_pending_refunds(gateway=paid) == 0
         assert len(paid.refund_calls) == 1
 
+    def test_manual_review_by_webhook_is_not_reported_as_lost_webhook(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Вебхук дошёл, но оплата не в рублях — ушла на ручной разбор без
+        # постановки в очередь. Досверка обязана узнать учтённую оплату
+        # по received_amount и не кричать «вебхук не пришёл»
+        tx = _expired_unpaid()
+        payment_id, paid = _gateway_for(tx, "succeeded", currency="USD")
+        with pytest.raises(PaymentSucceededAfterExpiryError):
+            confirm_payment(
+                payment_id=payment_id, gateway=paid, schedule_port=FakeSchedulePort()
+            )
+
+        with caplog.at_level(logging.CRITICAL, logger="apps.billing.services"):
+            _sweep(paid, later=_NEXT_TICK)
+
+        tx.refresh_from_db()
+        assert tx.payment_recheck_until is None
+        assert tx.requires_compensation is False
+        assert _critical_messages(caplog) == []
+
     def test_webhook_between_recheck_answer_and_write_is_not_doubled(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
