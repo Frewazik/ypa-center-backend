@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     )
     CAPTCHA_SECRET_KEY: str = "1x0000000000000000000000000000000AA"
 
+    # Пусто — уведомления менеджерам не отправляются (ошибка в лог)
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_MANAGER_CHAT_ID: str = ""
+
 
 # ПОЧЕМУ ignore: обязательные поля заполняет pydantic-settings из env/.env,
 # mypy без pydantic-плагина видит их как незаполненные аргументы конструктора
@@ -317,8 +321,10 @@ CAPTCHA_SECRET_KEY = _env.CAPTCHA_SECRET_KEY
 # капчи падала бы в AttributeError на первом же запросе
 EXTERNAL_HTTP_TIMEOUT_SECONDS = 5.0
 
-TELEGRAM_BOT_TOKEN = "dummy-bot-token"
-TELEGRAM_MANAGER_CHAT_ID = "dummy-chat-id"
+# ПОЧЕМУ из окружения: зашитая заглушка уходила в Telegram как настоящий токен,
+# получала отказ — и уведомления менеджерам молча не доходили нигде
+TELEGRAM_BOT_TOKEN = _env.TELEGRAM_BOT_TOKEN
+TELEGRAM_MANAGER_CHAT_ID = _env.TELEGRAM_MANAGER_CHAT_ID
 
 UNFOLD = {
     "SITE_TITLE": "Улица Радости - админка",

@@ -9,6 +9,7 @@ from django.conf import settings
 from django.core.mail import send_mail
 from django.utils import timezone
 
+from apps.core.telegram import send_manager_message
 from config.tkq import broker
 
 from apps.billing.adapters import (
@@ -21,6 +22,7 @@ from apps.billing.adapters import (
 from apps.billing.models import RefundStatus, Transaction
 from apps.billing.ports import SchedulePort, resolve_schedule_port
 from apps.billing.services import (
+    REFUND_STATUSES_AWAITING_MANUAL,
     BillingError,
     confirm_payment,
     issue_pending_refunds,
@@ -136,6 +138,37 @@ def send_refund_email_task(transaction_id: str) -> None:
         recipient_list=[tx.parent.email],
         fail_silently=False,
     )
+
+
+@broker.task(retry_on_error=True, max_retries=5)
+async def notify_refund_review_task(transaction_id: str) -> None:
+    # ПОЧЕМУ: ставится строго из on_commit (services._schedule_refund_review_alert).
+    # Сбой Telegram (TelegramDeliveryError) уходит в ретрай брокера
+    tx = (
+        await Transaction.objects.select_related("parent")
+        .filter(
+            pk=transaction_id,
+            requires_compensation=False,
+            refund_status__in=REFUND_STATUSES_AWAITING_MANUAL,
+        )
+        .afirst()
+    )
+    if tx is None:
+        # ПОЧЕМУ: менеджер мог закрыть возврат раньше, чем дошла очередь
+        logger.info("Ручной разбор %s: уже не требуется.", transaction_id)
+        return
+    amount = tx.received_amount if tx.received_amount is not None else tx.amount
+    parent = tx.parent
+    text = (
+        "Возврат требует ручного разбора\n"
+        f"Получено: {_format_rubles(amount)}\n"
+        f"Причина: {tx.metadata.get('refund_error') or tx.get_refund_status_display()}\n"
+        f"Родитель: {parent.full_name or 'без имени'}, "
+        f"{str(parent.phone or '') or '—'}, {parent.email}\n"
+        f"Платёж ЮКассы: {tx.external_id or '—'}\n"
+        "Админка → «Транзакции» → фильтр «Возврат: нужен ручной разбор»"
+    )
+    await send_manager_message(text, context=f"refund_review tx={tx.pk}")
 
 
 def _format_rubles(kopecks: int) -> str:

@@ -217,6 +217,11 @@ def validate_website(self, value):       # website — honeypot
 transaction.on_commit(lambda: async_to_sync(notify_managers_task.kiq)(instance.pk))
 ```
 
+Сама отправка — общий модуль `apps/core/telegram.py` (`send_manager_message`): им же
+пользуется биллинг для возвратов на ручной разбор. Токен бота и чат менеджеров —
+переменные окружения `TELEGRAM_BOT_TOKEN` и `TELEGRAM_MANAGER_CHAT_ID`; если они пусты,
+уведомление не отправляется, в лог пишется ошибка.
+
 ---
 
 ## Шаг 4. CRM-процессинг в админке
