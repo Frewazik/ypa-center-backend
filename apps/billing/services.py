@@ -1256,6 +1256,7 @@ def _queue_refund(tx: Transaction, currency: str, extra: dict[str, object]) -> N
         tx.pk,
         currency,
     )
+    _schedule_refund_review_alert(tx.pk)
 
 
 def _validate_success_payload(
@@ -1981,32 +1982,46 @@ def sync_pending_refunds(*, gateway: PaymentGateway) -> int:
             locked.save(update_fields=["refund_status", "metadata"])
             if new_status == RefundStatus.SUCCEEDED:
                 _schedule_refund_email(locked.pk)
+            else:
+                _schedule_refund_review_alert(locked.pk)
             changed += 1
     return changed
 
 
 def _schedule_refund_email(transaction_id: uuid.UUID) -> None:
     # ПОЧЕМУ: письмо только о выполненном возврате — обещать деньги, пока
-    # ЮКасса ещё может отменить возврат, нельзя. on_commit: без него воркер
-    # может прочитать транзакцию раньше коммита
-    db_transaction.on_commit(lambda: _enqueue_refund_email(transaction_id))
+    # ЮКасса ещё может отменить возврат, нельзя
+    db_transaction.on_commit(
+        lambda: _enqueue_refund_task("send_refund_email_task", transaction_id)
+    )
 
 
-def _enqueue_refund_email(transaction_id: uuid.UUID) -> None:
-    # ПОЧЕМУ: локальный импорт — tasks импортирует services на уровне модуля
-    from apps.billing.tasks import send_refund_email_task
+def _schedule_refund_review_alert(transaction_id: uuid.UUID) -> None:
+    # ПОЧЕМУ: экран ручного разбора сам никого не зовёт — без сообщения
+    # менеджерам такой возврат ждал бы, пока кто-то случайно откроет админку
+    db_transaction.on_commit(
+        lambda: _enqueue_refund_task("notify_refund_review_task", transaction_id)
+    )
 
-    # ПОЧЕМУ: сбой брокера не должен откатывать уже выполненный возврат —
+
+def _enqueue_refund_task(task_name: str, transaction_id: uuid.UUID) -> None:
+    # ПОЧЕМУ: локальный импорт — tasks импортирует services на уровне модуля.
+    # Вызывается из on_commit: без него воркер может прочитать транзакцию
+    # раньше коммита
+    from apps.billing import tasks
+
+    task = getattr(tasks, task_name)
+    # ПОЧЕМУ: сбой брокера не должен откатывать уже проведённый возврат —
     # в on_commit-колбэке исключение ушло бы наружу из обработчика
     try:
-        async_to_sync(send_refund_email_task.kiq)(str(transaction_id))
+        async_to_sync(task.kiq)(str(transaction_id))
     except Exception:
-        logger.exception("Не удалось поставить письмо о возврате %s", transaction_id)
+        logger.exception("Не удалось поставить %s по %s", task_name, transaction_id)
     finally:
         # ПОЧЕМУ: как в users.services — async_to_sync закрывает локальный
         # event loop, без сброса пул брокера переиспользует мёртвый сокет
-        if hasattr(send_refund_email_task.broker, "connection_pool"):
-            send_refund_email_task.broker.connection_pool.reset()
+        if hasattr(task.broker, "connection_pool"):
+            task.broker.connection_pool.reset()
 
 
 def _quarantine_refund(tx_id: uuid.UUID, reason: str) -> None:
@@ -2030,6 +2045,7 @@ def _quarantine_refund(tx_id: uuid.UUID, reason: str) -> None:
                 "metadata",
             ]
         )
+        _schedule_refund_review_alert(locked.pk)
 
 
 def resolve_refund_manually(transaction_id: uuid.UUID, *, resolved_by: str) -> None:
