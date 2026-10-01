@@ -118,7 +118,9 @@ erDiagram
 (`PENDING` / `SUCCEEDED` / `CANCELED` / `FAILED`), `selected_slot_ids` (JSON),
 `metadata` (JSONB, аудит сверки), `requires_compensation` с partial-индексом
 (очередь возвратов), `compensation_claimed_until` — lease claim-check процессора
-возвратов, `refund_id` и `refund_status` (`PENDING` / `SUCCEEDED` / `CANCELED` —
+возвратов, `payment_recheck_until` с partial-индексом — очередь досверки: заказ снят
+по TTL, а платёж в ЮКассе ещё открыт (`api-core-contracts.md` §2.2),
+`refund_id` и `refund_status` (`PENDING` / `SUCCEEDED` / `CANCELED` —
 статусы ЮКассы, `FAILED` — не отправлен, `MANUAL` — закрыт менеджером). По
 `refund_status` опрашиваются незавершённые возвраты и строится экран ручного
 разбора, поэтому он в колонке, а не в `metadata`.

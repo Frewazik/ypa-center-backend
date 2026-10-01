@@ -210,6 +210,13 @@ class Transaction(models.Model):
     compensation_claimed_until = models.DateTimeField(
         "Возврат зарезервирован до", null=True, blank=True
     )
+    # ПОЧЕМУ: заказ, снятый по TTL с заведённым в ЮКассе платежом, ещё может быть
+    # оплачен по старой ссылке. Пока колонка не NULL, свипер досверяет платёж —
+    # иначе оплата при потерянном вебхуке осталась бы без возврата. Колонка,
+    # а не ключ metadata: очередь по JSONB дала бы Seq Scan
+    payment_recheck_until = models.DateTimeField(
+        "Досверить платёж до", null=True, blank=True
+    )
     # ПОЧЕМУ колонки, а не metadata: по ним опрашиваются незавершённые возвраты
     # и строится экран ручного разбора — логика не должна жить в JSON без схемы
     refund_id = models.CharField(
@@ -234,6 +241,13 @@ class Transaction(models.Model):
                 fields=["created_at"],
                 condition=Q(requires_compensation=True),
                 name="ix_billing_tx_refund_fifo",
+            ),
+            # ПОЧЕМУ: partial — в индекс попадают только заказы в очереди
+            # досверки, а не вся растущая история отменённых транзакций
+            models.Index(
+                fields=["payment_recheck_until"],
+                condition=Q(payment_recheck_until__isnull=False),
+                name="ix_billing_tx_payment_recheck",
             ),
         ]
 

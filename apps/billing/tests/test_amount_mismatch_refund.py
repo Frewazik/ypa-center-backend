@@ -21,7 +21,6 @@ from apps.billing.services import (
     confirm_payment,
     issue_pending_refunds,
     resolve_refund_manually,
-    sweep_stale_pending_transactions,
 )
 from apps.billing.tests.test_billing import (
     FakeGateway,
@@ -31,6 +30,7 @@ from apps.billing.tests.test_billing import (
     _checkout,
     _gateway_for,
     _make_pending_payment,
+    _sweep_unpaid,
 )
 
 
@@ -138,7 +138,7 @@ class TestLatePaymentRefundAmount:
         Transaction.objects.filter(pk=tx.pk).update(
             created_at=timezone.now() - timedelta(hours=1)
         )
-        assert sweep_stale_pending_transactions() == 1
+        assert _sweep_unpaid() == 1
         return tx
 
     def test_late_payment_refunds_received_not_expected_amount(self) -> None:
