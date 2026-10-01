@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import zoneinfo
 from typing import TYPE_CHECKING
 
 import pytest
@@ -205,6 +206,25 @@ class TestChildDelete:
             canceled.pk,
             past_trial.pk,
         }
+
+    # ПОЧЕМУ: фабрика обязана брать «сегодня» по часам Django, а не ОС —
+    # иначе вечером по Москве (в Новосибирске уже завтра) пробное «на сегодня»
+    # считалось прошедшим. Зоны +14 и −12 расходятся с датой ОС в любой
+    # момент суток хотя бы одна, поэтому тест ловит регресс без заморозки часов
+    @pytest.mark.parametrize("tz_name", ["Pacific/Kiritimati", "Etc/GMT+12"])
+    def test_todays_trial_blocks_delete_in_any_timezone(
+        self, api_client: APIClient, parent: Parent, tz_name: str
+    ) -> None:
+        child = StudentFactory(parent=parent)
+
+        with timezone.override(tz_name):
+            enrollment = EnrollmentFactory(student=child, trial=True)
+            response = api_client.delete(_child_url(child))
+
+        assert enrollment.trial_date == timezone.localdate(
+            timezone.now(), timezone=zoneinfo.ZoneInfo(tz_name)
+        )
+        assert response.status_code == status.HTTP_409_CONFLICT
 
     @pytest.mark.parametrize(
         ("kind", "enrollment_status"),

@@ -91,7 +91,7 @@ class ScheduleMaskFactory(factory.django.DjangoModelFactory):
         model = ScheduleMask
 
     schedule = factory.SubFactory(ScheduleFactory)
-    target_date = factory.LazyFunction(datetime.date.today)
+    target_date = factory.LazyFunction(timezone.localdate)
     type = MaskType.CANCELLATION
 
     class Params:
@@ -160,7 +160,7 @@ class EnrollmentFactory(factory.django.DjangoModelFactory):
         trial = factory.Trait(
             type="TRIAL",
             subscription=None,
-            trial_date=factory.LazyFunction(datetime.date.today),
+            trial_date=factory.LazyFunction(timezone.localdate),
             activity=factory.LazyAttribute(lambda o: o.schedule.activity),
         )
 

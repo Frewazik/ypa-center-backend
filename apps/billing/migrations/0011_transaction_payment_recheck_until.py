@@ -6,7 +6,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("billing", "0008_enrollment_unique_regular_only"),
+        ("billing", "0010_transaction_refund_status"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

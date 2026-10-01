@@ -96,6 +96,8 @@ class PaymentGateway(Protocol):
         # на стороне ЮКассы по переданному ключу
         ...
 
+    def get_refund(self, refund_id: str) -> RefundInfo: ...
+
 
 class YookassaSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="YOOKASSA_")
@@ -240,6 +242,24 @@ class YookassaHttpGateway:
         )
         _raise_for_client_error(payment_id, response)
         return _parse_refund_body(payment_id, response.content)
+
+    def get_refund(self, refund_id: str) -> RefundInfo:
+        if not _PAYMENT_ID_PATTERN.match(refund_id):
+            # ПОЧЕМУ: id подставляется в URL — тот же формат и та же защита
+            # от path traversal, что у платежа
+            raise GatewayContractError(f"Недопустимый формат refund_id: {refund_id!r}.")
+
+        response = self._request(
+            "GET", f"/refunds/{refund_id}", action=f"запрос возврата {refund_id}"
+        )
+        # ПОЧЕМУ не _raise_for_client_error: его 404 — «платёж не найден»,
+        # а здесь не найден возврат; для опроса любой 4xx — ручной разбор
+        if response.status_code >= 400:
+            raise GatewayContractError(
+                f"ЮКасса отвергла запрос возврата {refund_id}: "
+                f"HTTP {response.status_code}."
+            )
+        return _parse_refund_body(refund_id, response.content)
 
 
 def _parse_payment_body(payment_id: str, raw_body: bytes) -> PaymentInfo:

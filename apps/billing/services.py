@@ -9,6 +9,7 @@ from datetime import date, datetime, time, timedelta
 from dataclasses import dataclass
 from typing import Literal
 
+from asgiref.sync import async_to_sync
 from django.db import IntegrityError
 from django.db import transaction as db_transaction
 from django.db.models import Count, Q
@@ -33,6 +34,7 @@ from apps.billing.models import (
     EnrollmentType,
     IdempotencyRecord,
     ParentDeposit,
+    RefundStatus,
     Subscription,
     SubscriptionPlan,
     SubscriptionSlot,
@@ -172,6 +174,14 @@ class AmountMismatchError(BillingError):
         self.actual_currency = actual_currency
 
 
+class RefundNotAwaitingManualError(BillingError):
+    def __init__(self, transaction_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Транзакция {transaction_id} не ждёт ручного разбора возврата."
+        )
+        self.transaction_id = transaction_id
+
+
 class SubscriptionNotActivatableError(BillingError):
     def __init__(self, payment_id: str, subscription_id: int) -> None:
         super().__init__(
@@ -298,6 +308,11 @@ _POST_EXPIRY_RECHECK_WINDOW = timedelta(hours=24)
 # ПОЧЕМУ: lease обязан переживать сетевой вызов к шлюзу с ретраями,
 # но не блокировать возврат надолго после смерти воркера
 _REFUND_CLAIM_TTL = timedelta(minutes=10)
+# ПОЧЕМУ: CANCELED — ответ ЮКассы «возврат не прошёл»; вместе с нашим
+# карантином это всё, что требует рук менеджера
+REFUND_STATUSES_AWAITING_MANUAL = frozenset(
+    {RefundStatus.FAILED, RefundStatus.CANCELED}
+)
 
 
 # ПОЧЕМУ: дефолтное значение для снапшота, бизнес-правила могут меняться,
@@ -1009,17 +1024,23 @@ def _apply_success(
             if (
                 tx.status == TransactionStatus.CANCELED
                 and tx.metadata.get("canceled_reason") in _REFUNDABLE_CANCEL_REASONS
-                and not tx.metadata.get("compensation_required")
+                # ПОЧЕМУ received_amount, а не флаг возврата: флаг сбрасывается
+                # после выплаты, и повторный вебхук поставил бы возврат снова
+                and tx.received_amount is None
             ):
                 # ПОЧЕМУ: вебхук опоздал, заказ уже аннулирован (TTL-свипер или
                 # аварийное прерывание checkout) — инициируем возврат
                 tx.external_id = info.id
-                tx.save(update_fields=["external_id"])
-                _mark_for_compensation(tx, {"reason": "PAYMENT_SUCCEEDED_AFTER_EXPIRY"})
+                tx.received_amount = info.amount_kopecks
+                tx.save(update_fields=["external_id", "received_amount"])
+                _queue_refund(
+                    tx, info.currency, {"reason": "PAYMENT_SUCCEEDED_AFTER_EXPIRY"}
+                )
                 deferred = PaymentSucceededAfterExpiryError(info.id, str(tx.pk))
         elif info.currency != _EXPECTED_CURRENCY or info.amount_kopecks != tx.amount:
             tx.status = TransactionStatus.FAILED
             tx.external_id = info.id
+            tx.received_amount = info.amount_kopecks
             tx.metadata = {
                 **tx.metadata,
                 "failure_reason": "AMOUNT_MISMATCH",
@@ -1028,7 +1049,12 @@ def _apply_success(
                 "gateway_amount_kopecks": info.amount_kopecks,
                 "gateway_currency": info.currency,
             }
-            tx.save(update_fields=["status", "external_id", "metadata"])
+            tx.save(
+                update_fields=["status", "external_id", "received_amount", "metadata"]
+            )
+            # ПОЧЕМУ: заказ не исполняется, а деньги у нас — возвращаем всё
+            # пришедшее; депозитную часть вернёт _release_order_resources
+            _queue_refund(tx, info.currency, {})
             _release_order_resources(tx)
             deferred = AmountMismatchError(
                 info.id, tx.amount, info.amount_kopecks, info.currency
@@ -1040,12 +1066,20 @@ def _apply_success(
             if data_error is not None:
                 tx.status = TransactionStatus.FAILED
                 tx.external_id = info.id
+                tx.received_amount = info.amount_kopecks
                 tx.metadata = {
                     **tx.metadata,
                     "failure_reason": "DATA_INTEGRITY",
                     "detail": str(data_error),
                 }
-                tx.save(update_fields=["status", "external_id", "metadata"])
+                tx.save(
+                    update_fields=[
+                        "status",
+                        "external_id",
+                        "received_amount",
+                        "metadata",
+                    ]
+                )
                 _mark_for_compensation(tx, {})
                 _release_order_resources(tx)
                 deferred = data_error
@@ -1056,7 +1090,8 @@ def _apply_success(
                 assert subscription_id is not None
                 tx.status = TransactionStatus.SUCCEEDED
                 tx.external_id = info.id
-                tx.save(update_fields=["status", "external_id"])
+                tx.received_amount = info.amount_kopecks
+                tx.save(update_fields=["status", "external_id", "received_amount"])
 
                 try:
                     start_date, expires_at = _activation_window(slot_ids, schedule_port)
@@ -1147,7 +1182,8 @@ def _apply_trial_success(
     # за время оплаты, а место — уйти конкуренту
     tx.status = TransactionStatus.SUCCEEDED
     tx.external_id = info.id
-    tx.save(update_fields=["status", "external_id"])
+    tx.received_amount = info.amount_kopecks
+    tx.save(update_fields=["status", "external_id", "received_amount"])
 
     # !!!: порядок захвата (advisory-лок слота → строка Enrollment) обязан
     # совпадать с _try_enroll_held_seats, иначе вебхуки пробного и абонемента
@@ -1199,6 +1235,27 @@ def _mark_for_compensation(tx: Transaction, extra: dict[str, object]) -> None:
     tx.requires_compensation = True
     tx.metadata = {**tx.metadata, "compensation_required": True, **extra}
     tx.save(update_fields=["requires_compensation", "metadata"])
+
+
+def _queue_refund(tx: Transaction, currency: str, extra: dict[str, object]) -> None:
+    # ПОЧЕМУ: возврат в ЮКассе делается в валюте платежа, а наш шлюз шлёт только
+    # рубли в копейках. Платежи мы создаём строго в RUB, чужая валюта — аномалия:
+    # автоматом не возвращаем, отдаём на ручной разбор (экран транзакций в админке)
+    if currency == _EXPECTED_CURRENCY:
+        _mark_for_compensation(tx, extra)
+        return
+    tx.refund_status = RefundStatus.FAILED
+    tx.metadata = {
+        **tx.metadata,
+        **extra,
+        "refund_error": f"валюта платежа {currency} — возврат вручную",
+    }
+    tx.save(update_fields=["refund_status", "metadata"])
+    logger.error(
+        "Транзакция %s: оплата в валюте %s — возврат требует ручного разбора.",
+        tx.pk,
+        currency,
+    )
 
 
 def _validate_success_payload(
@@ -1842,10 +1899,17 @@ def issue_pending_refunds(
             )
             continue
 
+        # ПОЧЕМУ: возвращаем пришедшее, а не ожидаемое — при недоплате ЮКасса
+        # отвергла бы возврат больше суммы платежа. Сумма берётся из колонки,
+        # поэтому ретрай после падения шлёт тот же запрос под тем же ключом.
+        # NULL — транзакции до появления колонки, там сумма сверена с amount
+        refund_amount = (
+            tx.received_amount if tx.received_amount is not None else tx.amount
+        )
         try:
             refund = gateway.create_refund(
                 payment_id=tx.external_id,
-                amount_kopecks=tx.amount,
+                amount_kopecks=refund_amount,
                 idempotence_key=f"refund-{tx.pk}",
             )
         except GatewayContractError as exc:
@@ -1860,21 +1924,91 @@ def issue_pending_refunds(
                 continue
             locked.requires_compensation = False
             locked.compensation_claimed_until = None
-            locked.metadata = {
-                **locked.metadata,
-                "compensation_required": False,
-                "refund_id": refund.id,
-                "refund_status": refund.status,
-            }
+            locked.refund_id = refund.id
+            locked.refund_status = RefundStatus(refund.status.upper())
+            locked.metadata = {**locked.metadata, "compensation_required": False}
             locked.save(
                 update_fields=[
                     "requires_compensation",
                     "compensation_claimed_until",
+                    "refund_id",
+                    "refund_status",
                     "metadata",
                 ]
             )
+            if locked.refund_status == RefundStatus.SUCCEEDED:
+                _schedule_refund_email(locked.pk)
             issued += 1
     return issued
+
+
+def sync_pending_refunds(*, gateway: PaymentGateway) -> int:
+    # ПОЧЕМУ: ЮКасса может принять возврат в обработку и позже отменить его.
+    # Итог узнаём опросом API, а не из вебхука: тело вебхука не доверенное,
+    # и повторный GET по тому же возврату идемпотентен
+    candidates = list(
+        Transaction.objects.filter(
+            refund_status=RefundStatus.PENDING, refund_id__isnull=False
+        )
+        .order_by("created_at")
+        .values_list("pk", "refund_id")[:_REFUND_CHUNK_SIZE]
+    )
+
+    changed = 0
+    for tx_id, refund_id in candidates:
+        assert refund_id is not None  # сужение: выборка фильтрует NULL
+        error: str | None = None
+        try:
+            refund = gateway.get_refund(refund_id)
+        except GatewayContractError as exc:
+            new_status, error = RefundStatus.FAILED, str(exc)
+        else:
+            if refund.status == "pending":
+                continue
+            new_status = RefundStatus(refund.status.upper())
+        # ПОЧЕМУ: транзитные сбои (GatewayNetworkError) пробрасываются наружу —
+        # незавершённые возвраты доопросит ретрай или следующий тик
+
+        with db_transaction.atomic():
+            locked = (
+                Transaction.objects.select_for_update()
+                .filter(pk=tx_id, refund_status=RefundStatus.PENDING)
+                .first()
+            )
+            if locked is None:
+                continue  # параллельный тик успел первым
+            locked.refund_status = new_status
+            if error is not None:
+                locked.metadata = {**locked.metadata, "refund_error": error}
+            locked.save(update_fields=["refund_status", "metadata"])
+            if new_status == RefundStatus.SUCCEEDED:
+                _schedule_refund_email(locked.pk)
+            changed += 1
+    return changed
+
+
+def _schedule_refund_email(transaction_id: uuid.UUID) -> None:
+    # ПОЧЕМУ: письмо только о выполненном возврате — обещать деньги, пока
+    # ЮКасса ещё может отменить возврат, нельзя. on_commit: без него воркер
+    # может прочитать транзакцию раньше коммита
+    db_transaction.on_commit(lambda: _enqueue_refund_email(transaction_id))
+
+
+def _enqueue_refund_email(transaction_id: uuid.UUID) -> None:
+    # ПОЧЕМУ: локальный импорт — tasks импортирует services на уровне модуля
+    from apps.billing.tasks import send_refund_email_task
+
+    # ПОЧЕМУ: сбой брокера не должен откатывать уже выполненный возврат —
+    # в on_commit-колбэке исключение ушло бы наружу из обработчика
+    try:
+        async_to_sync(send_refund_email_task.kiq)(str(transaction_id))
+    except Exception:
+        logger.exception("Не удалось поставить письмо о возврате %s", transaction_id)
+    finally:
+        # ПОЧЕМУ: как в users.services — async_to_sync закрывает локальный
+        # event loop, без сброса пул брокера переиспользует мёртвый сокет
+        if hasattr(send_refund_email_task.broker, "connection_pool"):
+            send_refund_email_task.broker.connection_pool.reset()
 
 
 def _quarantine_refund(tx_id: uuid.UUID, reason: str) -> None:
@@ -1884,19 +2018,40 @@ def _quarantine_refund(tx_id: uuid.UUID, reason: str) -> None:
             return
         locked.requires_compensation = False
         locked.compensation_claimed_until = None
+        locked.refund_status = RefundStatus.FAILED
         locked.metadata = {
             **locked.metadata,
             "compensation_required": False,
-            "refund_status": "failed",
             "refund_error": reason,
         }
         locked.save(
             update_fields=[
                 "requires_compensation",
                 "compensation_claimed_until",
+                "refund_status",
                 "metadata",
             ]
         )
+
+
+def resolve_refund_manually(transaction_id: uuid.UUID, *, resolved_by: str) -> None:
+    # ПОЧЕМУ: менеджер разобрал возврат вне системы (кабинет ЮКассы) — фиксируем,
+    # кто и когда закрыл. Прежние refund_error/refund_id остаются для аудита
+    with db_transaction.atomic():
+        tx = Transaction.objects.select_for_update().filter(pk=transaction_id).first()
+        if (
+            tx is None
+            or tx.requires_compensation
+            or tx.refund_status not in REFUND_STATUSES_AWAITING_MANUAL
+        ):
+            raise RefundNotAwaitingManualError(transaction_id)
+        tx.refund_status = RefundStatus.MANUAL
+        tx.metadata = {
+            **tx.metadata,
+            "refund_resolved_by": resolved_by,
+            "refund_resolved_at": timezone.now().isoformat(),
+        }
+        tx.save(update_fields=["refund_status", "metadata"])
 
 
 def sweep_finalized_idempotency_records(*, now: datetime | None = None) -> int:
