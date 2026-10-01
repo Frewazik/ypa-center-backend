@@ -855,9 +855,8 @@ class TestUpcomingFeed:
         # можно было увидеть чужие регистрации с именами детей
         event = EventFactory(start_datetime=timezone.now() + datetime.timedelta(days=3))
         _guest_registration(event, phone=str(parent.phone))
-        EventRegistrationFactory(
-            event=event, parent=ParentFactory(), phone=str(parent.phone)
-        )
+        # ПОЧЕМУ другое событие: один номер — одна активная запись на событие
+        EventRegistrationFactory(parent=ParentFactory(), phone=str(parent.phone))
 
         response = api_client.get(UPCOMING_URL)
 
@@ -1257,11 +1256,9 @@ class TestBookings:
     def test_same_phone_other_parent_is_invisible(
         self, api_client: APIClient, parent: Parent
     ) -> None:
-        event = EventFactory()
-        EventRegistrationFactory(
-            event=event, parent=ParentFactory(), phone=str(parent.phone)
-        )
-        _guest_registration(event, phone=str(parent.phone))
+        EventRegistrationFactory(parent=ParentFactory(), phone=str(parent.phone))
+        # ПОЧЕМУ другое событие: один номер — одна активная запись на событие
+        _guest_registration(EventFactory(), phone=str(parent.phone))
 
         assert api_client.get(BOOKINGS_URL, {"period": "all"}).json() == []
 
@@ -1275,7 +1272,7 @@ class TestBookings:
             event=event, parent=ParentFactory(), email=parent.email
         )
         # Гость без email ни с кем не совпадает
-        _guest_registration(event, email="")
+        _guest_registration(event, email="", phone="+79130000001")
 
         items = api_client.get(BOOKINGS_URL).json()
 

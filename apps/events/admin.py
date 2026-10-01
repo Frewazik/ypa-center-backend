@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.db.models import QuerySet
 from django.http import HttpRequest
 
 from unfold.admin import ModelAdmin
 
-from apps.events.models import Event, EventRegistration, RegistrationStatus
-from apps.events.services import cancel_registration
+from apps.events.models import Event, EventRegistration
+from apps.events.services import cancel_registration, confirm_registration
 
 
 @admin.register(Event)
@@ -61,9 +61,17 @@ class EventRegistrationAdmin(ModelAdmin):
     def confirm_selected(
         self, request: HttpRequest, queryset: QuerySet[EventRegistration]
     ) -> None:
-        queryset.filter(
-            status__in=(RegistrationStatus.NEW, RegistrationStatus.PENDING_PAYMENT)
-        ).update(status=RegistrationStatus.CONFIRMED)
+        ids = list(queryset.values_list("pk", flat=True))
+        confirmed = sum(1 for pk in ids if confirm_registration(pk))
+        # ПОЧЕМУ: бронь могла сняться по TTL, пока менеджер держал страницу
+        # открытой, — без сообщения он решил бы, что подтвердил её
+        self.message_user(request, f"Подтверждено: {confirmed}.")
+        if skipped := len(ids) - confirmed:
+            self.message_user(
+                request,
+                f"Пропущено: {skipped} — уже подтверждены или отменены.",
+                level=messages.WARNING,
+            )
 
     @admin.action(description="Отменить и освободить места")
     def cancel_selected(
