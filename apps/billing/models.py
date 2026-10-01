@@ -23,6 +23,16 @@ class TransactionStatus(models.TextChoices):
     FAILED = "FAILED", "Ошибка сверки"
 
 
+class RefundStatus(models.TextChoices):
+    # ПОЧЕМУ: PENDING/SUCCEEDED/CANCELED — статусы возврата у ЮКассы,
+    # FAILED и MANUAL — наши: не отправлен (карантин) и закрыт менеджером
+    PENDING = "PENDING", "В обработке у ЮКассы"
+    SUCCEEDED = "SUCCEEDED", "Выполнен"
+    CANCELED = "CANCELED", "Отменён ЮКассой"
+    FAILED = "FAILED", "Не отправлен"
+    MANUAL = "MANUAL", "Разобран вручную"
+
+
 class AttendanceStatus(models.TextChoices):
     ATTENDED = "ATTENDED", "Присутствовал"
     ABSENT_ERR = "ABSENT_ERR", "Отсутствие (ошибочная отметка)"
@@ -152,6 +162,12 @@ class Transaction(models.Model):
         verbose_name="Абонемент",
     )
     amount = models.IntegerField("Сумма, в копейках")
+    # ПОЧЕМУ: фактически полученное от провайдера (может не совпасть с amount).
+    # NULL — успешной оплаты ещё не видели; заполненное поле — маркер
+    # «деньги пришли», по нему возврат берёт сумму и не ставится дважды
+    received_amount = models.IntegerField(
+        "Получено от провайдера, в копейках", null=True, blank=True
+    )
     external_id = models.CharField(
         "ID платежа ЮКассы",
         max_length=255,
@@ -193,6 +209,18 @@ class Transaction(models.Model):
     # TTL вместо вечного флага, чтобы возврат упавшего воркера не завис навсегда
     compensation_claimed_until = models.DateTimeField(
         "Возврат зарезервирован до", null=True, blank=True
+    )
+    # ПОЧЕМУ колонки, а не metadata: по ним опрашиваются незавершённые возвраты
+    # и строится экран ручного разбора — логика не должна жить в JSON без схемы
+    refund_id = models.CharField(
+        "ID возврата ЮКассы", max_length=64, null=True, blank=True
+    )
+    refund_status = models.CharField(
+        "Статус возврата",
+        max_length=20,
+        choices=RefundStatus.choices,
+        null=True,
+        blank=True,
     )
     created_at = models.DateTimeField("Создана", auto_now_add=True)
 

@@ -5,6 +5,10 @@ from __future__ import annotations
 
 import logging
 
+from django.conf import settings
+from django.core.mail import send_mail
+from django.utils import timezone
+
 from config.tkq import broker
 
 from apps.billing.adapters import (
@@ -14,6 +18,7 @@ from apps.billing.adapters import (
     PaymentNotFoundError,
     YookassaHttpGateway,
 )
+from apps.billing.models import RefundStatus, Transaction
 from apps.billing.ports import SchedulePort, resolve_schedule_port
 from apps.billing.services import (
     BillingError,
@@ -22,6 +27,7 @@ from apps.billing.services import (
     sweep_expired_subscriptions,
     sweep_finalized_idempotency_records,
     sweep_stale_pending_transactions,
+    sync_pending_refunds,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,6 +93,47 @@ def sweep_billing_states() -> None:
 def process_compensation_refunds() -> None:
     # !!!: включен автоматический ретрай при сетевых сбоях, повтор безопасен,
     # так как Idempotence-Key провайдера жестко детерминирован ID транзакции
-    issued = issue_pending_refunds(gateway=YookassaHttpGateway())
-    if issued:
-        logger.info("Компенсации: создано возвратов — %d.", issued)
+    gateway = YookassaHttpGateway()
+    issued = issue_pending_refunds(gateway=gateway)
+    settled = sync_pending_refunds(gateway=gateway)
+    if issued or settled:
+        logger.info(
+            "Компенсации: создано возвратов — %d, получен итог по возвратам — %d.",
+            issued,
+            settled,
+        )
+
+
+@broker.task(retry_on_error=True, max_retries=3)
+def send_refund_email_task(transaction_id: str) -> None:
+    # ПОЧЕМУ: синхронная функция уводит SMTP I/O в тредпул.
+    # Ставится строго из on_commit (services._schedule_refund_email)
+    tx = (
+        Transaction.objects.select_related("parent")
+        .filter(pk=transaction_id, refund_status=RefundStatus.SUCCEEDED)
+        .first()
+    )
+    if tx is None:
+        logger.error("Письмо о возврате: транзакция %s не найдена.", transaction_id)
+        return
+    amount = tx.received_amount if tx.received_amount is not None else tx.amount
+    paid_on = timezone.localdate(tx.created_at).strftime("%d.%m.%Y")
+    send_mail(
+        subject="Возврат оплаты — «Улица Радости»",
+        message=(
+            f"Здравствуйте, {tx.parent.full_name}!\n\n"
+            f"Заказ по вашему платежу от {paid_on} не был оформлен, поэтому мы "
+            f"вернули {_format_rubles(amount)}.\n"
+            f"Деньги вернутся тем же способом, которым вы платили; срок "
+            f"зачисления зависит от банка.\n\n"
+            f"Если остались вопросы — свяжитесь с нами."
+        ),
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        recipient_list=[tx.parent.email],
+        fail_silently=False,
+    )
+
+
+def _format_rubles(kopecks: int) -> str:
+    rubles, rest = divmod(kopecks, 100)
+    return f"{rubles:,}".replace(",", " ") + f",{rest:02d} ₽"
