@@ -256,12 +256,12 @@ class FakeSchedulePort:
             raise UnknownSlotError(slot_id)
         return self.default_capacity
 
-    def get_next_lesson_date(self, slot_id: int, on_or_after: date) -> date:
+    def get_next_lesson_date(self, slot_id: int, after: datetime) -> date:
         if slot_id in self.lesson_dates:
             return self.lesson_dates[slot_id]
         if self.strict:
             raise UnknownSlotError(slot_id)
-        return on_or_after + timedelta(days=1)
+        return timezone.localdate(after) + timedelta(days=1)
 
     def get_slot_trial_info(self, slot_id: int) -> SlotTrialInfo:
         if slot_id in self.trial_infos:

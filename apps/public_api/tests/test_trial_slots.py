@@ -340,11 +340,12 @@ class TestSlotsPassTrialCheckout:
         slots = APIClient().get(_slots_url(activity.pk)).json()["slots"]
 
         assert any(slot["is_rescheduled"] for slot in slots)
+        now = timezone.now()
         for slot in slots:
             trial_date = datetime.date.fromisoformat(slot["date"])
-            assert (
-                port.get_next_lesson_date(slot["schedule_id"], trial_date) == trial_date
-            )
+            # Тот же момент, что передаёт чекаут пробного
+            after = max(now, _at(trial_date, 0))
+            assert port.get_next_lesson_date(slot["schedule_id"], after) == trial_date
 
     def test_first_slot_can_be_bought(self, activity: Activity) -> None:
         _group(activity, 2, datetime.time(17))
