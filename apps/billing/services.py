@@ -3,13 +3,12 @@ from __future__ import annotations
 import calendar
 import logging
 import uuid
-from contextlib import suppress
 from collections.abc import Sequence
-from datetime import date, datetime, time, timedelta
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
 from typing import Literal
 
-from asgiref.sync import async_to_sync
 from django.db import IntegrityError
 from django.db import transaction as db_transaction
 from django.db.models import Count, Q
@@ -45,6 +44,7 @@ from apps.billing.models import (
 from apps.billing.ports import SchedulePort, UnknownSlotError
 from apps.billing.selectors import active_seat_q, attendances_awaiting_debit
 from apps.core.locks import advisory_xact_lock, advisory_xact_lock_many
+from apps.core.queue import kiq_safely
 from apps.users.models import Student
 
 logger = logging.getLogger(__name__)
@@ -2061,18 +2061,7 @@ def _enqueue_refund_task(task_name: str, transaction_id: uuid.UUID) -> None:
     # раньше коммита
     from apps.billing import tasks
 
-    task = getattr(tasks, task_name)
-    # ПОЧЕМУ: сбой брокера не должен откатывать уже проведённый возврат —
-    # в on_commit-колбэке исключение ушло бы наружу из обработчика
-    try:
-        async_to_sync(task.kiq)(str(transaction_id))
-    except Exception:
-        logger.exception("Не удалось поставить %s по %s", task_name, transaction_id)
-    finally:
-        # ПОЧЕМУ: как в users.services — async_to_sync закрывает локальный
-        # event loop, без сброса пул брокера переиспользует мёртвый сокет
-        if hasattr(task.broker, "connection_pool"):
-            task.broker.connection_pool.reset()
+    kiq_safely(getattr(tasks, task_name), str(transaction_id))
 
 
 def _quarantine_refund(tx_id: uuid.UUID, reason: str) -> None:

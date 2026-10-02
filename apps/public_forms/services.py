@@ -5,11 +5,12 @@ from dataclasses import dataclass
 from typing import Final
 
 import httpx
-from asgiref.sync import async_to_sync, sync_to_async
+from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.db import transaction
 from rest_framework.serializers import ValidationError
 
+from apps.core.queue import kiq_safely
 from apps.public_forms.models import CallbackRequest, FeedbackRequest
 from apps.public_forms.tasks import FormType, notify_managers_task
 from apps.users.consent import ConsentSource, record_consent
@@ -70,17 +71,8 @@ async def verify_captcha_token(token: str, remote_ip: str | None) -> bool:
 
 
 def _enqueue_notification(request_id: int, form_type: FormType) -> None:
-    try:
-        async_to_sync(notify_managers_task.kiq)(request_id, form_type)
-    except Exception:
-        # ПОЧЕМУ: сбой очереди уведомлений не должен ломать уже сохранённую заявку клиенту
-        logger.exception("Не удалось отправить задачу уведомления менеджеров в очередь")
-    finally:
-        # ПОЧЕМУ: async_to_sync закрывает созданный локальный event loop.
-        # Без сброса пула следующий запрос попытается переиспользовать сокет
-        # из закрытого loop'а и упадёт с 'Event loop is closed'
-        if hasattr(notify_managers_task.broker, "connection_pool"):
-            notify_managers_task.broker.connection_pool.reset()
+    # ПОЧЕМУ: сбой очереди уведомлений не должен ломать уже сохранённую заявку клиенту
+    kiq_safely(notify_managers_task, request_id, form_type)
 
 
 def _schedule_manager_notification(request_id: int, form_type: FormType) -> None:
