@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import logging
 import secrets
 import string
 from dataclasses import dataclass
 from datetime import timedelta
 
-from asgiref.sync import async_to_sync
 from django.db import models, transaction
 from django.utils import timezone
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.core.locks import text_lock_key, try_advisory_xact_lock
+from apps.core.queue import kiq_safely
 from apps.users.constants import (
     OTP_COOLDOWN_SECONDS,
     OTP_LENGTH,
@@ -20,25 +20,13 @@ from apps.users.constants import (
 )
 from apps.users.models import MagicTokens, Parent
 from apps.users.tasks import send_otp_email_task
-from rest_framework_simplejwt.tokens import RefreshToken
-
-logger = logging.getLogger(__name__)
 
 
 def _enqueue_otp_email(email: str, code: str) -> None:
     # ПОЧЕМУ: то же, что _enqueue_notification в public_forms (ae9e222).
     # Сбой очереди не должен ронять запрос кода — MagicTokens уже сохранён,
     # а клиент получит 500 вместо шага ввода кода.
-    try:
-        async_to_sync(send_otp_email_task.kiq)(email, code)
-    except Exception:
-        logger.exception("Не удалось отправить задачу OTP-письма в очередь")
-    finally:
-        # ПОЧЕМУ: async_to_sync закрывает созданный локальный event loop.
-        # Без сброса пула следующий запрос переиспользует сокет из закрытого
-        # loop'а и падает с 'Event loop is closed'
-        if hasattr(send_otp_email_task.broker, "connection_pool"):
-            send_otp_email_task.broker.connection_pool.reset()
+    kiq_safely(send_otp_email_task, email, code)
 
 
 class OTPNotFoundError(Exception):

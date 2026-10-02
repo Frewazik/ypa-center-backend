@@ -7,9 +7,11 @@ from django.db.models import Count, Prefetch, Q, QuerySet
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from rest_framework import generics
+from rest_framework.exceptions import NotFound
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from apps.billing.models import EnrollmentStatus, SubscriptionPlan
 from apps.catalog.models import Activity
@@ -24,14 +26,20 @@ from apps.public_api.serializers import (
     GalleryImagePublicSerializer,
     SubscriptionPlanPublicSerializer,
     TeacherPublicSerializer,
+    TrialSlotsResponseSerializer,
 )
 from apps.schedule.models import Schedule
+from apps.schedule.services import list_trial_slots
 from apps.users.models import TeacherProfile
 
 POPULAR_ACTIVITIES_LIMIT: Final[int] = 3
 PAST_EVENTS_VISIBILITY_DAYS: Final[int] = 7
 CACHE_TTL_SHOWCASE_SECONDS: Final[int] = 60 * 5
 CACHE_TTL_EVENTS_SECONDS: Final[int] = 60
+# ПОЧЕМУ коротко: места меняются с каждой покупкой, а инвалидации по записям
+# нет. Устаревший на полминуты список безопасен — чекаут перепроверяет места
+# под блокировкой и ответит 409 NO_AVAILABLE_SEATS
+CACHE_TTL_TRIAL_SLOTS_SECONDS: Final[int] = 30
 
 
 def _active_groups_queryset() -> QuerySet[Schedule]:
@@ -284,3 +292,43 @@ class PublicEventListView(generics.ListAPIView[Event]):
                 request, *args, **kwargs
             ),
         )
+
+
+class ActivityTrialSlotsView(APIView):
+    permission_classes = (AllowAny,)
+    authentication_classes = ()
+
+    @extend_schema(
+        operation_id="public_activity_next_slots",
+        summary="Свободные занятия кружка для пробного на две недели",
+        description=(
+            "Окно — сегодня + 13 дней. Только занятия, которые ещё не начались, "
+            "не отменены и где есть свободное место; переносы уже применены. "
+            "Из элемента берутся schedule_id и date для POST /checkout/trial "
+            "(trial_date = date). Нет свободных занятий — пустой slots. "
+            "Кэш 30 секунд."
+        ),
+        responses=TrialSlotsResponseSerializer,
+    )
+    def get(self, request: Request, pk: int) -> Response:
+        return cached_payload(
+            key=payload_cache_key("activity_next_slots", request),
+            ttl_seconds=CACHE_TTL_TRIAL_SLOTS_SECONDS,
+            produce=lambda: self._produce(pk),
+        )
+
+    def _produce(self, pk: int) -> Response:
+        # Бюджет: 1 запрос на кружок + 2 на каждую из 2–3 недель окна
+        activity = (
+            Activity.objects.filter(pk=pk, is_active=True).only("id", "name").first()
+        )
+        if activity is None:
+            raise NotFound("Кружок не найден.")
+        trial_slots = list_trial_slots(activity.pk, now=timezone.now())
+        payload = {
+            "activity": activity,
+            "date_from": trial_slots.date_from,
+            "date_to": trial_slots.date_to,
+            "slots": trial_slots.slots,
+        }
+        return Response(TrialSlotsResponseSerializer(payload).data)

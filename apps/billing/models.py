@@ -23,6 +23,16 @@ class TransactionStatus(models.TextChoices):
     FAILED = "FAILED", "Ошибка сверки"
 
 
+class RefundStatus(models.TextChoices):
+    # ПОЧЕМУ: PENDING/SUCCEEDED/CANCELED — статусы возврата у ЮКассы,
+    # FAILED и MANUAL — наши: не отправлен (карантин) и закрыт менеджером
+    PENDING = "PENDING", "В обработке у ЮКассы"
+    SUCCEEDED = "SUCCEEDED", "Выполнен"
+    CANCELED = "CANCELED", "Отменён ЮКассой"
+    FAILED = "FAILED", "Не отправлен"
+    MANUAL = "MANUAL", "Разобран вручную"
+
+
 class AttendanceStatus(models.TextChoices):
     ATTENDED = "ATTENDED", "Присутствовал"
     ABSENT_ERR = "ABSENT_ERR", "Отсутствие (ошибочная отметка)"
@@ -152,6 +162,12 @@ class Transaction(models.Model):
         verbose_name="Абонемент",
     )
     amount = models.IntegerField("Сумма, в копейках")
+    # ПОЧЕМУ: фактически полученное от провайдера (может не совпасть с amount).
+    # NULL — успешной оплаты ещё не видели; заполненное поле — маркер
+    # «деньги пришли», по нему возврат берёт сумму и не ставится дважды
+    received_amount = models.IntegerField(
+        "Получено от провайдера, в копейках", null=True, blank=True
+    )
     external_id = models.CharField(
         "ID платежа ЮКассы",
         max_length=255,
@@ -194,6 +210,25 @@ class Transaction(models.Model):
     compensation_claimed_until = models.DateTimeField(
         "Возврат зарезервирован до", null=True, blank=True
     )
+    # ПОЧЕМУ: заказ, снятый по TTL с заведённым в ЮКассе платежом, ещё может быть
+    # оплачен по старой ссылке. Пока колонка не NULL, свипер досверяет платёж —
+    # иначе оплата при потерянном вебхуке осталась бы без возврата. Колонка,
+    # а не ключ metadata: очередь по JSONB дала бы Seq Scan
+    payment_recheck_until = models.DateTimeField(
+        "Досверить платёж до", null=True, blank=True
+    )
+    # ПОЧЕМУ колонки, а не metadata: по ним опрашиваются незавершённые возвраты
+    # и строится экран ручного разбора — логика не должна жить в JSON без схемы
+    refund_id = models.CharField(
+        "ID возврата ЮКассы", max_length=64, null=True, blank=True
+    )
+    refund_status = models.CharField(
+        "Статус возврата",
+        max_length=20,
+        choices=RefundStatus.choices,
+        null=True,
+        blank=True,
+    )
     created_at = models.DateTimeField("Создана", auto_now_add=True)
 
     class Meta:
@@ -206,6 +241,13 @@ class Transaction(models.Model):
                 fields=["created_at"],
                 condition=Q(requires_compensation=True),
                 name="ix_billing_tx_refund_fifo",
+            ),
+            # ПОЧЕМУ: partial — в индекс попадают только заказы в очереди
+            # досверки, а не вся растущая история отменённых транзакций
+            models.Index(
+                fields=["payment_recheck_until"],
+                condition=Q(payment_recheck_until__isnull=False),
+                name="ix_billing_tx_payment_recheck",
             ),
         ]
 

@@ -15,7 +15,7 @@ from rest_framework.test import APIClient
 from apps.events.admin import EventRegistrationAdmin
 from apps.events.models import EventRegistration, RegistrationStatus
 from apps.events.services import (
-    PENDING_PAYMENT_TTL,
+    pending_payment_ttl,
     RegistrationSubmission,
     cancel_registration,
     register_for_event,
@@ -159,7 +159,7 @@ class TestCancelRegistration:
         expired = register_for_event(event.pk, _submission(attendees_count=2))
         EventRegistration.objects.filter(pk=expired.pk).update(
             created_at=timezone.now()
-            - PENDING_PAYMENT_TTL
+            - pending_payment_ttl()
             - datetime.timedelta(minutes=1)
         )
         fresh = register_for_event(
@@ -247,9 +247,13 @@ class TestEventRegistrationEndpoint:
     ) -> None:
         event = EventFactory(capacity=100)
 
-        for _ in range(THROTTLE_LIMIT):
+        # ПОЧЕМУ: номер на каждую заявку свой — повтор номера на то же событие
+        # отклоняется раньше лимита (422)
+        for i in range(THROTTLE_LIMIT):
             ok = api_client.post(
-                _register_url(event.pk), registration_payload, format="json"
+                _register_url(event.pk),
+                {**registration_payload, "phone": f"+7999123450{i}"},
+                format="json",
             )
             assert ok.status_code == status.HTTP_201_CREATED
 

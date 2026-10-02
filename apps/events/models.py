@@ -113,6 +113,13 @@ class EventRegistration(models.Model):
                 condition=Q(attendees_count__gte=1),
                 name="event_registration_attendees_positive",
             ),
+            # ПОЧЕМУ: одна активная запись на номер в рамках события — иначе
+            # скрипт выкупал бесплатное событие повторными заявками
+            models.UniqueConstraint(
+                fields=["event", "phone"],
+                condition=Q(status__in=SEAT_BLOCKING_STATUSES),
+                name="uq_event_registration_active_phone",
+            ),
         ]
         indexes = [
             models.Index(

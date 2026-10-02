@@ -3,14 +3,12 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import re
+import threading
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Literal, Protocol
-from urllib import error as urlerror
-from urllib import request as urlrequest
 
 import httpx
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -98,6 +96,8 @@ class PaymentGateway(Protocol):
         # на стороне ЮКассы по переданному ключу
         ...
 
+    def get_refund(self, refund_id: str) -> RefundInfo: ...
+
 
 class YookassaSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="YOOKASSA_")
@@ -107,6 +107,23 @@ class YookassaSettings(BaseSettings):
     api_base_url: str = "https://api.yookassa.ru/v3"
     timeout_seconds: float = 5.0
     return_url: str = "http://localhost:3000/checkout/result"
+
+
+_pooled_client: httpx.Client | None = None
+_pooled_client_lock = threading.Lock()
+
+
+def _shared_http_client() -> httpx.Client:
+    # ПОЧЕМУ: один клиент на процесс — keep-alive и пул TCP/TLS-соединений
+    # к api.yookassa.ru живут между вызовами и тиками крона, а не открываются
+    # на каждый запрос (TIME_WAIT exhaustion). httpx.Client потокобезопасен.
+    # Создаётся лениво — уже после fork воркера, сокеты не делятся между процессами
+    global _pooled_client
+    if _pooled_client is None:
+        with _pooled_client_lock:
+            if _pooled_client is None:
+                _pooled_client = httpx.Client()
+    return _pooled_client
 
 
 class YookassaHttpGateway:
@@ -120,8 +137,43 @@ class YookassaHttpGateway:
             settings if settings is not None else YookassaSettings()  # type: ignore[call-arg]
         )
         # ПОЧЕМУ transport: единственная легальная точка подмены HTTP в тестах
-        # (httpx.MockTransport) — мокается сетевая граница, а не наш код
-        self._transport = transport
+        # (httpx.MockTransport) — мокается сетевая граница, а не наш код.
+        # С подменой клиент свой, чтобы не отравить общий пул процесса
+        self._client = (
+            httpx.Client(transport=transport) if transport is not None else None
+        )
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        action: str,
+        json_body: object = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        # ПОЧЕМУ: общая классификация транспорта — сеть и 5xx ретраятся
+        # (GatewayNetworkError), 4xx разбирает вызывающий: их смысл зависит
+        # от операции (404 платежа — поддельный вебхук, а не сбой)
+        client = self._client if self._client is not None else _shared_http_client()
+        try:
+            response = client.request(
+                method,
+                f"{self._settings.api_base_url}{path}",
+                json=json_body,
+                headers=headers,
+                auth=(self._settings.shop_id, self._settings.secret_key),
+                timeout=self._settings.timeout_seconds,
+            )
+        except httpx.HTTPError as exc:
+            raise GatewayNetworkError(
+                f"Сбой соединения с ЮКассой ({action}): {exc}."
+            ) from exc
+        if response.status_code >= 500:
+            raise GatewayNetworkError(
+                f"ЮКасса ответила HTTP {response.status_code} ({action})."
+            )
+        return response
 
     def create_payment(
         self,
@@ -144,26 +196,13 @@ class YookassaHttpGateway:
             "description": description,
             "metadata": {"transaction_id": transaction_id},
         }
-        try:
-            with httpx.Client(
-                timeout=self._settings.timeout_seconds,
-                transport=self._transport,
-            ) as client:
-                response = client.post(
-                    f"{self._settings.api_base_url}/payments",
-                    json=body,
-                    auth=(self._settings.shop_id, self._settings.secret_key),
-                    headers={"Idempotence-Key": idempotence_key},
-                )
-        except httpx.HTTPError as exc:
-            raise GatewayNetworkError(
-                f"Сбой соединения с ЮКассой при создании платежа: {exc}."
-            ) from exc
-
-        if response.status_code >= 500:
-            raise GatewayNetworkError(
-                f"ЮКасса ответила HTTP {response.status_code} на создание платежа."
-            )
+        response = self._request(
+            "POST",
+            "/payments",
+            action="создание платежа",
+            json_body=body,
+            headers={"Idempotence-Key": idempotence_key},
+        )
         if response.status_code >= 400:
             raise GatewayContractError(
                 f"ЮКасса отвергла создание платежа: HTTP {response.status_code}."
@@ -176,29 +215,11 @@ class YookassaHttpGateway:
             # из внешнего вебхука в URL
             raise InvalidPaymentIdError(payment_id)
 
-        url = f"{self._settings.api_base_url}/payments/{payment_id}"
-        credentials = f"{self._settings.shop_id}:{self._settings.secret_key}"
-        token = base64.b64encode(credentials.encode()).decode()
-        http_request = urlrequest.Request(
-            url, headers={"Authorization": f"Basic {token}"}
+        response = self._request(
+            "GET", f"/payments/{payment_id}", action=f"запрос платежа {payment_id}"
         )
-
-        try:
-            # FIXME: urllib не поддерживает пулинг TCP-коннектов
-            # При росте нагрузки упремся в TIME_WAIT exhaustion
-            # Перевести на httpx.Client/requests.Session
-            with urlrequest.urlopen(
-                http_request, timeout=self._settings.timeout_seconds
-            ) as response:
-                raw_body: bytes = response.read()
-        except urlerror.HTTPError as exc:
-            raise _classify_http_error(payment_id, exc) from exc
-        except urlerror.URLError as exc:
-            raise GatewayNetworkError(
-                f"Сбой соединения с ЮКассой: {exc.reason}."
-            ) from exc
-
-        return _parse_payment_body(payment_id, raw_body)
+        _raise_for_client_error(payment_id, response)
+        return _parse_payment_body(payment_id, response.content)
 
     def create_refund(
         self, payment_id: str, amount_kopecks: int, idempotence_key: str
@@ -206,45 +227,39 @@ class YookassaHttpGateway:
         if not _PAYMENT_ID_PATTERN.match(payment_id):
             raise InvalidPaymentIdError(payment_id)
 
-        url = f"{self._settings.api_base_url}/refunds"
-        credentials = f"{self._settings.shop_id}:{self._settings.secret_key}"
-        token = base64.b64encode(credentials.encode()).decode()
-        body = json.dumps(
-            {
+        response = self._request(
+            "POST",
+            "/refunds",
+            action=f"возврат по платежу {payment_id}",
+            json_body={
                 "payment_id": payment_id,
                 "amount": {
                     "value": _kopecks_to_value(amount_kopecks),
                     "currency": "RUB",
                 },
-            }
-        ).encode()
-        http_request = urlrequest.Request(
-            url,
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Basic {token}",
-                "Content-Type": "application/json",
-                "Idempotence-Key": idempotence_key,
             },
+            headers={"Idempotence-Key": idempotence_key},
         )
+        _raise_for_client_error(payment_id, response)
+        return _parse_refund_body(payment_id, response.content)
 
-        try:
-            # FIXME: urllib не поддерживает пулинг TCP-коннектов
-            # При росте нагрузки упремся в TIME_WAIT exhaustion
-            # Перевести на httpx.Client/requests.Session
-            with urlrequest.urlopen(
-                http_request, timeout=self._settings.timeout_seconds
-            ) as response:
-                raw_body: bytes = response.read()
-        except urlerror.HTTPError as exc:
-            raise _classify_http_error(payment_id, exc) from exc
-        except urlerror.URLError as exc:
-            raise GatewayNetworkError(
-                f"Сбой соединения с ЮКассой: {exc.reason}."
-            ) from exc
+    def get_refund(self, refund_id: str) -> RefundInfo:
+        if not _PAYMENT_ID_PATTERN.match(refund_id):
+            # ПОЧЕМУ: id подставляется в URL — тот же формат и та же защита
+            # от path traversal, что у платежа
+            raise GatewayContractError(f"Недопустимый формат refund_id: {refund_id!r}.")
 
-        return _parse_refund_body(payment_id, raw_body)
+        response = self._request(
+            "GET", f"/refunds/{refund_id}", action=f"запрос возврата {refund_id}"
+        )
+        # ПОЧЕМУ не _raise_for_client_error: его 404 — «платёж не найден»,
+        # а здесь не найден возврат; для опроса любой 4xx — ручной разбор
+        if response.status_code >= 400:
+            raise GatewayContractError(
+                f"ЮКасса отвергла запрос возврата {refund_id}: "
+                f"HTTP {response.status_code}."
+            )
+        return _parse_refund_body(refund_id, response.content)
 
 
 def _parse_payment_body(payment_id: str, raw_body: bytes) -> PaymentInfo:
@@ -313,12 +328,13 @@ def _parse_amount(payment_id: str, raw_amount: object) -> tuple[int, str]:
     return int(kopecks), currency
 
 
-def _classify_http_error(payment_id: str, exc: urlerror.HTTPError) -> GatewayError:
-    if exc.code == 404:
-        return PaymentNotFoundError(payment_id)
-    if exc.code >= 500:
-        return GatewayNetworkError(f"ЮКасса ответила HTTP {exc.code}.")
-    return GatewayContractError(f"ЮКасса отвергла запрос: HTTP {exc.code}.")
+def _raise_for_client_error(payment_id: str, response: httpx.Response) -> None:
+    if response.status_code == 404:
+        raise PaymentNotFoundError(payment_id)
+    if response.status_code >= 400:
+        raise GatewayContractError(
+            f"ЮКасса отвергла запрос: HTTP {response.status_code}."
+        )
 
 
 def _kopecks_to_value(amount_kopecks: int) -> str:
