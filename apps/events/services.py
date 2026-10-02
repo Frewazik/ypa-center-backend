@@ -5,10 +5,12 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import NotFound, ValidationError
 
+from apps.core.queue import kiq_safely
 from apps.events.models import (
     SEAT_BLOCKING_STATUSES,
     Event,
@@ -24,7 +26,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 HONEYPOT_FIELD: Final[str] = "website_url"
-PENDING_PAYMENT_TTL: Final[datetime.timedelta] = datetime.timedelta(minutes=30)
+# ПОЧЕМУ: потолок мест на одну заявку — без него один запрос забирал
+# полсобытия (выкуп бесплатных мест скриптом)
+MAX_ATTENDEES_PER_REGISTRATION: Final[int] = 5
+
+
+def pending_payment_ttl() -> datetime.timedelta:
+    return datetime.timedelta(minutes=settings.EVENT_PENDING_PAYMENT_TTL_MINUTES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +83,17 @@ def register_for_event(
                 code="VALIDATION_ERROR",
             )
 
+        # ПОЧЕМУ: проверка под локом события — параллельная заявка с тем же
+        # номером ждёт его и увидит эту; индекс uq_event_registration_active_phone
+        # — страховка на случай записи в обход сервиса
+        if EventRegistration.objects.filter(
+            event=event, phone=data.phone, status__in=SEAT_BLOCKING_STATUSES
+        ).exists():
+            raise ValidationError(
+                {"phone": ["На это событие с этим номером уже есть запись."]},
+                code="VALIDATION_ERROR",
+            )
+
         registration = EventRegistration.objects.create(
             event=event,
             parent=parent,
@@ -102,32 +121,81 @@ def register_for_event(
                 phone=data.phone,
                 source_id=registration.pk,
             )
+        if not event.is_free:
+            # ПОЧЕМУ: оплата на месте — пока менеджер не нажал «Подтвердить
+            # оплату», бронь снимется по TTL; без сообщения о ней никто не знал
+            _schedule_task("notify_new_registration_task", registration.pk)
+        return registration
+
+
+def _release_seats(
+    registration_id: int, from_statuses: tuple[str, ...]
+) -> EventRegistration | None:
+    # Отменяет регистрацию, только если она ещё в одном из from_statuses,
+    # и возвращает места событию. None — отменять было нечего
+    with transaction.atomic():
+        try:
+            registration = EventRegistration.objects.get(pk=registration_id)
+        except EventRegistration.DoesNotExist:
+            return None
+
+        # ПОЧЕМУ: единый порядок захвата — всегда Event первым,
+        # иначе deadlock с параллельной регистрацией на это событие
+        event = Event.objects.select_for_update().get(pk=registration.event_id)
+        # ПОЧЕМУ: статус проверяется в самом UPDATE, а не по прочитанному выше —
+        # строку мог поменять параллельный экшен админки; Postgres дождётся
+        # его коммита и перепроверит условие
+        released = EventRegistration.objects.filter(
+            pk=registration_id, status__in=from_statuses
+        ).update(status=RegistrationStatus.CANCELED)
+        if not released:
+            return None
+
+        event.seats_taken -= registration.attendees_count
+        event.save(update_fields=["seats_taken"])
         return registration
 
 
 def cancel_registration(registration_id: int) -> bool:
+    return _release_seats(registration_id, SEAT_BLOCKING_STATUSES) is not None
+
+
+def expire_pending_registration(registration_id: int) -> bool:
+    # ПОЧЕМУ: только PENDING_PAYMENT — общая cancel_registration отменила бы и
+    # бронь, которую менеджер подтвердил, пока свипер шёл по списку
+    with transaction.atomic():
+        registration = _release_seats(
+            registration_id, (RegistrationStatus.PENDING_PAYMENT,)
+        )
+        if registration is not None and registration.email:
+            _schedule_task("send_registration_expired_email_task", registration.pk)
+    return registration is not None
+
+
+def confirm_registration(registration_id: int) -> bool:
     with transaction.atomic():
         try:
             registration = EventRegistration.objects.get(pk=registration_id)
         except EventRegistration.DoesNotExist:
             return False
 
-        # ПОЧЕМУ: единый порядок захвата — всегда Event первым,
-        # иначе deadlock с параллельной регистрацией на это событие
-        event = Event.objects.select_for_update().get(pk=registration.event_id)
-        released = EventRegistration.objects.filter(
-            pk=registration_id, status__in=SEAT_BLOCKING_STATUSES
-        ).update(status=RegistrationStatus.CANCELED)
-        if not released:
-            return False
-
-        event.seats_taken -= registration.attendees_count
-        event.save(update_fields=["seats_taken"])
-        return True
+        # ПОЧЕМУ: тот же порядок, что у отмены, — событие, потом регистрация.
+        # Места не меняются (PENDING_PAYMENT и CONFIRMED оба их занимают),
+        # но отмена и подтверждение одной брони выстраиваются в очередь
+        Event.objects.select_for_update().get(pk=registration.event_id)
+        return bool(
+            EventRegistration.objects.filter(
+                pk=registration_id,
+                status__in=(
+                    RegistrationStatus.NEW,
+                    RegistrationStatus.PENDING_PAYMENT,
+                ),
+            ).update(status=RegistrationStatus.CONFIRMED)
+        )
 
 
 def release_expired_pending_registrations() -> int:
-    deadline = timezone.now() - PENDING_PAYMENT_TTL
+    deadline = timezone.now() - pending_payment_ttl()
     expired_ids = list(
         EventRegistration.objects.filter(
             status=RegistrationStatus.PENDING_PAYMENT,
@@ -137,7 +205,9 @@ def release_expired_pending_registrations() -> int:
     # ПОЧЕМУ: транзакция на каждую бронь — короткие локи вместо одного
     # длинного на все события сразу
     released = sum(
-        1 for registration_id in expired_ids if cancel_registration(registration_id)
+        1
+        for registration_id in expired_ids
+        if expire_pending_registration(registration_id)
     )
     if released:
         logger.info("Освобождено просроченных броней: %d", released)
@@ -165,3 +235,14 @@ def process_registration_submission(
         comment=str(raw_data.get("comment") or ""),
     )
     return register_for_event(event_id, payload, parent=parent, consent=consent)
+
+
+def _schedule_task(task_name: str, registration_id: int) -> None:
+    transaction.on_commit(lambda: _enqueue_task(task_name, registration_id))
+
+
+def _enqueue_task(task_name: str, registration_id: int) -> None:
+    # ПОЧЕМУ: локальный импорт — tasks импортирует services на уровне модуля
+    from apps.events import tasks
+
+    kiq_safely(getattr(tasks, task_name), registration_id)

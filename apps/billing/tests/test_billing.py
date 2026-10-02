@@ -24,6 +24,7 @@ from apps.billing.adapters import (
     PaymentInfo,
     PaymentNotFoundError,
     RefundInfo,
+    RefundStatus,
     _parse_payment_body,
 )
 from apps.billing.models import (
@@ -170,6 +171,9 @@ class FakeGateway:
     refund_calls: list[tuple[str, int, str]] = field(default_factory=list)
     failing_refund_ids: set[str] = field(default_factory=set)
     created_payments: list[tuple[str, int, str]] = field(default_factory=list)
+    # ПОЧЕМУ: статус, с которым ЮКасса принимает возврат, и итог при опросе
+    new_refund_status: RefundStatus = "succeeded"
+    refund_outcomes: dict[str, RefundStatus] = field(default_factory=dict)
 
     def get_payment(self, payment_id: str) -> PaymentInfo:
         found = self.payments.get(payment_id)
@@ -200,7 +204,14 @@ class FakeGateway:
         if payment_id in self.failing_refund_ids:
             raise GatewayContractError(f"провайдер отверг возврат {payment_id}")
         self.refund_calls.append((payment_id, amount_kopecks, idempotence_key))
-        return RefundInfo(id=f"rf-{len(self.refund_calls)}", status="succeeded")
+        return RefundInfo(
+            id=f"rf-{len(self.refund_calls)}", status=self.new_refund_status
+        )
+
+    def get_refund(self, refund_id: str) -> RefundInfo:
+        return RefundInfo(
+            id=refund_id, status=self.refund_outcomes.get(refund_id, "pending")
+        )
 
 
 @dataclass
@@ -225,6 +236,9 @@ class RaisingGateway:
     ) -> RefundInfo:
         raise self.error_factory("сбой шлюза")
 
+    def get_refund(self, refund_id: str) -> RefundInfo:
+        raise self.error_factory("сбой шлюза")
+
 
 @dataclass
 class FakeSchedulePort:
@@ -242,12 +256,12 @@ class FakeSchedulePort:
             raise UnknownSlotError(slot_id)
         return self.default_capacity
 
-    def get_next_lesson_date(self, slot_id: int, on_or_after: date) -> date:
+    def get_next_lesson_date(self, slot_id: int, after: datetime) -> date:
         if slot_id in self.lesson_dates:
             return self.lesson_dates[slot_id]
         if self.strict:
             raise UnknownSlotError(slot_id)
-        return on_or_after + timedelta(days=1)
+        return timezone.localdate(after) + timedelta(days=1)
 
     def get_slot_trial_info(self, slot_id: int) -> SlotTrialInfo:
         if slot_id in self.trial_infos:
@@ -353,6 +367,29 @@ def _gateway_for(
         currency=currency,
     )
     return payment_id, FakeGateway(payments={payment_id: info})
+
+
+def _sweep_unpaid(*, now: datetime | None = None) -> int:
+    # ПОЧЕМУ: сценарий «родитель бросил оплату» — ЮКасса по всем незавершённым
+    # платежам отвечает pending, и свипер после сверки снимает заказы по TTL
+    gateway = FakeGateway(
+        payments={
+            tx.external_id: PaymentInfo(
+                id=tx.external_id,
+                status="pending",
+                transaction_id=str(tx.pk),
+                amount_kopecks=tx.amount,
+                currency="RUB",
+            )
+            for tx in Transaction.objects.filter(
+                status=TransactionStatus.PENDING, external_id__isnull=False
+            )
+            if tx.external_id is not None
+        }
+    )
+    return sweep_stale_pending_transactions(
+        gateway=gateway, schedule_port=FakeSchedulePort(), now=now
+    )
 
 
 def _make_attendance_with_balance(
@@ -1159,7 +1196,7 @@ class TestSweepers:
         )
         fresh = _make_pending_payment([102])
 
-        swept = sweep_stale_pending_transactions()
+        swept = _sweep_unpaid()
 
         stale.refresh_from_db()
         fresh.refresh_from_db()
@@ -1192,8 +1229,8 @@ class TestSweepers:
                 created_at=timezone.now() - timedelta(hours=1)
             )
 
-        first_tick = sweep_stale_pending_transactions()
-        second_tick = sweep_stale_pending_transactions()
+        first_tick = _sweep_unpaid()
+        second_tick = _sweep_unpaid()
 
         assert first_tick == 2
         assert second_tick == 1
@@ -1228,7 +1265,7 @@ class TestLateSuccessCompensationFlow:
         Transaction.objects.filter(pk=tx.pk).update(
             created_at=timezone.now() - timedelta(hours=1)
         )
-        assert sweep_stale_pending_transactions() == 1
+        assert _sweep_unpaid() == 1
         payment_id, gateway = _gateway_for(tx, "succeeded")
         return tx, payment_id, gateway
 
@@ -1262,8 +1299,8 @@ class TestLateSuccessCompensationFlow:
         assert second_run == 0
         assert gateway.refund_calls == [(payment_id, tx.amount, f"refund-{tx.pk}")]
         assert tx.metadata["compensation_required"] is False
-        assert tx.metadata["refund_id"] == "rf-1"
-        assert tx.metadata["refund_status"] == "succeeded"
+        assert tx.refund_id == "rf-1"
+        assert tx.refund_status == "SUCCEEDED"
 
     def test_overbooking_compensation_is_refunded_by_same_pipeline(self) -> None:
         port = _port(s101=1)
@@ -1298,7 +1335,7 @@ class TestLateSuccessCompensationFlow:
         # ПОЧЕМУ: невыполнимый возврат выводится из очереди в карантин
         # чтобы избежать вечного блокирования refund-воркера
         assert tx.requires_compensation is False
-        assert tx.metadata["refund_status"] == "failed"
+        assert tx.refund_status == "FAILED"
 
     def test_refund_skipped_when_payment_id_missing(self) -> None:
         # ПОЧЕМУ: страховка на случай порчи данных — транзакции без external_id
@@ -1316,7 +1353,7 @@ class TestLateSuccessCompensationFlow:
         assert gateway.refund_calls == []
         tx.refresh_from_db()
         assert tx.requires_compensation is False
-        assert tx.metadata["refund_status"] == "failed"
+        assert tx.refund_status == "FAILED"
 
     def test_active_claim_blocks_parallel_tick_before_network_call(self) -> None:
         # ПОЧЕМУ: claim check — конкурентный тик (дубль крона, ручной запуск)
@@ -1344,7 +1381,7 @@ class TestLateSuccessCompensationFlow:
         tx.refresh_from_db()
         assert tx.requires_compensation is False
         assert tx.compensation_claimed_until is None
-        assert tx.metadata["refund_status"] == "succeeded"
+        assert tx.refund_status == "SUCCEEDED"
 
     def test_successful_refund_releases_claim(self) -> None:
         tx = _make_refundable_payment([101])
@@ -1727,7 +1764,7 @@ class TestDepositHoldReturn:
             created_at=timezone.now() - timedelta(hours=1)
         )
 
-        assert sweep_stale_pending_transactions() == 1
+        assert _sweep_unpaid() == 1
 
         tx.refresh_from_db()
         deposit = ParentDeposit.objects.get(parent=parent)
@@ -1753,7 +1790,7 @@ class TestDepositHoldReturn:
         assert tx.metadata["deposit_returned"] is True
         # ПОЧЕМУ: повторное освобождение депозита идемпотентно
         # баланс пользователя математически защищен от задвоения
-        sweep_stale_pending_transactions()
+        _sweep_unpaid()
         assert ParentDeposit.objects.get(parent=parent).balance == 240_000
 
 
@@ -1792,10 +1829,10 @@ class TestRefundQueueDiscipline:
         healthy.refresh_from_db()
         assert issued == 1
         assert poisoned.requires_compensation is False
-        assert poisoned.metadata["refund_status"] == "failed"
+        assert poisoned.refund_status == "FAILED"
         assert "отверг" in poisoned.metadata["refund_error"]
         assert healthy.requires_compensation is False
-        assert healthy.metadata["refund_id"] == "rf-1"
+        assert healthy.refund_id == "rf-1"
 
 
 @pytest.mark.django_db
@@ -1922,17 +1959,20 @@ class TestExpiryCreditRace:
 
         monkeypatch.setattr(SubscriptionSlot, "save", stalling_save)
 
+        # ПОЧЕМУ сигнал на входе в добор списаний: это первая точка после
+        # claim абонемента. Дальше свипер встаёт на FOR UPDATE отметки, которую
+        # держит debit, и после коммита видит token_debited=True — не спишет
+        # второй раз
         sweeper_claimed = Event()
-        original_sub_save = Subscription.save
+        original_catch_up = billing_services._debit_attended_before_expiry
 
-        def signalling_sub_save(
-            self: Subscription, *args: object, **kwargs: object
-        ) -> None:
-            original_sub_save(self, *args, **kwargs)
-            if self.status == SubscriptionStatus.EXPIRED:
-                sweeper_claimed.set()
+        def signalling_catch_up(subscription: Subscription) -> None:
+            sweeper_claimed.set()
+            original_catch_up(subscription)
 
-        monkeypatch.setattr(Subscription, "save", signalling_sub_save)
+        monkeypatch.setattr(
+            billing_services, "_debit_attended_before_expiry", signalling_catch_up
+        )
 
         def run_debit() -> None:
             try:
@@ -1995,7 +2035,7 @@ class TestDuplicateEnrollmentGuard:
         plan = SubscriptionPlanFactory(slots_count=1)
         _checkout([101], parent=parent, student=student, plan=plan)
         Transaction.objects.update(created_at=timezone.now() - timedelta(hours=1))
-        assert sweep_stale_pending_transactions() == 1  # бронь → CANCELED
+        assert _sweep_unpaid() == 1  # бронь → CANCELED
 
         result = _checkout([101], parent=parent, student=student, plan=plan)
 
@@ -2278,7 +2318,7 @@ class TestEvictionReleaseDeadlock:
 
         def run_sweeper() -> None:
             try:
-                sweep_stale_pending_transactions()
+                _sweep_unpaid()
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
             finally:

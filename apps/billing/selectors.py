@@ -16,11 +16,16 @@ from __future__ import annotations
 
 import datetime
 
-from django.db.models import Q
+from django.db.models import Q, QuerySet
 from django.db.models.expressions import Combinable
 from django.utils import timezone
 
-from apps.billing.models import EnrollmentStatus, EnrollmentType
+from apps.billing.models import (
+    Attendance,
+    AttendanceStatus,
+    EnrollmentStatus,
+    EnrollmentType,
+)
 
 # ПОЧЕМУ: неоплаченная бронь держит место ровно столько, сколько живёт
 # транзакция; значение обязано совпадать с _PENDING_TRANSACTION_TTL
@@ -64,3 +69,19 @@ def trial_seat_q(
     else:
         conditions[field % "trial_date__gte"] = timezone.localdate()
     return active_seat_q(prefix) & Q(**conditions)
+
+
+def attendances_awaiting_debit() -> QuerySet[Attendance]:
+    """Отметки «пришёл» по абонементу, за которые фишка ещё не списана.
+
+    Один запрос на ночную задачу журнала и на добор в свипере истечения:
+    правило «что списывать» не должно разъехаться между ними. Списывает
+    только «пришёл» — пропуск с любой причиной фишку не сжигает (решение
+    бизнеса, project-context §5). Пробные отсечены: фишек у них нет.
+    """
+    return Attendance.objects.filter(
+        status=AttendanceStatus.ATTENDED,
+        token_debited=False,
+        enrollment__status=EnrollmentStatus.ENROLLED,
+        enrollment__subscription__isnull=False,
+    )

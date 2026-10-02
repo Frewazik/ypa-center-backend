@@ -1,22 +1,15 @@
 from __future__ import annotations
 
 import json
-import logging
 from collections.abc import Callable, Iterator
-from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 from asgiref.sync import async_to_sync
 from django.test import override_settings
 
-from apps.public_forms import tasks
-from apps.public_forms.tasks import (
-    RETRY_AFTER_CAP_SECONDS,
-    NotificationDeliveryError,
-    build_notification_text,
-    notify_managers_task,
-)
+from apps.core import telegram as telegram_channel
+from apps.public_forms.tasks import build_notification_text, notify_managers_task
 from apps.public_forms.tests.factories import (
     CallbackRequestFactory,
     FeedbackRequestFactory,
@@ -50,20 +43,15 @@ def telegram(
             seen.append(request)
             return handler(request)
 
+        # Доставка и её ошибки — общий канал, тесты в apps/core/tests/test_telegram.py
         monkeypatch.setattr(
-            "apps.public_forms.services.get_http_client",
+            telegram_channel,
+            "_http_client",
             lambda: httpx.AsyncClient(transport=httpx.MockTransport(_record)),
         )
         return seen
 
     return _install
-
-
-@pytest.fixture
-def no_sleep(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    sleep = AsyncMock()
-    monkeypatch.setattr(tasks.asyncio, "sleep", sleep)
-    return sleep
 
 
 def _sent_text(request: httpx.Request) -> str:
@@ -129,113 +117,3 @@ class TestNotifyManagersTask:
         async_to_sync(notify_managers_task.original_func)(999_999, "feedback")
 
         assert seen == []
-
-
-@pytest.mark.asyncio
-class TestDelivery:
-    async def test_unconfigured_telegram_makes_no_calls(
-        self,
-        telegram: Callable[[TelegramHandler], list[httpx.Request]],
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        seen = telegram(_ok)
-
-        with override_settings(TELEGRAM_BOT_TOKEN="", TELEGRAM_MANAGER_CHAT_ID=""):
-            await tasks._deliver("текст", "feedback", 1)
-
-        assert seen == []
-        assert "Telegram не настроен" in caplog.text
-
-    @pytest.mark.parametrize("code", [400, 401, 403, 404])
-    async def test_permanent_error_logged_not_retried(
-        self,
-        telegram: Callable[[TelegramHandler], list[httpx.Request]],
-        caplog: pytest.LogCaptureFixture,
-        code: int,
-    ) -> None:
-        # ПОЧЕМУ: неверный токен/чат или бот удалён из чата повтором не лечатся —
-        # исключение отправило бы задачу в 5 бессмысленных ретраев
-        telegram(
-            lambda r: httpx.Response(
-                code, json={"ok": False, "error_code": code, "description": "Forbidden"}
-            )
-        )
-
-        with caplog.at_level(logging.ERROR, logger="apps.public_forms.tasks"):
-            await tasks._deliver("текст", "feedback", 1)
-
-        assert f"отклонил запрос {code} «Forbidden»" in caplog.text
-
-    async def test_server_error_goes_to_retry(
-        self, telegram: Callable[[TelegramHandler], list[httpx.Request]]
-    ) -> None:
-        telegram(lambda r: httpx.Response(502))
-
-        with pytest.raises(NotificationDeliveryError):
-            await tasks._deliver("текст", "feedback", 1)
-
-    async def test_network_error_goes_to_retry(
-        self, telegram: Callable[[TelegramHandler], list[httpx.Request]]
-    ) -> None:
-        def _down(request: httpx.Request) -> httpx.Response:
-            raise httpx.ConnectError("boom")
-
-        telegram(_down)
-
-        with pytest.raises(NotificationDeliveryError):
-            await tasks._deliver("текст", "feedback", 1)
-
-
-@pytest.mark.asyncio
-class TestFloodLimit:
-    @pytest.mark.parametrize(
-        ("flood_reply", "expected_pause"),
-        [
-            # Так отвечает Telegram: пауза в теле ответа
-            (
-                httpx.Response(
-                    429, json={"ok": False, "parameters": {"retry_after": 7}}
-                ),
-                7.0,
-            ),
-            # Запасной вариант — заголовок
-            (httpx.Response(429, headers={"Retry-After": "3"}), 3.0),
-            # Мусор в заголовке не роняет задачу
-            (
-                httpx.Response(
-                    429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
-                ),
-                1.0,
-            ),
-            (httpx.Response(429), 1.0),
-            # Долгое ожидание держало бы слот воркера — дальше решает ретрай брокера
-            (
-                httpx.Response(429, json={"parameters": {"retry_after": 600}}),
-                RETRY_AFTER_CAP_SECONDS,
-            ),
-        ],
-    )
-    async def test_waits_as_telegram_asks_then_resends(
-        self,
-        telegram: Callable[[TelegramHandler], list[httpx.Request]],
-        no_sleep: AsyncMock,
-        flood_reply: httpx.Response,
-        expected_pause: float,
-    ) -> None:
-        replies = iter([flood_reply, httpx.Response(200, json={"ok": True})])
-        seen = telegram(lambda r: next(replies))
-
-        await tasks._deliver("текст", "feedback", 1)
-
-        no_sleep.assert_awaited_once_with(expected_pause)
-        assert len(seen) == 2
-
-    async def test_second_flood_reply_goes_to_retry(
-        self,
-        telegram: Callable[[TelegramHandler], list[httpx.Request]],
-        no_sleep: AsyncMock,
-    ) -> None:
-        telegram(lambda r: httpx.Response(429, json={"parameters": {"retry_after": 1}}))
-
-        with pytest.raises(NotificationDeliveryError):
-            await tasks._deliver("текст", "feedback", 1)

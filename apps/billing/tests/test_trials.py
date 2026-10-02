@@ -34,7 +34,6 @@ from apps.billing.services import (
     confirm_payment,
     create_payment,
     create_trial_payment,
-    sweep_stale_pending_transactions,
 )
 from apps.billing.tests.test_billing import (
     EnrollmentFactory,
@@ -45,6 +44,7 @@ from apps.billing.tests.test_billing import (
     SubscriptionPlanFactory,
     _checkout,
     _gateway_for,
+    _sweep_unpaid,
 )
 from apps.billing.views import CheckoutTrialView
 from apps.journal.services import open_lesson
@@ -270,7 +270,7 @@ class TestTrialSeatLifecycle:
         Transaction.objects.update(created_at=timezone.now() - timedelta(hours=1))
         Enrollment.objects.update(created_at=timezone.now() - timedelta(hours=1))
 
-        assert sweep_stale_pending_transactions() == 1
+        assert _sweep_unpaid() == 1
 
         enrollment = Enrollment.objects.get(type=EnrollmentType.TRIAL)
         assert enrollment.status == EnrollmentStatus.CANCELED
@@ -335,7 +335,7 @@ class TestTrialWebhookConfirmation:
         _trial_checkout(101)
         tx = Transaction.objects.get()
         Transaction.objects.update(created_at=timezone.now() - timedelta(hours=1))
-        assert sweep_stale_pending_transactions() == 1
+        assert _sweep_unpaid() == 1
         payment_id, gateway = _gateway_for(tx, "succeeded")
 
         with pytest.raises(Exception, match="успех пришёл после истечения TTL"):

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import datetime
-
 import factory
+from django.utils import timezone
 
 from apps.billing.models import Attendance, AttendanceStatus, SubscriptionSlot
 from apps.schedule.tests.factories import EnrollmentFactory, SubscriptionFactory
@@ -23,6 +22,6 @@ class AttendanceFactory(factory.django.DjangoModelFactory):
         model = Attendance
 
     enrollment = factory.SubFactory(EnrollmentFactory)
-    date = factory.LazyFunction(datetime.date.today)
+    date = factory.LazyFunction(timezone.localdate)
     status = AttendanceStatus.ABSENT_OK
     token_debited = False

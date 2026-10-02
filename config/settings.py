@@ -59,12 +59,18 @@ class Settings(BaseSettings):
     # см. _resolve_captcha_secret_key
     CAPTCHA_SECRET_KEY: str = ""
 
-    # Бот и чат, куда приходит «новая заявка с сайта». В production обязательны
+    # Бот и чат для уведомлений менеджерам (заявки с сайта, брони событий,
+    # возвраты на разбор). В production обязательны; локально и на staging
+    # пусто — отправка пропускается, ошибка в лог
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_MANAGER_CHAT_ID: str = ""
     # Адрес, на котором открывается админка (https://api.example.ru) —
     # для ссылки на заявку в уведомлении. В production обязателен
     ADMIN_BASE_URL: str = ""
+
+    # Сколько минут неоплаченная бронь на платное событие ждёт «Подтвердить
+    # оплату» в админке, прежде чем свипер освободит места
+    EVENT_PENDING_PAYMENT_TTL_MINUTES: int = Field(default=30, ge=1)
 
 
 # ПОЧЕМУ ignore: обязательные поля заполняет pydantic-settings из env/.env,
@@ -146,8 +152,8 @@ _MANAGER_NOTIFICATION_SETTINGS = (
 
 
 def _check_manager_notification_settings(env: Settings) -> None:
-    # ПОЧЕМУ: без бота заявки с сайта копятся в админке, и никто о них не
-    # узнаёт — в production это видно только по жалобам клиентов. Локально
+    # ПОЧЕМУ: без бота заявки с сайта, брони событий и возвраты на разбор
+    # копятся в админке, и никто о них не узнаёт — в production это видно только по жалобам клиентов. Локально
     # и на staging пустой Telegram допустим: задача пишет в лог и выходит
     if env.ENVIRONMENT != "production":
         return
@@ -156,7 +162,7 @@ def _check_manager_notification_settings(env: Settings) -> None:
     ]
     if missing:
         raise ImproperlyConfigured(
-            f"Задайте {', '.join(missing)} — уведомления о заявках с сайта. "
+            f"Задайте {', '.join(missing)} — уведомления менеджерам. "
             "См. docs/public-forms-design.md"
         )
 
@@ -329,10 +335,42 @@ SIMPLE_JWT = {
 
 SPECTACULAR_SETTINGS = {
     "TITLE": "Улица Радости API",
-    "DESCRIPTION": "Детский центр развития - спецификация контрактов ядра.",
+    "DESCRIPTION": (
+        "Детский центр развития - спецификация контрактов ядра.\n\n"
+        "**Как войти:** `POST /api/v1/auth/otp/request/` с email → код из "
+        "письма (локально — в консоли воркера `taskiq worker`) →`POST /api/v1/auth/otp/verify/` "
+        "→ скопировать "
+        "`access` → кнопка **Authorize**, вставить токен без слова `Bearer`."
+    ),
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
     "COMPONENT_SPLIT_REQUEST": True,
+    # Токен из Authorize переживает перезагрузку страницы; у каждой ручки
+    # своя ссылка (#/profile/me_profile) — удобно кидать в чат
+    "SWAGGER_UI_SETTINGS": {"persistAuthorization": True, "deepLinking": True},
+    # Порядок групп в Swagger. Новая ручка обязана получить один из этих
+    # тегов — проверяет apps/core/tests/test_openapi_schema.py
+    "TAGS": [
+        {"name": "auth", "description": "Вход по коду из письма, JWT-токены"},
+        {"name": "catalog", "description": "Открытые данные для сайта, без входа"},
+        {"name": "schedule", "description": "Сетка занятий"},
+        {
+            "name": "forms",
+            "description": "Заявки с сайта: звонок, обратная связь, регистрация "
+            "на событие. Вход необязателен",
+        },
+        {"name": "profile", "description": "Анкета родителя и дети"},
+        {
+            "name": "checkout",
+            "description": "Покупка абонемента и пробного. Нужен заголовок "
+            "X-Idempotency-Key",
+        },
+        {
+            "name": "my",
+            "description": "Мои абонементы, пробные, записи, лента и депозит",
+        },
+        {"name": "webhooks", "description": "Служебное, фронт не вызывает"},
+    ],
 }
 
 if _env.AWS_STORAGE_BUCKET_NAME:
@@ -382,9 +420,13 @@ CAPTCHA_VERIFY_URL = _env.CAPTCHA_VERIFY_URL
 # капчи падала бы в AttributeError на первом же запросе
 EXTERNAL_HTTP_TIMEOUT_SECONDS = 5.0
 
+# ПОЧЕМУ из окружения: зашитая заглушка уходила в Telegram как настоящий токен,
+# получала отказ — и уведомления менеджерам молча не доходили нигде
 TELEGRAM_BOT_TOKEN = _env.TELEGRAM_BOT_TOKEN
 TELEGRAM_MANAGER_CHAT_ID = _env.TELEGRAM_MANAGER_CHAT_ID
 ADMIN_BASE_URL = _env.ADMIN_BASE_URL
+
+EVENT_PENDING_PAYMENT_TTL_MINUTES = _env.EVENT_PENDING_PAYMENT_TTL_MINUTES
 
 UNFOLD = {
     "SITE_TITLE": "Улица Радости - админка",

@@ -27,6 +27,7 @@ class EventRegistrationCreateView(APIView):
     throttle_classes = (EventRegistrationIPThrottle,)
 
     @extend_schema(
+        tags=["forms"],
         operation_id="public_event_register",
         request=EventRegistrationCreateSerializer,
         responses={status.HTTP_201_CREATED: RegistrationAcceptedSerializer},

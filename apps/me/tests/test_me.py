@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import zoneinfo
 from typing import TYPE_CHECKING
 
 import pytest
@@ -205,6 +206,25 @@ class TestChildDelete:
             canceled.pk,
             past_trial.pk,
         }
+
+    # ПОЧЕМУ: фабрика обязана брать «сегодня» по часам Django, а не ОС —
+    # иначе вечером по Москве (в Новосибирске уже завтра) пробное «на сегодня»
+    # считалось прошедшим. Зоны +14 и −12 расходятся с датой ОС в любой
+    # момент суток хотя бы одна, поэтому тест ловит регресс без заморозки часов
+    @pytest.mark.parametrize("tz_name", ["Pacific/Kiritimati", "Etc/GMT+12"])
+    def test_todays_trial_blocks_delete_in_any_timezone(
+        self, api_client: APIClient, parent: Parent, tz_name: str
+    ) -> None:
+        child = StudentFactory(parent=parent)
+
+        with timezone.override(tz_name):
+            enrollment = EnrollmentFactory(student=child, trial=True)
+            response = api_client.delete(_child_url(child))
+
+        assert enrollment.trial_date == timezone.localdate(
+            timezone.now(), timezone=zoneinfo.ZoneInfo(tz_name)
+        )
+        assert response.status_code == status.HTTP_409_CONFLICT
 
     @pytest.mark.parametrize(
         ("kind", "enrollment_status"),
@@ -835,9 +855,8 @@ class TestUpcomingFeed:
         # можно было увидеть чужие регистрации с именами детей
         event = EventFactory(start_datetime=timezone.now() + datetime.timedelta(days=3))
         _guest_registration(event, phone=str(parent.phone))
-        EventRegistrationFactory(
-            event=event, parent=ParentFactory(), phone=str(parent.phone)
-        )
+        # ПОЧЕМУ другое событие: один номер — одна активная запись на событие
+        EventRegistrationFactory(parent=ParentFactory(), phone=str(parent.phone))
 
         response = api_client.get(UPCOMING_URL)
 
@@ -1237,11 +1256,9 @@ class TestBookings:
     def test_same_phone_other_parent_is_invisible(
         self, api_client: APIClient, parent: Parent
     ) -> None:
-        event = EventFactory()
-        EventRegistrationFactory(
-            event=event, parent=ParentFactory(), phone=str(parent.phone)
-        )
-        _guest_registration(event, phone=str(parent.phone))
+        EventRegistrationFactory(parent=ParentFactory(), phone=str(parent.phone))
+        # ПОЧЕМУ другое событие: один номер — одна активная запись на событие
+        _guest_registration(EventFactory(), phone=str(parent.phone))
 
         assert api_client.get(BOOKINGS_URL, {"period": "all"}).json() == []
 
@@ -1255,7 +1272,7 @@ class TestBookings:
             event=event, parent=ParentFactory(), email=parent.email
         )
         # Гость без email ни с кем не совпадает
-        _guest_registration(event, email="")
+        _guest_registration(event, email="", phone="+79130000001")
 
         items = api_client.get(BOOKINGS_URL).json()
 

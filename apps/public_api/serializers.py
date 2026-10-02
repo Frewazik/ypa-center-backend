@@ -10,6 +10,12 @@ from apps.catalog.models import Activity
 from apps.content.models import GalleryImage
 from apps.events.models import Event
 from apps.schedule.models import Schedule
+from apps.schedule.serializers import (
+    TIME_FORMAT,
+    PersonPayload,
+    TeacherNestedSerializer,
+)
+from apps.schedule.services import WeekSlot
 from apps.users.models import TeacherProfile
 
 
@@ -165,3 +171,33 @@ class EventPublicSerializer(serializers.ModelSerializer[Event]):
             "capacity",
             "is_upcoming",
         )
+
+
+class TrialSlotSerializer(serializers.Serializer[WeekSlot]):
+    # ПОЧЕМУ: только то, что нужно выбрать занятие и отправить чекаут;
+    # число мест не отдаём — в списке только занятия со свободными местами
+    schedule_id = serializers.IntegerField(read_only=True)
+    date = serializers.DateField(read_only=True)
+    start_time = serializers.TimeField(read_only=True, format=TIME_FORMAT)
+    end_time = serializers.TimeField(read_only=True, format=TIME_FORMAT)
+    group_name = serializers.CharField(read_only=True)
+    teacher = serializers.SerializerMethodField()
+    is_rescheduled = serializers.BooleanField(read_only=True)
+
+    @extend_schema_field(TeacherNestedSerializer(allow_null=True))
+    def get_teacher(self, slot: WeekSlot) -> PersonPayload | None:
+        if slot.teacher_id is None or slot.teacher_full_name is None:
+            return None
+        return {"id": slot.teacher_id, "full_name": slot.teacher_full_name}
+
+
+class TrialSlotsActivitySerializer(serializers.Serializer[Activity]):
+    id = serializers.IntegerField(read_only=True)
+    name = serializers.CharField(read_only=True)
+
+
+class TrialSlotsResponseSerializer(serializers.Serializer[dict[str, object]]):
+    activity = TrialSlotsActivitySerializer(read_only=True)
+    date_from = serializers.DateField(read_only=True)
+    date_to = serializers.DateField(read_only=True)
+    slots = TrialSlotSerializer(many=True, read_only=True)

@@ -69,10 +69,19 @@ def _current_parent(request: Request) -> Parent:
 _ONBOARDING_PERMISSIONS = [IsAuthenticated]
 
 
-@extend_schema(
-    operation_id="me_profile",
-    summary="Профиль родителя с детьми",
-    responses=ProfileSerializer,
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="me_profile",
+        summary="Профиль родителя с детьми",
+        responses=ProfileSerializer,
+        tags=["profile"],
+    ),
+    patch=extend_schema(
+        operation_id="me_profile_update",
+        summary="Изменить анкету родителя",
+        responses=ProfileSerializer,
+        tags=["profile"],
+    ),
 )
 class ProfileView(generics.RetrieveUpdateAPIView[Parent]):
     permission_classes = _ONBOARDING_PERMISSIONS
@@ -83,11 +92,14 @@ class ProfileView(generics.RetrieveUpdateAPIView[Parent]):
         return _current_parent(self.request)
 
 
-@extend_schema(
-    operation_id="me_child_create",
-    summary="Добавить ребёнка",
-    request=ChildSerializer,
-    responses={status.HTTP_201_CREATED: ChildSerializer},
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="me_child_create",
+        summary="Добавить ребёнка",
+        request=ChildSerializer,
+        responses={status.HTTP_201_CREATED: ChildSerializer},
+        tags=["profile"],
+    )
 )
 class ChildCreateView(APIView):
     permission_classes = _ONBOARDING_PERMISSIONS
@@ -125,6 +137,7 @@ class ChildHasActiveEnrollmentsConflict(APIException):
         operation_id="me_child_update",
         summary="Изменить данные ребёнка",
         responses=ChildSerializer,
+        tags=["profile"],
     ),
     delete=extend_schema(
         operation_id="me_child_delete",
@@ -144,6 +157,7 @@ class ChildHasActiveEnrollmentsConflict(APIException):
                 description="CHILD_HAS_ACTIVE_ENROLLMENTS"
             ),
         },
+        tags=["profile"],
     ),
 )
 class ChildDetailView(generics.UpdateAPIView[Student]):
@@ -175,16 +189,19 @@ _PAGINATION_NOTE = (
 )
 
 
-@extend_schema(
-    operation_id="me_subscriptions",
-    summary="Мои абонементы: действующие и история",
-    description=(
-        "Только оплаченные: ACTIVE (сверху) и EXPIRED, внутри — новые сверху. "
-        "У истёкшего — все купленные слоты, остаток 0 (он ушёл на депозит)."
-        + _PAGINATION_NOTE
-    ),
-    parameters=LIMIT_OFFSET_PARAMETERS,
-    responses=SubscriptionViewSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="me_subscriptions",
+        summary="Мои абонементы: действующие и история",
+        description=(
+            "Только оплаченные: ACTIVE (сверху) и EXPIRED, внутри — новые сверху. "
+            "У истёкшего — все купленные слоты, остаток 0 (он ушёл на депозит)."
+            + _PAGINATION_NOTE
+        ),
+        parameters=LIMIT_OFFSET_PARAMETERS,
+        responses=SubscriptionViewSerializer(many=True),
+        tags=["my"],
+    )
 )
 class SubscriptionListView(APIView):
     def get(self, request: Request) -> Response:
@@ -199,17 +216,20 @@ class SubscriptionListView(APIView):
         )
 
 
-@extend_schema(
-    operation_id="me_trials",
-    summary="Пробные занятия детей родителя (устарела)",
-    description=(
-        "Устарела: используйте GET /me/bookings/?kind=TRIAL — там пробные "
-        "вместе с событиями в одном формате. Работает, пока фронт не перейдёт. "
-        "Новые по дате пробного сверху." + _PAGINATION_NOTE
-    ),
-    deprecated=True,
-    parameters=LIMIT_OFFSET_PARAMETERS,
-    responses=TrialViewSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="me_trials",
+        summary="Пробные занятия детей родителя (устарела)",
+        description=(
+            "Устарела: используйте GET /me/bookings/?kind=TRIAL — там пробные "
+            "вместе с событиями в одном формате. Работает, пока фронт не перейдёт. "
+            "Новые по дате пробного сверху." + _PAGINATION_NOTE
+        ),
+        deprecated=True,
+        parameters=LIMIT_OFFSET_PARAMETERS,
+        responses=TrialViewSerializer(many=True),
+        tags=["my"],
+    )
 )
 class TrialListView(APIView):
     def get(self, request: Request) -> Response:
@@ -234,33 +254,36 @@ def _parse_choice_param(
     return raw
 
 
-@extend_schema(
-    operation_id="me_bookings",
-    summary="Мои записи: пробные занятия и события одной лентой",
-    description=(
-        "period=upcoming (по умолчанию) — ближайшие сверху; past — свежие "
-        "сверху; all — сначала предстоящие, потом прошедшие. «Прошло» — по "
-        "дате: сегодняшнее ещё предстоящее. Отменённые не показываются. "
-        "status: PENDING — ждёт оплаты/подтверждения, CONFIRMED — записан. "
-        "Уникальный ключ карточки — пара (kind, id)." + _PAGINATION_NOTE
-    ),
-    parameters=[
-        OpenApiParameter(
-            name="period",
-            type=str,
-            required=False,
-            enum=list(BOOKING_PERIODS),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="me_bookings",
+        summary="Мои записи: пробные занятия и события одной лентой",
+        description=(
+            "period=upcoming (по умолчанию) — ближайшие сверху; past — свежие "
+            "сверху; all — сначала предстоящие, потом прошедшие. «Прошло» — по "
+            "дате: сегодняшнее ещё предстоящее. Отменённые не показываются. "
+            "status: PENDING — ждёт оплаты/подтверждения, CONFIRMED — записан. "
+            "Уникальный ключ карточки — пара (kind, id)." + _PAGINATION_NOTE
         ),
-        OpenApiParameter(
-            name="kind",
-            type=str,
-            required=False,
-            enum=list(BOOKING_KINDS),
-            description="Без параметра — оба вида.",
-        ),
-        *LIMIT_OFFSET_PARAMETERS,
-    ],
-    responses=BookingSerializer(many=True),
+        parameters=[
+            OpenApiParameter(
+                name="period",
+                type=str,
+                required=False,
+                enum=list(BOOKING_PERIODS),
+            ),
+            OpenApiParameter(
+                name="kind",
+                type=str,
+                required=False,
+                enum=list(BOOKING_KINDS),
+                description="Без параметра — оба вида.",
+            ),
+            *LIMIT_OFFSET_PARAMETERS,
+        ],
+        responses=BookingSerializer(many=True),
+        tags=["my"],
+    )
 )
 class BookingListView(APIView):
     def get(self, request: Request) -> Response:
@@ -281,14 +304,17 @@ class BookingListView(APIView):
         )
 
 
-@extend_schema(
-    operation_id="me_deposit",
-    summary="Баланс депозита родителя",
-    description=(
-        "Баланс в копейках. Нет депозита — 0. Нужен чекауту, чтобы решить, "
-        "предлагать ли оплату с депозита (use_deposit)."
-    ),
-    responses=DepositBalanceSerializer,
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="me_deposit",
+        summary="Баланс депозита родителя",
+        description=(
+            "Баланс в копейках. Нет депозита — 0. Нужен чекауту, чтобы решить, "
+            "предлагать ли оплату с депозита (use_deposit)."
+        ),
+        responses=DepositBalanceSerializer,
+        tags=["my"],
+    )
 )
 class DepositBalanceView(APIView):
     def get(self, request: Request) -> Response:
@@ -296,15 +322,18 @@ class DepositBalanceView(APIView):
         return Response(DepositBalanceSerializer({"balance": balance}).data)
 
 
-@extend_schema(
-    operation_id="me_deposit_entries",
-    summary="История движений депозита",
-    description=(
-        "Новые сверху. amount со знаком: плюс — начисление, минус — списание."
-        + _PAGINATION_NOTE
-    ),
-    parameters=LIMIT_OFFSET_PARAMETERS,
-    responses=DepositEntryViewSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="me_deposit_entries",
+        summary="История движений депозита",
+        description=(
+            "Новые сверху. amount со знаком: плюс — начисление, минус — списание."
+            + _PAGINATION_NOTE
+        ),
+        parameters=LIMIT_OFFSET_PARAMETERS,
+        responses=DepositEntryViewSerializer(many=True),
+        tags=["my"],
+    )
 )
 class DepositEntryListView(APIView):
     def get(self, request: Request) -> Response:
@@ -319,19 +348,22 @@ class DepositEntryListView(APIView):
         )
 
 
-@extend_schema(
-    operation_id="me_upcoming",
-    summary="Лента ближайших активностей (занятия + события)",
-    description=(
-        "Хронологически, ближайшие сверху. Горизонт weeks (по умолчанию 4, "
-        "максимум 8)." + _PAGINATION_NOTE
-    ),
-    parameters=[
-        OpenApiParameter(name="weeks", type=int, required=False),
-        OpenApiParameter(name="child_id", type=int, required=False),
-        *LIMIT_OFFSET_PARAMETERS,
-    ],
-    responses=UpcomingItemSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="me_upcoming",
+        summary="Лента ближайших активностей (занятия + события)",
+        description=(
+            "Хронологически, ближайшие сверху. Горизонт weeks (по умолчанию 4, "
+            "максимум 8)." + _PAGINATION_NOTE
+        ),
+        parameters=[
+            OpenApiParameter(name="weeks", type=int, required=False),
+            OpenApiParameter(name="child_id", type=int, required=False),
+            *LIMIT_OFFSET_PARAMETERS,
+        ],
+        responses=UpcomingItemSerializer(many=True),
+        tags=["my"],
+    )
 )
 class UpcomingFeedView(APIView):
     def get(self, request: Request) -> Response:

@@ -3,10 +3,10 @@ from __future__ import annotations
 import calendar
 import logging
 import uuid
-from contextlib import suppress
 from collections.abc import Sequence
-from datetime import date, datetime, time, timedelta
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
 from typing import Literal
 
 from django.db import IntegrityError
@@ -17,8 +17,11 @@ from django.utils import timezone
 from apps.billing.adapters import (
     GatewayContractError,
     GatewayError,
+    GatewayNetworkError,
+    InvalidPaymentIdError,
     PaymentGateway,
     PaymentInfo,
+    PaymentNotFoundError,
 )
 from apps.billing.models import (
     Attendance,
@@ -30,6 +33,7 @@ from apps.billing.models import (
     EnrollmentType,
     IdempotencyRecord,
     ParentDeposit,
+    RefundStatus,
     Subscription,
     SubscriptionPlan,
     SubscriptionSlot,
@@ -38,8 +42,9 @@ from apps.billing.models import (
     TransactionStatus,
 )
 from apps.billing.ports import SchedulePort, UnknownSlotError
-from apps.billing.selectors import active_seat_q
+from apps.billing.selectors import active_seat_q, attendances_awaiting_debit
 from apps.core.locks import advisory_xact_lock, advisory_xact_lock_many
+from apps.core.queue import kiq_safely
 from apps.users.models import Student
 
 logger = logging.getLogger(__name__)
@@ -169,6 +174,14 @@ class AmountMismatchError(BillingError):
         self.actual_currency = actual_currency
 
 
+class RefundNotAwaitingManualError(BillingError):
+    def __init__(self, transaction_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Транзакция {transaction_id} не ждёт ручного разбора возврата."
+        )
+        self.transaction_id = transaction_id
+
+
 class SubscriptionNotActivatableError(BillingError):
     def __init__(self, payment_id: str, subscription_id: int) -> None:
         super().__init__(
@@ -281,9 +294,25 @@ _SLOT_LOCK_CLASS = 815_001
 # при массовой отмене или падении БД
 _SWEEP_CHUNK_SIZE = 1_000
 _REFUND_CHUNK_SIZE = 500
+# ПОЧЕМУ: каждая сверка — GET в ЮКассу с таймаутом до 5 с. 50 × 5 с укладываются
+# в интервал крона (5 мин), тогда как весь чанк в 1000 занял бы больше часа
+_RECONCILE_CHUNK_SIZE = 50
+# ПОЧЕМУ: если ЮКасса недоступна дольше этого срока, заказ снимается без сверки —
+# иначе сломанные ключи API держали бы места в группах бесконечно. Оплату
+# поймают опоздавший вебхук или досверка и отправят в возврат
+_RECONCILE_GIVE_UP_AFTER = timedelta(hours=2)
+# ПОЧЕМУ: неоплаченный платёж ЮКасса отменяет сама (expired_on_confirmation), срок
+# зависит от способа оплаты. Сутки с запасом накрывают его; не получили
+# окончательного статуса — алерт и ручная проверка в кабинете ЮКассы
+_POST_EXPIRY_RECHECK_WINDOW = timedelta(hours=24)
 # ПОЧЕМУ: lease обязан переживать сетевой вызов к шлюзу с ретраями,
 # но не блокировать возврат надолго после смерти воркера
 _REFUND_CLAIM_TTL = timedelta(minutes=10)
+# ПОЧЕМУ: CANCELED — ответ ЮКассы «возврат не прошёл»; вместе с нашим
+# карантином это всё, что требует рук менеджера
+REFUND_STATUSES_AWAITING_MANUAL = frozenset(
+    {RefundStatus.FAILED, RefundStatus.CANCELED}
+)
 
 
 # ПОЧЕМУ: дефолтное значение для снапшота, бизнес-правила могут меняться,
@@ -336,23 +365,30 @@ def debit_token(attendance_id: int) -> None:
         if subscription.status != SubscriptionStatus.ACTIVE or is_expired:
             raise SubscriptionNotSpendableError(subscription.pk, subscription.status)
 
-        try:
-            slot = SubscriptionSlot.objects.select_for_update(of=("self",)).get(
-                subscription_id=enrollment.subscription_id,
-                slot_id=enrollment.schedule_id,
-            )
-        except SubscriptionSlot.DoesNotExist as exc:
-            raise SlotBalanceNotFoundError(
-                enrollment.subscription_id, enrollment.schedule_id
-            ) from exc
+        _spend_slot_token(attendance, subscription.pk)
 
-        if slot.remaining_tokens <= 0:
-            raise InsufficientTokensError(slot.pk)
 
-        slot.remaining_tokens -= 1
-        slot.save(update_fields=["remaining_tokens"])
-        attendance.token_debited = True
-        attendance.save(update_fields=["token_debited"])
+def _spend_slot_token(attendance: Attendance, subscription_id: int) -> None:
+    # ПОЧЕМУ: общий хвост debit_token и добора в свипере истечения. Вызывающий
+    # уже держит FOR UPDATE на отметке и проверил, что списывать можно;
+    # исключения бросаются до записи — откатывать нечего
+    try:
+        slot = SubscriptionSlot.objects.select_for_update(of=("self",)).get(
+            subscription_id=subscription_id,
+            slot_id=attendance.enrollment.schedule_id,
+        )
+    except SubscriptionSlot.DoesNotExist as exc:
+        raise SlotBalanceNotFoundError(
+            subscription_id, attendance.enrollment.schedule_id
+        ) from exc
+
+    if slot.remaining_tokens <= 0:
+        raise InsufficientTokensError(slot.pk)
+
+    slot.remaining_tokens -= 1
+    slot.save(update_fields=["remaining_tokens"])
+    attendance.token_debited = True
+    attendance.save(update_fields=["token_debited"])
 
 
 def create_payment(
@@ -630,7 +666,8 @@ def create_trial_payment(
 ) -> CheckoutResult:
     # ПОЧЕМУ: защита от IDOR — принадлежность ребёнка плательщику
     _ensure_student_owned(student_id, parent_id)
-    if trial_date < timezone.localdate():
+    now = timezone.now()
+    if trial_date < timezone.localdate(now):
         raise TrialDateUnavailableError(
             schedule_id, trial_date, "дата пробного уже в прошлом."
         )
@@ -654,17 +691,21 @@ def create_trial_payment(
                 trial_info = schedule_port.get_slot_trial_info(schedule_id)
                 capacity = schedule_port.get_slot_capacity(schedule_id)
                 next_lesson = schedule_port.get_next_lesson_date(
-                    schedule_id, trial_date
+                    schedule_id,
+                    max(
+                        now, timezone.make_aware(datetime.combine(trial_date, time.min))
+                    ),
                 )
             except UnknownSlotError as exc:
                 raise SlotNotFoundError(schedule_id) from exc
-            # ПОЧЕМУ: дата валидна, только если ближайшее занятие «на дату или
-            # позже» — ровно эта дата; отмены и переносы масок учтены портом
+            # ПОЧЕМУ: дата валидна, только если ближайшее занятие с открытой
+            # записью — ровно эта дата; отмены, переносы и уже начавшееся
+            # сегодняшнее занятие учтены портом
             if next_lesson != trial_date:
                 raise TrialDateUnavailableError(
                     schedule_id,
                     trial_date,
-                    "на эту дату занятие группы не проводится.",
+                    "на эту дату нет занятия, на которое ещё открыта запись.",
                 )
 
             # Быстрая проверка лимита до capacity-работы; гонку двух параллельных
@@ -795,9 +836,10 @@ def _fulfill_prepaid_order(tx: Transaction, schedule_port: SchedulePort) -> None
         )
     slot_ids = _selected_slot_ids(tx, "deposit-prepaid")
     try:
-        start_date, expires_at = _activation_window(slot_ids, schedule_port)
+        first_lessons = _first_lessons(slot_ids, schedule_port)
     except UnknownSlotError as exc:
         raise SlotNotFoundError(exc.slot_id) from exc
+    start_date, expires_at = _activation_window(first_lessons)
 
     tx.status = TransactionStatus.SUCCEEDED
     tx.metadata = {**tx.metadata, "paid_from_deposit": True}
@@ -812,6 +854,7 @@ def _fulfill_prepaid_order(tx: Transaction, schedule_port: SchedulePort) -> None
     Enrollment.objects.filter(
         subscription_id=subscription_id, status=EnrollmentStatus.HELD
     ).update(status=EnrollmentStatus.ENROLLED)
+    _join_todays_lessons(subscription_id, first_lessons)
     SubscriptionSlot.objects.bulk_create(
         [
             SubscriptionSlot(
@@ -945,13 +988,19 @@ def confirm_payment(
     # !!!: мы не доверяем payload вебхука
     # применяем строго верифицированный статус напрямую из API провайдера
     info = gateway.get_payment(payment_id)
+    _apply_verified_payment(info, _verified_transaction_id(info), schedule_port)
 
-    transaction_id = _verified_transaction_id(info)
+
+def _apply_verified_payment(
+    info: PaymentInfo, transaction_id: uuid.UUID, schedule_port: SchedulePort
+) -> None:
+    # ПОЧЕМУ: общий хвост вебхука и сверки в свипере — статус уже получен
+    # из API провайдера, обе дороги проводят его одним и тем же кодом
     if info.status == "succeeded":
         _apply_success(info, transaction_id, schedule_port)
         return
     if info.status == "canceled":
-        _apply_cancellation(transaction_id, payment_id)
+        _apply_cancellation(transaction_id, info.id)
         return
     # ПОЧЕМУ: промежуточные статусы (pending, waiting_for_capture) игнорируются,
     # ожидаем терминального состояния платежа от провайдера
@@ -982,17 +1031,23 @@ def _apply_success(
             if (
                 tx.status == TransactionStatus.CANCELED
                 and tx.metadata.get("canceled_reason") in _REFUNDABLE_CANCEL_REASONS
-                and not tx.metadata.get("compensation_required")
+                # ПОЧЕМУ received_amount, а не флаг возврата: флаг сбрасывается
+                # после выплаты, и повторный вебхук поставил бы возврат снова
+                and tx.received_amount is None
             ):
                 # ПОЧЕМУ: вебхук опоздал, заказ уже аннулирован (TTL-свипер или
                 # аварийное прерывание checkout) — инициируем возврат
                 tx.external_id = info.id
-                tx.save(update_fields=["external_id"])
-                _mark_for_compensation(tx, {"reason": "PAYMENT_SUCCEEDED_AFTER_EXPIRY"})
+                tx.received_amount = info.amount_kopecks
+                tx.save(update_fields=["external_id", "received_amount"])
+                _queue_refund(
+                    tx, info.currency, {"reason": "PAYMENT_SUCCEEDED_AFTER_EXPIRY"}
+                )
                 deferred = PaymentSucceededAfterExpiryError(info.id, str(tx.pk))
         elif info.currency != _EXPECTED_CURRENCY or info.amount_kopecks != tx.amount:
             tx.status = TransactionStatus.FAILED
             tx.external_id = info.id
+            tx.received_amount = info.amount_kopecks
             tx.metadata = {
                 **tx.metadata,
                 "failure_reason": "AMOUNT_MISMATCH",
@@ -1001,7 +1056,12 @@ def _apply_success(
                 "gateway_amount_kopecks": info.amount_kopecks,
                 "gateway_currency": info.currency,
             }
-            tx.save(update_fields=["status", "external_id", "metadata"])
+            tx.save(
+                update_fields=["status", "external_id", "received_amount", "metadata"]
+            )
+            # ПОЧЕМУ: заказ не исполняется, а деньги у нас — возвращаем всё
+            # пришедшее; депозитную часть вернёт _release_order_resources
+            _queue_refund(tx, info.currency, {})
             _release_order_resources(tx)
             deferred = AmountMismatchError(
                 info.id, tx.amount, info.amount_kopecks, info.currency
@@ -1013,12 +1073,20 @@ def _apply_success(
             if data_error is not None:
                 tx.status = TransactionStatus.FAILED
                 tx.external_id = info.id
+                tx.received_amount = info.amount_kopecks
                 tx.metadata = {
                     **tx.metadata,
                     "failure_reason": "DATA_INTEGRITY",
                     "detail": str(data_error),
                 }
-                tx.save(update_fields=["status", "external_id", "metadata"])
+                tx.save(
+                    update_fields=[
+                        "status",
+                        "external_id",
+                        "received_amount",
+                        "metadata",
+                    ]
+                )
                 _mark_for_compensation(tx, {})
                 _release_order_resources(tx)
                 deferred = data_error
@@ -1029,10 +1097,11 @@ def _apply_success(
                 assert subscription_id is not None
                 tx.status = TransactionStatus.SUCCEEDED
                 tx.external_id = info.id
-                tx.save(update_fields=["status", "external_id"])
+                tx.received_amount = info.amount_kopecks
+                tx.save(update_fields=["status", "external_id", "received_amount"])
 
                 try:
-                    start_date, expires_at = _activation_window(slot_ids, schedule_port)
+                    first_lessons = _first_lessons(slot_ids, schedule_port)
                 except UnknownSlotError:
                     _mark_for_compensation(
                         tx,
@@ -1046,6 +1115,7 @@ def _apply_success(
                         info.id, tx.subscription_id or 0, "SLOT_REMOVED"
                     )
                 else:
+                    start_date, expires_at = _activation_window(first_lessons)
                     activated = Subscription.objects.filter(
                         pk=subscription_id, status=SubscriptionStatus.PENDING
                     ).update(
@@ -1090,6 +1160,7 @@ def _apply_success(
                                 info.id, subscription_id, overbook_reason
                             )
                         else:
+                            _join_todays_lessons(subscription_id, first_lessons)
                             SubscriptionSlot.objects.bulk_create(
                                 [
                                     SubscriptionSlot(
@@ -1120,7 +1191,8 @@ def _apply_trial_success(
     # за время оплаты, а место — уйти конкуренту
     tx.status = TransactionStatus.SUCCEEDED
     tx.external_id = info.id
-    tx.save(update_fields=["status", "external_id"])
+    tx.received_amount = info.amount_kopecks
+    tx.save(update_fields=["status", "external_id", "received_amount"])
 
     # !!!: порядок захвата (advisory-лок слота → строка Enrollment) обязан
     # совпадать с _try_enroll_held_seats, иначе вебхуки пробного и абонемента
@@ -1165,6 +1237,10 @@ def _apply_trial_success(
 
     enrollment.status = EnrollmentStatus.ENROLLED
     enrollment.save(update_fields=["status"])
+    # ПОЧЕМУ без проверки времени: оплату, пришедшую после начала занятия,
+    # принимаем (решение бизнеса 2026-10-01) — ребёнок, скорее всего, уже там
+    if enrollment.trial_date == timezone.localdate():
+        _add_to_journal({enrollment.pk: enrollment.trial_date})
     return None
 
 
@@ -1172,6 +1248,28 @@ def _mark_for_compensation(tx: Transaction, extra: dict[str, object]) -> None:
     tx.requires_compensation = True
     tx.metadata = {**tx.metadata, "compensation_required": True, **extra}
     tx.save(update_fields=["requires_compensation", "metadata"])
+
+
+def _queue_refund(tx: Transaction, currency: str, extra: dict[str, object]) -> None:
+    # ПОЧЕМУ: возврат в ЮКассе делается в валюте платежа, а наш шлюз шлёт только
+    # рубли в копейках. Платежи мы создаём строго в RUB, чужая валюта — аномалия:
+    # автоматом не возвращаем, отдаём на ручной разбор (экран транзакций в админке)
+    if currency == _EXPECTED_CURRENCY:
+        _mark_for_compensation(tx, extra)
+        return
+    tx.refund_status = RefundStatus.FAILED
+    tx.metadata = {
+        **tx.metadata,
+        **extra,
+        "refund_error": f"валюта платежа {currency} — возврат вручную",
+    }
+    tx.save(update_fields=["refund_status", "metadata"])
+    logger.error(
+        "Транзакция %s: оплата в валюте %s — возврат требует ручного разбора.",
+        tx.pk,
+        currency,
+    )
+    _schedule_refund_review_alert(tx.pk)
 
 
 def _validate_success_payload(
@@ -1349,53 +1447,358 @@ def _month_after(day: date) -> date:
     return day.replace(year=year, month=month, day=min(day.day, last_day))
 
 
-def _activation_window(
-    slot_ids: list[int], schedule_port: SchedulePort
-) -> tuple[date, datetime]:
+def _first_lessons(slot_ids: list[int], schedule_port: SchedulePort) -> dict[int, date]:
+    # ПОЧЕМУ «сейчас» — момент активации, а не оформления заказа (решение
+    # бизнеса 2026-10-01): вебхук, пришедший после начала занятия, сдвигает
+    # старт на следующее — абонемент никогда не начинается с прошедшего
+    now = timezone.now()
+    return {
+        slot_id: schedule_port.get_next_lesson_date(slot_id, now)
+        for slot_id in sorted(slot_ids)
+    }
+
+
+def _activation_window(first_lessons: dict[int, date]) -> tuple[date, datetime]:
     # ПОЧЕМУ: согласно checkout-flow.md, абонемент действует строго месяц
     # начиная с даты первого фактического занятия в выбранных слотах
-    today = timezone.localdate()
-    first_lesson = min(
-        schedule_port.get_next_lesson_date(slot_id, today)
-        for slot_id in sorted(slot_ids)
-    )
+    first_lesson = min(first_lessons.values())
     expires_at = timezone.make_aware(
         datetime.combine(_month_after(first_lesson), time(23, 59, 59))
     )
     return first_lesson, expires_at
 
 
-def sweep_stale_pending_transactions(*, now: datetime | None = None) -> int:
+def _join_todays_lessons(subscription_id: int, first_lessons: dict[int, date]) -> None:
+    # ПОЧЕМУ: журнал дня собирается в 07:00 (journal.materialize_today_lessons);
+    # купивший днём до начала занятия иначе не попал бы в него до следующей недели
+    today = timezone.localdate()
+    todays_slots = [slot_id for slot_id, day in first_lessons.items() if day == today]
+    if not todays_slots:
+        return
+    enrollment_ids = Enrollment.objects.filter(
+        subscription_id=subscription_id,
+        schedule_id__in=todays_slots,
+        status=EnrollmentStatus.ENROLLED,
+    ).values_list("pk", flat=True)
+    _add_to_journal(dict.fromkeys(enrollment_ids, today))
+
+
+def _add_to_journal(lesson_dates: dict[int, date]) -> None:
+    # ПОЧЕМУ так же, как journal.open_lesson: посещаемость автоматическая,
+    # педагог только снимает отсутствующих. ignore_conflicts опирается на
+    # uq_billing_attendance_per_enrollment_date — повтор вебхука и утренняя
+    # задача журнала не задвоят отметку и не тронут выставленную педагогом
+    Attendance.objects.bulk_create(
+        [
+            Attendance(
+                enrollment_id=enrollment_id,
+                date=lesson_date,
+                status=AttendanceStatus.ATTENDED,
+            )
+            for enrollment_id, lesson_date in lesson_dates.items()
+        ],
+        ignore_conflicts=True,
+    )
+
+
+def sweep_stale_pending_transactions(
+    *,
+    gateway: PaymentGateway,
+    schedule_port: SchedulePort,
+    now: datetime | None = None,
+) -> int:
     # ПОЧЕМУ: защита от зависания забронированных слотов, если вебхук
     # от провайдера потерялся или клиент бросил оплату на полпути
+    # !!!: заказ, заведённый в ЮКассе, снимается только после сверки с ней —
+    # вебхук мог потеряться, а деньги прийти. Молча снятый оплаченный заказ
+    # никто бы не вернул: возврат запускает только опоздавший вебхук
     moment = now if now is not None else timezone.now()
     cutoff = moment - _PENDING_TRANSACTION_TTL
+    give_up_before = moment - _RECONCILE_GIVE_UP_AFTER
     # ПОЧЕМУ: LIMIT без ORDER BY недетерминирован — при переполнении чанка
     # свипер обязан снимать самые старые брони первыми
-    stale_ids = list(
+    stale = list(
         Transaction.objects.filter(
             status=TransactionStatus.PENDING, created_at__lt=cutoff
         )
         .order_by("created_at")
-        .values_list("pk", flat=True)[:_SWEEP_CHUNK_SIZE]
+        .values_list("pk", "external_id", "created_at")[:_SWEEP_CHUNK_SIZE]
     )
 
     swept = 0
-    for tx_id in stale_ids:
-        with db_transaction.atomic():
-            tx = (
-                Transaction.objects.select_for_update()
-                .filter(pk=tx_id, status=TransactionStatus.PENDING)
-                .first()
-            )
-            if tx is None:
-                continue  # вебхук успел первым — не трогаем
-            tx.status = TransactionStatus.CANCELED
-            tx.metadata = {**tx.metadata, "canceled_reason": _TTL_EXPIRED_REASON}
-            tx.save(update_fields=["status", "metadata"])
-            _release_order_resources(tx)
+    reconcile_budget = _RECONCILE_CHUNK_SIZE
+    gateway_down = False
+    for tx_id, external_id, created_at in stale:
+        # ПОЧЕМУ: без external_id платёж у провайдера не заведён (или процесс
+        # умер до сохранения id — тогда клиент не получил ссылку): спрашивать
+        # некого и платить нечем, снимаем как раньше
+        gave_up = external_id is not None and created_at < give_up_before
+        if external_id is not None and not gave_up:
+            # ПОЧЕМУ: заказ, не сверенный в этом тике, остаётся PENDING —
+            # сверим в следующем, а не снимаем вслепую
+            if gateway_down or reconcile_budget == 0:
+                continue
+            reconcile_budget -= 1
+            try:
+                settled = _reconcile_stale_payment(
+                    tx_id, external_id, gateway, schedule_port
+                )
+            except GatewayError as exc:
+                # ПОЧЕМУ: ЮКасса лежит или отвергает наши запросы — остальные
+                # запросы тика упрутся в то же; прекращаем сверку до следующего тика
+                _log_reconcile_postponed(tx_id, exc)
+                gateway_down = True
+                continue
+            if settled:
+                continue
+
+        if _expire_pending_transaction(
+            tx_id, recheck_until=moment + _POST_EXPIRY_RECHECK_WINDOW
+        ):
             swept += 1
+            if gave_up:
+                logger.critical(
+                    "Сверка %s: платёж %s не удалось сверить за %s — заказ снят "
+                    "без сверки; досверка продолжится.",
+                    tx_id,
+                    external_id,
+                    _RECONCILE_GIVE_UP_AFTER,
+                )
+
+    # ПОЧЕМУ: досверке снятых заказов — остаток бюджета тика. Снятие по TTL
+    # важнее: оно держит места в группах
+    _close_overdue_rechecks(moment)
+    if not gateway_down and reconcile_budget > 0:
+        _recheck_expired_payments(gateway, schedule_port, moment, reconcile_budget)
     return swept
+
+
+def _log_reconcile_postponed(tx_id: uuid.UUID, exc: GatewayError) -> None:
+    if isinstance(exc, GatewayNetworkError):
+        logger.warning(
+            "Сверка %s: ЮКасса недоступна, сверка отложена до следующего тика.",
+            tx_id,
+            exc_info=exc,
+        )
+        return
+    logger.critical(
+        "Сверка %s: нарушение контракта API ЮКассы (ключи/схема ответа) — "
+        "сверка отложена до следующего тика.",
+        tx_id,
+        exc_info=exc,
+    )
+
+
+def _reconcile_stale_payment(
+    tx_id: uuid.UUID,
+    payment_id: str,
+    gateway: PaymentGateway,
+    schedule_port: SchedulePort,
+) -> bool:
+    # ПОЧЕМУ: True — провайдер дал окончательный статус, и он проведён тем же
+    # путём, что и вебхук; False — снимать заказ по TTL локально.
+    # !!!: сетевой вызов строго вне транзакции и локов (контракт apps.billing.ports);
+    # запись — отдельной короткой транзакцией внутри _apply_verified_payment.
+    # Смерть процесса между ними безопасна: GET идемпотентен, следующий тик
+    # спросит заново
+    try:
+        info = gateway.get_payment(payment_id)
+    except (PaymentNotFoundError, InvalidPaymentIdError):
+        logger.error(
+            "Сверка %s: платёж %s неизвестен ЮКассе — денег нет, заказ снимается "
+            "по TTL.",
+            tx_id,
+            payment_id,
+        )
+        return False
+
+    if info.status not in ("succeeded", "canceled"):
+        # ПОЧЕМУ: pending/waiting_for_capture — за TTL не оплачено. Заказ снимается,
+        # места освобождаются; оплату позже поймает вебхук или досверка
+        # (_recheck_expired_payments) и отправит в возврат
+        return False
+
+    if info.transaction_id != str(tx_id):
+        logger.error(
+            "Сверка %s: платёж %s ссылается на транзакцию %r — заказ снимается "
+            "по TTL, требуется ручной разбор.",
+            tx_id,
+            payment_id,
+            info.transaction_id,
+        )
+        return False
+
+    # ПОЧЕМУ: вебхук мог успеть за время GET — тогда он уже всё провёл,
+    # и тревога «вебхук не дошёл» была бы ложной
+    if not Transaction.objects.filter(
+        pk=tx_id, status=TransactionStatus.PENDING
+    ).exists():
+        return True
+
+    if info.status == "succeeded":
+        # ПОЧЕМУ critical: оплата без вебхука — признак, что вебхуки ЮКассы
+        # до нас не доходят (URL, allowlist за прокси); чинить надо источник
+        logger.critical(
+            "Сверка %s: платёж %s оплачен, но вебхук не пришёл — проведён "
+            "сверкой. Проверьте доставку вебхуков ЮКассы.",
+            tx_id,
+            payment_id,
+        )
+    try:
+        _apply_verified_payment(info, tx_id, schedule_port)
+    except BillingError:
+        # ПОЧЕМУ: как в run_payment_verification — бизнес-исход (компенсация,
+        # несовпадение суммы) уже закоммичен, ошибка лишь сообщает о нём
+        logger.exception(
+            "Сверка %s: платёж %s проведён с бизнес-ошибкой — требуется ручной разбор.",
+            tx_id,
+            payment_id,
+        )
+    return True
+
+
+def _expire_pending_transaction(tx_id: uuid.UUID, *, recheck_until: datetime) -> bool:
+    with db_transaction.atomic():
+        tx = (
+            Transaction.objects.select_for_update()
+            .filter(pk=tx_id, status=TransactionStatus.PENDING)
+            .first()
+        )
+        if tx is None:
+            return False  # вебхук успел первым — не трогаем
+        tx.status = TransactionStatus.CANCELED
+        tx.metadata = {**tx.metadata, "canceled_reason": _TTL_EXPIRED_REASON}
+        # ПОЧЕМУ: платёж заведён в ЮКассе — родитель ещё может оплатить по
+        # старой ссылке, ставим заказ в очередь досверки
+        if tx.external_id is not None:
+            tx.payment_recheck_until = recheck_until
+        tx.save(update_fields=["status", "metadata", "payment_recheck_until"])
+        _release_order_resources(tx)
+        return True
+
+
+def _recheck_expired_payments(
+    gateway: PaymentGateway,
+    schedule_port: SchedulePort,
+    moment: datetime,
+    budget: int,
+) -> None:
+    # ПОЧЕМУ: «спросить перед снятием» не ловит оплату, случившуюся после
+    # снятия: вебхук потерян — возврата нет. Досверка спрашивает ЮКассу, пока
+    # та не даст окончательный статус (неоплаченный платёж она отменяет сама —
+    # expired_on_confirmation). Раньше снятые — первыми
+    # ПОЧЕМУ верхняя граница: заказ, снятый в этом же тике, получил срок ровно
+    # moment + окно — его только что спросили, повторный GET бессмыслен
+    due = list(
+        Transaction.objects.filter(
+            payment_recheck_until__gte=moment,
+            payment_recheck_until__lt=moment + _POST_EXPIRY_RECHECK_WINDOW,
+        )
+        .order_by("payment_recheck_until")
+        .values_list("pk", "external_id")[:budget]
+    )
+    for tx_id, external_id in due:
+        if external_id is None:
+            _finish_recheck(tx_id)
+            continue
+        try:
+            final = _recheck_expired_payment(tx_id, external_id, gateway, schedule_port)
+        except GatewayError as exc:
+            _log_reconcile_postponed(tx_id, exc)
+            return
+        if final:
+            _finish_recheck(tx_id)
+
+
+def _recheck_expired_payment(
+    tx_id: uuid.UUID,
+    payment_id: str,
+    gateway: PaymentGateway,
+    schedule_port: SchedulePort,
+) -> bool:
+    # ПОЧЕМУ: True — статус окончательный, досверку закрываем; False —
+    # платёж ещё открыт, спросим в следующем тике.
+    # !!!: как и сверка — сеть вне транзакции, запись в _apply_verified_payment.
+    # Смерть процесса до _finish_recheck безопасна: следующий тик увидит, что
+    # возврат уже поставлен, и просто закроет досверку
+    try:
+        info = gateway.get_payment(payment_id)
+    except (PaymentNotFoundError, InvalidPaymentIdError):
+        logger.error(
+            "Досверка %s: платёж %s неизвестен ЮКассе — досверка закрыта.",
+            tx_id,
+            payment_id,
+        )
+        return True
+
+    if info.status == "canceled":
+        return True
+    if info.status != "succeeded":
+        return False
+
+    if info.transaction_id != str(tx_id):
+        logger.error(
+            "Досверка %s: платёж %s ссылается на транзакцию %r — досверка закрыта, "
+            "требуется ручной разбор.",
+            tx_id,
+            payment_id,
+            info.transaction_id,
+        )
+        return True
+
+    # ПОЧЕМУ: вебхук мог успеть — оплата уже учтена (возврат поставлен,
+    # выплачен или ушёл на ручной разбор). Маркер тот же, что в _apply_success:
+    # received_amount заполняется при первом же учёте пришедших денег
+    tx = Transaction.objects.only("status", "received_amount").get(pk=tx_id)
+    if tx.status != TransactionStatus.CANCELED or tx.received_amount is not None:
+        return True
+
+    logger.critical(
+        "Досверка %s: платёж %s оплачен после снятия заказа, вебхук не пришёл — "
+        "поставлен возврат. Проверьте доставку вебхуков ЮКассы.",
+        tx_id,
+        payment_id,
+    )
+    try:
+        _apply_verified_payment(info, tx_id, schedule_port)
+    except PaymentSucceededAfterExpiryError:
+        pass  # ожидаемый исход: заказ не восстанавливается, возврат поставлен
+    except BillingError:
+        logger.exception(
+            "Досверка %s: платёж %s проведён с бизнес-ошибкой — требуется ручной "
+            "разбор.",
+            tx_id,
+            payment_id,
+        )
+    return True
+
+
+def _finish_recheck(tx_id: uuid.UUID) -> bool:
+    # ПОЧЕМУ: условный UPDATE — параллельный тик, закрывший досверку первым,
+    # не получит второй записи и второго алерта
+    return (
+        Transaction.objects.filter(
+            pk=tx_id, payment_recheck_until__isnull=False
+        ).update(payment_recheck_until=None)
+        == 1
+    )
+
+
+def _close_overdue_rechecks(moment: datetime) -> None:
+    overdue = list(
+        Transaction.objects.filter(payment_recheck_until__lt=moment)
+        .order_by("payment_recheck_until")
+        .values_list("pk", "external_id")[:_SWEEP_CHUNK_SIZE]
+    )
+    for tx_id, external_id in overdue:
+        if _finish_recheck(tx_id):
+            logger.critical(
+                "Досверка %s: платёж %s не получил окончательного статуса за %s — "
+                "проверьте оплату в кабинете ЮКассы.",
+                tx_id,
+                external_id,
+                _POST_EXPIRY_RECHECK_WINDOW,
+            )
 
 
 def sweep_expired_subscriptions(*, now: datetime | None = None) -> int:
@@ -1425,6 +1828,9 @@ def sweep_expired_subscriptions(*, now: datetime | None = None) -> int:
             )
             if subscription is None:
                 continue  # конкурентный тик успел первым
+            # !!!: до расчёта остатка и до отмены записей — иначе занятие
+            # последнего дня, не списанное ночной задачей, вернулось бы деньгами
+            _debit_attended_before_expiry(subscription)
             subscription.status = SubscriptionStatus.EXPIRED
             subscription.save(update_fields=["status"])
             Enrollment.objects.filter(
@@ -1434,6 +1840,29 @@ def sweep_expired_subscriptions(*, now: datetime | None = None) -> int:
             _credit_unused_sessions(subscription)
             swept += 1
     return swept
+
+
+def _debit_attended_before_expiry(subscription: Subscription) -> None:
+    # ПОЧЕМУ: страховка ночной задачи (journal.debit_attended_lessons) —
+    # упала, не успела до 23:59:59 последнего дня или отметку вернули в
+    # «пришёл» после неё. debit_token здесь не подходит: срок по дате уже
+    # вышел, а блокировка абонемента у свипера и так взята
+    assert subscription.expires_at is not None  # сужение: свипер фильтрует по нему
+    last_day = timezone.localdate(subscription.expires_at)
+    attendances = (
+        attendances_awaiting_debit()
+        .filter(enrollment__subscription=subscription, date__lte=last_day)
+        .select_related("enrollment")
+        .select_for_update(of=("self",))
+        .order_by("pk")
+    )
+    for attendance in attendances:
+        try:
+            _spend_slot_token(attendance, subscription.pk)
+        except (InsufficientTokensError, SlotBalanceNotFoundError) as exc:
+            # ПОЧЕМУ: пятое занятие месяца при 4 фишках бесплатно (решение
+            # бизнеса) — не причина срывать закрытие абонемента
+            logger.info("Отметка #%s не списана при истечении: %s", attendance.pk, exc)
 
 
 def _credit_unused_sessions(subscription: Subscription) -> int:
@@ -1520,10 +1949,17 @@ def issue_pending_refunds(
             )
             continue
 
+        # ПОЧЕМУ: возвращаем пришедшее, а не ожидаемое — при недоплате ЮКасса
+        # отвергла бы возврат больше суммы платежа. Сумма берётся из колонки,
+        # поэтому ретрай после падения шлёт тот же запрос под тем же ключом.
+        # NULL — транзакции до появления колонки, там сумма сверена с amount
+        refund_amount = (
+            tx.received_amount if tx.received_amount is not None else tx.amount
+        )
         try:
             refund = gateway.create_refund(
                 payment_id=tx.external_id,
-                amount_kopecks=tx.amount,
+                amount_kopecks=refund_amount,
                 idempotence_key=f"refund-{tx.pk}",
             )
         except GatewayContractError as exc:
@@ -1538,21 +1974,94 @@ def issue_pending_refunds(
                 continue
             locked.requires_compensation = False
             locked.compensation_claimed_until = None
-            locked.metadata = {
-                **locked.metadata,
-                "compensation_required": False,
-                "refund_id": refund.id,
-                "refund_status": refund.status,
-            }
+            locked.refund_id = refund.id
+            locked.refund_status = RefundStatus(refund.status.upper())
+            locked.metadata = {**locked.metadata, "compensation_required": False}
             locked.save(
                 update_fields=[
                     "requires_compensation",
                     "compensation_claimed_until",
+                    "refund_id",
+                    "refund_status",
                     "metadata",
                 ]
             )
+            if locked.refund_status == RefundStatus.SUCCEEDED:
+                _schedule_refund_email(locked.pk)
             issued += 1
     return issued
+
+
+def sync_pending_refunds(*, gateway: PaymentGateway) -> int:
+    # ПОЧЕМУ: ЮКасса может принять возврат в обработку и позже отменить его.
+    # Итог узнаём опросом API, а не из вебхука: тело вебхука не доверенное,
+    # и повторный GET по тому же возврату идемпотентен
+    candidates = list(
+        Transaction.objects.filter(
+            refund_status=RefundStatus.PENDING, refund_id__isnull=False
+        )
+        .order_by("created_at")
+        .values_list("pk", "refund_id")[:_REFUND_CHUNK_SIZE]
+    )
+
+    changed = 0
+    for tx_id, refund_id in candidates:
+        assert refund_id is not None  # сужение: выборка фильтрует NULL
+        error: str | None = None
+        try:
+            refund = gateway.get_refund(refund_id)
+        except GatewayContractError as exc:
+            new_status, error = RefundStatus.FAILED, str(exc)
+        else:
+            if refund.status == "pending":
+                continue
+            new_status = RefundStatus(refund.status.upper())
+        # ПОЧЕМУ: транзитные сбои (GatewayNetworkError) пробрасываются наружу —
+        # незавершённые возвраты доопросит ретрай или следующий тик
+
+        with db_transaction.atomic():
+            locked = (
+                Transaction.objects.select_for_update()
+                .filter(pk=tx_id, refund_status=RefundStatus.PENDING)
+                .first()
+            )
+            if locked is None:
+                continue  # параллельный тик успел первым
+            locked.refund_status = new_status
+            if error is not None:
+                locked.metadata = {**locked.metadata, "refund_error": error}
+            locked.save(update_fields=["refund_status", "metadata"])
+            if new_status == RefundStatus.SUCCEEDED:
+                _schedule_refund_email(locked.pk)
+            else:
+                _schedule_refund_review_alert(locked.pk)
+            changed += 1
+    return changed
+
+
+def _schedule_refund_email(transaction_id: uuid.UUID) -> None:
+    # ПОЧЕМУ: письмо только о выполненном возврате — обещать деньги, пока
+    # ЮКасса ещё может отменить возврат, нельзя
+    db_transaction.on_commit(
+        lambda: _enqueue_refund_task("send_refund_email_task", transaction_id)
+    )
+
+
+def _schedule_refund_review_alert(transaction_id: uuid.UUID) -> None:
+    # ПОЧЕМУ: экран ручного разбора сам никого не зовёт — без сообщения
+    # менеджерам такой возврат ждал бы, пока кто-то случайно откроет админку
+    db_transaction.on_commit(
+        lambda: _enqueue_refund_task("notify_refund_review_task", transaction_id)
+    )
+
+
+def _enqueue_refund_task(task_name: str, transaction_id: uuid.UUID) -> None:
+    # ПОЧЕМУ: локальный импорт — tasks импортирует services на уровне модуля.
+    # Вызывается из on_commit: без него воркер может прочитать транзакцию
+    # раньше коммита
+    from apps.billing import tasks
+
+    kiq_safely(getattr(tasks, task_name), str(transaction_id))
 
 
 def _quarantine_refund(tx_id: uuid.UUID, reason: str) -> None:
@@ -1562,19 +2071,41 @@ def _quarantine_refund(tx_id: uuid.UUID, reason: str) -> None:
             return
         locked.requires_compensation = False
         locked.compensation_claimed_until = None
+        locked.refund_status = RefundStatus.FAILED
         locked.metadata = {
             **locked.metadata,
             "compensation_required": False,
-            "refund_status": "failed",
             "refund_error": reason,
         }
         locked.save(
             update_fields=[
                 "requires_compensation",
                 "compensation_claimed_until",
+                "refund_status",
                 "metadata",
             ]
         )
+        _schedule_refund_review_alert(locked.pk)
+
+
+def resolve_refund_manually(transaction_id: uuid.UUID, *, resolved_by: str) -> None:
+    # ПОЧЕМУ: менеджер разобрал возврат вне системы (кабинет ЮКассы) — фиксируем,
+    # кто и когда закрыл. Прежние refund_error/refund_id остаются для аудита
+    with db_transaction.atomic():
+        tx = Transaction.objects.select_for_update().filter(pk=transaction_id).first()
+        if (
+            tx is None
+            or tx.requires_compensation
+            or tx.refund_status not in REFUND_STATUSES_AWAITING_MANUAL
+        ):
+            raise RefundNotAwaitingManualError(transaction_id)
+        tx.refund_status = RefundStatus.MANUAL
+        tx.metadata = {
+            **tx.metadata,
+            "refund_resolved_by": resolved_by,
+            "refund_resolved_at": timezone.now().isoformat(),
+        }
+        tx.save(update_fields=["refund_status", "metadata"])
 
 
 def sweep_finalized_idempotency_records(*, now: datetime | None = None) -> int:

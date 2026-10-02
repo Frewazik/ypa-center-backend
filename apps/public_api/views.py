@@ -5,11 +5,13 @@ from typing import Final
 
 from django.db.models import Count, Prefetch, Q, QuerySet
 from django.utils import timezone
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import extend_schema, extend_schema_view
 from rest_framework import generics
+from rest_framework.exceptions import NotFound
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from apps.billing.models import EnrollmentStatus, SubscriptionPlan
 from apps.catalog.models import Activity
@@ -24,14 +26,20 @@ from apps.public_api.serializers import (
     GalleryImagePublicSerializer,
     SubscriptionPlanPublicSerializer,
     TeacherPublicSerializer,
+    TrialSlotsResponseSerializer,
 )
 from apps.schedule.models import Schedule
+from apps.schedule.services import list_trial_slots
 from apps.users.models import TeacherProfile
 
 POPULAR_ACTIVITIES_LIMIT: Final[int] = 3
 PAST_EVENTS_VISIBILITY_DAYS: Final[int] = 7
 CACHE_TTL_SHOWCASE_SECONDS: Final[int] = 60 * 5
 CACHE_TTL_EVENTS_SECONDS: Final[int] = 60
+# ПОЧЕМУ коротко: места меняются с каждой покупкой, а инвалидации по записям
+# нет. Устаревший на полминуты список безопасен — чекаут перепроверяет места
+# под блокировкой и ответит 409 NO_AVAILABLE_SEATS
+CACHE_TTL_TRIAL_SLOTS_SECONDS: Final[int] = 30
 
 
 def _active_groups_queryset() -> QuerySet[Schedule]:
@@ -45,10 +53,13 @@ def _active_groups_queryset() -> QuerySet[Schedule]:
     )
 
 
-@extend_schema(
-    operation_id="public_activities_popular",
-    summary="Топ-3 популярных кружка",
-    responses=ActivityCardSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_activities_popular",
+        summary="Топ-3 популярных кружка",
+        responses=ActivityCardSerializer(many=True),
+        tags=["catalog"],
+    )
 )
 class PopularActivitiesView(generics.ListAPIView[Activity]):
     permission_classes = (AllowAny,)
@@ -81,10 +92,13 @@ class PopularActivitiesView(generics.ListAPIView[Activity]):
         )
 
 
-@extend_schema(
-    operation_id="public_activities_list",
-    summary="Полный каталог кружков («Все кружки»)",
-    responses=ActivityDetailSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_activities_list",
+        summary="Полный каталог кружков («Все кружки»)",
+        responses=ActivityDetailSerializer(many=True),
+        tags=["catalog"],
+    )
 )
 class PublicActivityListView(generics.ListAPIView[Activity]):
     permission_classes = (AllowAny,)
@@ -109,10 +123,13 @@ class PublicActivityListView(generics.ListAPIView[Activity]):
         )
 
 
-@extend_schema(
-    operation_id="public_activity_detail",
-    summary="Детальная карточка кружка с подгруппами",
-    responses=ActivityDetailSerializer,
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_activity_detail",
+        summary="Детальная карточка кружка с подгруппами",
+        responses=ActivityDetailSerializer,
+        tags=["catalog"],
+    )
 )
 class ActivityDetailView(generics.RetrieveAPIView[Activity]):
     permission_classes = (AllowAny,)
@@ -135,10 +152,13 @@ class ActivityDetailView(generics.RetrieveAPIView[Activity]):
         )
 
 
-@extend_schema(
-    operation_id="public_teachers_list",
-    summary="Преподаватели с их кружками",
-    responses=TeacherPublicSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_teachers_list",
+        summary="Преподаватели с их кружками",
+        responses=TeacherPublicSerializer(many=True),
+        tags=["catalog"],
+    )
 )
 class PublicTeacherListView(generics.ListAPIView[TeacherProfile]):
     permission_classes = (AllowAny,)
@@ -175,14 +195,17 @@ class PublicTeacherListView(generics.ListAPIView[TeacherProfile]):
         )
 
 
-@extend_schema(
-    operation_id="public_gallery_list",
-    summary="Опубликованные фото галереи",
-    description=(
-        "Без query-параметров — весь список массивом (обратная совместимость). "
-        "С ?limit=N (опц. &offset=M) — постраничная выдача в конверте "
-        "{count, next, previous, results} для подгрузки по кнопке/скроллу."
-    ),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_gallery_list",
+        summary="Опубликованные фото галереи",
+        description=(
+            "Без query-параметров — весь список массивом (обратная совместимость). "
+            "С ?limit=N (опц. &offset=M) — постраничная выдача в конверте "
+            "{count, next, previous, results} для подгрузки по кнопке/скроллу."
+        ),
+        tags=["catalog"],
+    )
 )
 class PublicGalleryListView(generics.ListAPIView[GalleryImage]):
     permission_classes = (AllowAny,)
@@ -208,10 +231,13 @@ class PublicGalleryListView(generics.ListAPIView[GalleryImage]):
         )
 
 
-@extend_schema(
-    operation_id="public_plans_list",
-    summary="Тарифные планы абонементов",
-    responses=SubscriptionPlanPublicSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_plans_list",
+        summary="Тарифные планы абонементов",
+        responses=SubscriptionPlanPublicSerializer(many=True),
+        tags=["catalog"],
+    )
 )
 class PublicPlanListView(generics.ListAPIView[SubscriptionPlan]):
     permission_classes = (AllowAny,)
@@ -233,10 +259,13 @@ class PublicPlanListView(generics.ListAPIView[SubscriptionPlan]):
         )
 
 
-@extend_schema(
-    operation_id="public_events_list",
-    summary="Афиша: будущие события и прошедшие за 7 дней",
-    responses=EventPublicSerializer(many=True),
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="public_events_list",
+        summary="Афиша: будущие события и прошедшие за 7 дней",
+        responses=EventPublicSerializer(many=True),
+        tags=["catalog"],
+    )
 )
 class PublicEventListView(generics.ListAPIView[Event]):
     permission_classes = (AllowAny,)
@@ -263,3 +292,44 @@ class PublicEventListView(generics.ListAPIView[Event]):
                 request, *args, **kwargs
             ),
         )
+
+
+class ActivityTrialSlotsView(APIView):
+    permission_classes = (AllowAny,)
+    authentication_classes = ()
+
+    @extend_schema(
+        operation_id="public_activity_next_slots",
+        summary="Свободные занятия кружка для пробного на две недели",
+        description=(
+            "Окно — сегодня + 13 дней. Только занятия, которые ещё не начались, "
+            "не отменены и где есть свободное место; переносы уже применены. "
+            "Из элемента берутся schedule_id и date для POST /checkout/trial "
+            "(trial_date = date). Нет свободных занятий — пустой slots. "
+            "Кэш 30 секунд."
+        ),
+        responses=TrialSlotsResponseSerializer,
+        tags=["schedule"],
+    )
+    def get(self, request: Request, pk: int) -> Response:
+        return cached_payload(
+            key=payload_cache_key("activity_next_slots", request),
+            ttl_seconds=CACHE_TTL_TRIAL_SLOTS_SECONDS,
+            produce=lambda: self._produce(pk),
+        )
+
+    def _produce(self, pk: int) -> Response:
+        # Бюджет: 1 запрос на кружок + 2 на каждую из 2–3 недель окна
+        activity = (
+            Activity.objects.filter(pk=pk, is_active=True).only("id", "name").first()
+        )
+        if activity is None:
+            raise NotFound("Кружок не найден.")
+        trial_slots = list_trial_slots(activity.pk, now=timezone.now())
+        payload = {
+            "activity": activity,
+            "date_from": trial_slots.date_from,
+            "date_to": trial_slots.date_to,
+            "slots": trial_slots.slots,
+        }
+        return Response(TrialSlotsResponseSerializer(payload).data)
