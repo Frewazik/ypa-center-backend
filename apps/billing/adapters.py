@@ -9,6 +9,7 @@ import threading
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Literal, Protocol
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -191,7 +192,9 @@ class YookassaHttpGateway:
             "capture": True,
             "confirmation": {
                 "type": "redirect",
-                "return_url": self._settings.return_url,
+                "return_url": _return_url_for(
+                    self._settings.return_url, transaction_id
+                ),
             },
             "description": description,
             "metadata": {"transaction_id": transaction_id},
@@ -335,6 +338,18 @@ def _raise_for_client_error(payment_id: str, response: httpx.Response) -> None:
         raise GatewayContractError(
             f"ЮКасса отвергла запрос: HTTP {response.status_code}."
         )
+
+
+def _return_url_for(base_url: str, transaction_id: str) -> str:
+    # ПОЧЕМУ: страница результата узнаёт, какой заказ опрашивать, только из
+    # адреса возврата. Собираем через urlsplit, а не склейкой «?tx=» — в
+    # настроенном адресе уже могут быть свои параметры и #фрагмент
+    parts = urlsplit(base_url)
+    query = [
+        (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "tx"
+    ]
+    query.append(("tx", transaction_id))
+    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
 def _kopecks_to_value(amount_kopecks: int) -> str:
