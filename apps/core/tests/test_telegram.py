@@ -9,7 +9,11 @@ import pytest
 from pytest_django.fixtures import SettingsWrapper
 
 from apps.core import telegram
-from apps.core.telegram import TelegramDeliveryError, send_manager_message
+from apps.core.telegram import (
+    RETRY_AFTER_CAP_SECONDS,
+    TelegramDeliveryError,
+    send_manager_message,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -85,6 +89,93 @@ class TestSendManagerMessage:
             raise httpx.ConnectError("нет сети")
 
         _route(monkeypatch, broken)
+
+        with pytest.raises(TelegramDeliveryError):
+            await send_manager_message("Привет", context="test")
+
+    @pytest.mark.parametrize("code", [400, 401, 403, 404])
+    async def test_permanent_error_logged_not_retried(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        code: int,
+    ) -> None:
+        # ПОЧЕМУ: неверный токен/чат или бот удалён из чата повтором не лечатся —
+        # исключение отправило бы задачу в 5 бессмысленных ретраев
+        _route(
+            monkeypatch,
+            lambda r: httpx.Response(
+                code, json={"ok": False, "error_code": code, "description": "Forbidden"}
+            ),
+        )
+
+        with caplog.at_level(logging.ERROR, logger="apps.core.telegram"):
+            await send_manager_message("Привет", context="form=feedback id=1")
+
+        assert f"отклонил запрос {code} «Forbidden»" in caplog.text
+
+
+@pytest.mark.usefixtures("configured")
+class TestFloodLimit:
+    @pytest.mark.parametrize(
+        ("flood_reply", "expected_pause"),
+        [
+            # Так отвечает Telegram: пауза в теле ответа
+            (
+                httpx.Response(
+                    429, json={"ok": False, "parameters": {"retry_after": 7}}
+                ),
+                7.0,
+            ),
+            # Запасной вариант — заголовок
+            (httpx.Response(429, headers={"Retry-After": "3"}), 3.0),
+            # Мусор в заголовке не роняет задачу
+            (
+                httpx.Response(
+                    429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+                ),
+                1.0,
+            ),
+            (httpx.Response(429), 1.0),
+            # Долгое ожидание держало бы слот воркера — дальше решает ретрай брокера
+            (
+                httpx.Response(429, json={"parameters": {"retry_after": 600}}),
+                RETRY_AFTER_CAP_SECONDS,
+            ),
+        ],
+    )
+    async def test_waits_as_telegram_asks_then_resends(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        flood_reply: httpx.Response,
+        expected_pause: float,
+    ) -> None:
+        replies = iter([flood_reply, httpx.Response(200, json={"ok": True})])
+        seen = _route(monkeypatch, lambda r: next(replies))
+        waited: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            waited.append(seconds)
+
+        monkeypatch.setattr(telegram.asyncio, "sleep", fake_sleep)
+
+        await send_manager_message("Привет", context="test")
+
+        assert waited == [expected_pause]
+        assert len(seen) == 2
+
+    async def test_second_flood_reply_goes_to_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _route(
+            monkeypatch,
+            lambda r: httpx.Response(429, json={"parameters": {"retry_after": 1}}),
+        )
+
+        async def fake_sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(telegram.asyncio, "sleep", fake_sleep)
 
         with pytest.raises(TelegramDeliveryError):
             await send_manager_message("Привет", context="test")

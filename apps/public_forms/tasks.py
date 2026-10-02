@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Literal
+from typing import Final, Literal
+
+from django.conf import settings
+from django.urls import reverse
 
 from apps.core.telegram import send_manager_message
 from apps.public_forms.models import CallbackRequest, FeedbackRequest
@@ -11,37 +14,36 @@ logger = logging.getLogger(__name__)
 
 FormType = Literal["callback", "feedback"]
 
+_FORM_MODELS: Final[dict[FormType, type[CallbackRequest] | type[FeedbackRequest]]] = {
+    "callback": CallbackRequest,
+    "feedback": FeedbackRequest,
+}
+_FORM_TITLES: Final[dict[FormType, str]] = {
+    "callback": "Новая заявка на обратный звонок",
+    "feedback": "Новое обращение с сайта",
+}
+_ADMIN_CHANGE_VIEWS: Final[dict[FormType, str]] = {
+    "callback": "admin:public_forms_callbackrequest_change",
+    "feedback": "admin:public_forms_feedbackrequest_change",
+}
 
-async def _deliver(text: str, form_type: FormType, request_id: int) -> None:
-    await send_manager_message(text, context=f"form={form_type} id={request_id}")
+
+def build_notification_text(request_id: int, form_type: FormType) -> str:
+    # ПОЧЕМУ: в Telegram только номер и ссылка, без имени, телефона и текста.
+    # Серверы Telegram за рубежом — персональные данные клиента туда
+    # не уходят (152-ФЗ, ст. 12), а заявку целиком менеджер открывает
+    # в админке. Короткий текст заодно всегда влезает в лимит Telegram
+    path = reverse(_ADMIN_CHANGE_VIEWS[form_type], args=[request_id])
+    link = f"{settings.ADMIN_BASE_URL.rstrip('/')}{path}"
+    return f"{_FORM_TITLES[form_type]} #{request_id}\n{link}"
 
 
 @broker.task(retry_on_error=True)
 async def notify_managers_task(request_id: int, form_type: FormType) -> None:
-    if form_type == "callback":
-        try:
-            callback = await CallbackRequest.objects.aget(pk=request_id)
-        except CallbackRequest.DoesNotExist:
-            logger.error("CallbackRequest id=%s не найдена", request_id)
-            return
-        text = (
-            f"Заявка на обратный звонок #{callback.pk}\n"
-            f"Имя: {callback.name}\n"
-            f"Телефон: {callback.phone}\n"
-            f"Удобное время: {callback.get_preferred_time_window_display()}"
-        )
-        await _deliver(text, "callback", callback.pk)
+    if not await _FORM_MODELS[form_type].objects.filter(pk=request_id).aexists():
+        logger.error("Заявка не найдена (form=%s id=%s)", form_type, request_id)
         return
-
-    try:
-        feedback = await FeedbackRequest.objects.aget(pk=request_id)
-    except FeedbackRequest.DoesNotExist:
-        logger.error("FeedbackRequest id=%s не найдено", request_id)
-        return
-    text = (
-        f"Обращение с сайта #{feedback.pk}\n"
-        f"Имя: {feedback.name or '—'}\n"
-        f"Email: {feedback.email}\n"
-        f"Сообщение: {feedback.message}"
+    await send_manager_message(
+        build_notification_text(request_id, form_type),
+        context=f"form={form_type} id={request_id}",
     )
-    await _deliver(text, "feedback", feedback.pk)

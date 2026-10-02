@@ -42,6 +42,11 @@ class CallbackRequestCreateSerializer(serializers.ModelSerializer[CallbackReques
         return require_true(value)
 
 
+# ПОЧЕМУ: у TextField в модели нет предела — без него бот кладёт в базу
+# и в админку мегабайтные простыни. Живому вопросу 2000 символов хватает
+FEEDBACK_MESSAGE_MAX_LENGTH = 2000
+
+
 class FeedbackRequestCreateSerializer(serializers.ModelSerializer[FeedbackRequest]):
     website_url = _honeypot_field()
     captcha_token = _captcha_field()
@@ -57,6 +62,7 @@ class FeedbackRequestCreateSerializer(serializers.ModelSerializer[FeedbackReques
             "website_url",
             "captcha_token",
         )
+        extra_kwargs = {"message": {"max_length": FEEDBACK_MESSAGE_MAX_LENGTH}}
 
     def validate_pd_consent(self, value: bool) -> bool:
         return require_true(value)
