@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Literal
 
+from django.core.cache import cache
 from django.db import IntegrityError
 from django.db import transaction as db_transaction
 from django.db.models import Count, Q
@@ -1499,6 +1500,219 @@ def _add_to_journal(lesson_dates: dict[int, date]) -> None:
         ],
         ignore_conflicts=True,
     )
+
+
+class CheckoutTransactionNotFoundError(BillingError):
+    # ПОЧЕМУ одна ошибка на «нет» и «чужая»: чужое неотличимо от несуществующего,
+    # иначе перебором id можно узнать, что транзакция есть
+    def __init__(self, transaction_id: uuid.UUID) -> None:
+        super().__init__(f"Транзакция {transaction_id} не найдена.")
+        self.transaction_id = transaction_id
+
+
+CheckoutOutcomeStatus = Literal["PENDING", "SUCCEEDED", "CANCELED", "REFUND"]
+CheckoutOrderType = Literal["SUBSCRIPTION", "TRIAL"]
+RefundReason = Literal[
+    "SEATS_TAKEN",
+    "GROUP_CLOSED",
+    "PAID_AFTER_EXPIRY",
+    "AMOUNT_MISMATCH",
+    "NOT_FULFILLED",
+]
+
+# ПОЧЕМУ: внутренние причины (metadata) сводятся к короткому набору для фронта —
+# новая внутренняя причина не ломает экран, а падает в NOT_FULFILLED
+_REFUND_REASONS: dict[str, RefundReason] = {
+    "SEATS_TAKEN_AFTER_PAYMENT": "SEATS_TAKEN",
+    # ПОЧЕМУ не SEATS_TAKEN: бронь снимает только чистка протухших (>15 мин)
+    # на чужом чекауте — родитель заплатил поздно, а места могут быть свободны
+    "HOLD_LOST": "PAID_AFTER_EXPIRY",
+    "SLOT_REMOVED": "GROUP_CLOSED",
+    "PAYMENT_SUCCEEDED_AFTER_EXPIRY": "PAID_AFTER_EXPIRY",
+    "AMOUNT_MISMATCH": "AMOUNT_MISMATCH",
+}
+
+# ПОЧЕМУ: страница результата опрашивает статус раз в пару секунд. Если вебхук
+# опоздал (локально не доходит вовсе), просим воркер спросить ЮКассу сами —
+# но не сразу (вебхук обычно успевает за секунды) и не чаще интервала, иначе
+# опрос превратится в шквал запросов к ЮКассе. Отсчёт — от первого опроса,
+# а не от created_at: к возврату со страницы оплаты заказу уже минуты
+_PAYMENT_RECHECK_GRACE = timedelta(seconds=10)
+_PAYMENT_RECHECK_INTERVAL = timedelta(seconds=15)
+
+
+@dataclass(frozen=True)
+class CheckoutOrderSlot:
+    schedule_id: int
+    activity_name: str
+    group_name: str
+    day_of_week: int
+    start_time: time
+    end_time: time
+
+
+@dataclass(frozen=True)
+class CheckoutOrder:
+    title: str
+    student_name: str
+    trial_date: date | None
+    slots: list[CheckoutOrderSlot]
+
+
+@dataclass(frozen=True)
+class CheckoutOutcome:
+    id: uuid.UUID
+    type: CheckoutOrderType
+    status: CheckoutOutcomeStatus
+    reason: RefundReason | None
+    amount: int
+    created_at: datetime
+    expires_at: datetime
+    order: CheckoutOrder
+
+
+def get_checkout_outcome(
+    transaction_id: uuid.UUID, parent_id: int, *, now: datetime | None = None
+) -> CheckoutOutcome:
+    """Итог оплаты глазами родителя — для страницы «результат оплаты».
+
+    Отдаёт исход, а не сырой статус строки: оплаченное пробное, на которое
+    не хватило места, в БД SUCCEEDED, а для родителя это возврат.
+    """
+    tx = (
+        Transaction.objects.select_related(
+            "subscription__plan",
+            "enrollment__student",
+            "enrollment__schedule__activity",
+        )
+        .filter(pk=transaction_id, parent_id=parent_id)
+        .first()
+    )
+    if tx is None:
+        raise CheckoutTransactionNotFoundError(transaction_id)
+
+    outcome = _parent_outcome(tx)
+    if outcome == "PENDING":
+        _request_payment_recheck(tx, now if now is not None else timezone.now())
+    return CheckoutOutcome(
+        id=tx.pk,
+        type="TRIAL" if tx.enrollment_id is not None else "SUBSCRIPTION",
+        status=outcome,
+        reason=_refund_reason(tx) if outcome == "REFUND" else None,
+        # ПОЧЕМУ: сколько реально прошло через карту — оно же вернётся при
+        # возврате; до оплаты — сколько предстоит заплатить
+        amount=tx.received_amount if tx.received_amount is not None else tx.amount,
+        created_at=tx.created_at,
+        expires_at=tx.created_at + _PENDING_TRANSACTION_TTL,
+        order=_checkout_order(tx),
+    )
+
+
+def _parent_outcome(tx: Transaction) -> CheckoutOutcomeStatus:
+    # !!!: возврат проверяется первым и не по одному флагу. requires_compensation
+    # значит «возврат ещё надо отправить» и сбрасывается при отправке
+    # (issue_pending_refunds) — дальше о возврате говорит refund_status.
+    # FAILED — деньги пришли, заказ не исполнен: это всегда возврат
+    if (
+        tx.requires_compensation
+        or tx.refund_status is not None
+        or tx.status == TransactionStatus.FAILED
+    ):
+        return "REFUND"
+    if tx.status == TransactionStatus.PENDING:
+        return "PENDING"
+    if tx.status == TransactionStatus.SUCCEEDED:
+        return "SUCCEEDED"
+    return "CANCELED"
+
+
+def _refund_reason(tx: Transaction) -> RefundReason:
+    # ПОЧЕМУ failure_reason первым: у несовпадения суммы ключа reason нет
+    code = tx.metadata.get("failure_reason") or tx.metadata.get("reason")
+    return _REFUND_REASONS.get(str(code), "NOT_FULFILLED")
+
+
+def _checkout_order(tx: Transaction) -> CheckoutOrder:
+    if tx.enrollment is not None:
+        trial = tx.enrollment
+        return CheckoutOrder(
+            title="Пробное занятие",
+            student_name=trial.student.full_name,
+            trial_date=trial.trial_date,
+            slots=[_order_slot(trial)],
+        )
+    subscription = tx.subscription
+    if subscription is None:
+        return CheckoutOrder(title="", student_name="", trial_date=None, slots=[])
+    # ПОЧЕМУ все записи абонемента, а не только живые: после возврата они
+    # CANCELED, но родителю всё равно надо видеть, за что он платил
+    enrollments = list(
+        Enrollment.objects.filter(subscription_id=subscription.pk)
+        .select_related("student", "schedule__activity")
+        .order_by("schedule__day_of_week", "schedule__start_time", "pk")
+    )
+    return CheckoutOrder(
+        title=f"Абонемент «{subscription.plan.name}»",
+        student_name=enrollments[0].student.full_name if enrollments else "",
+        trial_date=None,
+        slots=[_order_slot(enrollment) for enrollment in enrollments],
+    )
+
+
+def _order_slot(enrollment: Enrollment) -> CheckoutOrderSlot:
+    schedule = enrollment.schedule
+    return CheckoutOrderSlot(
+        schedule_id=schedule.pk,
+        activity_name=schedule.activity.name,
+        group_name=schedule.group_name,
+        day_of_week=schedule.day_of_week,
+        start_time=schedule.start_time,
+        end_time=schedule.end_time,
+    )
+
+
+def _request_payment_recheck(tx: Transaction, moment: datetime) -> None:
+    # !!!: здесь только постановка задачи — никакого похода в ЮКассу внутри
+    # HTTP-запроса. Задача та же, что у вебхука (verify_and_process_payment),
+    # а её путь идемпотентен: строка под select_for_update, работа только из
+    # PENDING. Повтор стоит одного GET к ЮКассе, деньги и места не трогает
+    if tx.external_id is None:
+        return  # платёж у провайдера не заведён — спрашивать нечего
+    payment_id = tx.external_id
+    now_ts = moment.timestamp()
+    try:
+        first_seen = cache.get_or_set(
+            f"billing:payment-recheck:seen:{tx.pk}",
+            now_ts,
+            timeout=int(_RECONCILE_GIVE_UP_AFTER.total_seconds()),
+        )
+        if not isinstance(first_seen, float):
+            first_seen = now_ts
+        if now_ts - first_seen < _PAYMENT_RECHECK_GRACE.total_seconds():
+            return
+        # ПОЧЕМУ add: атомарный SET NX в Redis — из параллельных опросов
+        # задачу ставит ровно один, остальные до конца интервала молчат
+        if not cache.add(
+            f"billing:payment-recheck:lock:{tx.pk}",
+            1,
+            timeout=int(_PAYMENT_RECHECK_INTERVAL.total_seconds()),
+        ):
+            return
+    except Exception:
+        # ПОЧЕМУ: без кэша не можем ограничить частоту — лучше не проверить,
+        # чем завалить ЮКассу; статус родителю всё равно отдаём
+        logger.warning(
+            "Досрочная сверка %s: кэш недоступен, пропускаем.", tx.pk, exc_info=True
+        )
+        return
+    db_transaction.on_commit(lambda: _enqueue_payment_verification(payment_id))
+
+
+def _enqueue_payment_verification(payment_id: str) -> None:
+    # ПОЧЕМУ: локальный импорт — tasks импортирует services на уровне модуля
+    from apps.billing import tasks
+
+    kiq_safely(tasks.verify_and_process_payment, payment_id)
 
 
 def sweep_stale_pending_transactions(

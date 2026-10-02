@@ -40,6 +40,56 @@ class CheckoutResponseSerializer(serializers.Serializer):
     expires_at = serializers.DateTimeField(allow_null=True)
 
 
+_TIME_FORMAT = "%H:%M"
+
+
+class CheckoutOrderSlotSerializer(serializers.Serializer):
+    schedule_id = serializers.IntegerField()
+    activity_name = serializers.CharField()
+    group_name = serializers.CharField(allow_blank=True)
+    day_of_week = serializers.IntegerField(help_text="0 — понедельник, 6 — воскресенье")
+    start_time = serializers.TimeField(format=_TIME_FORMAT)
+    end_time = serializers.TimeField(format=_TIME_FORMAT)
+
+
+class CheckoutOrderSerializer(serializers.Serializer):
+    title = serializers.CharField()
+    student_name = serializers.CharField(allow_blank=True)
+    trial_date = serializers.DateField(allow_null=True)
+    slots = CheckoutOrderSlotSerializer(many=True)
+
+
+class CheckoutTransactionSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    type = serializers.ChoiceField(choices=("SUBSCRIPTION", "TRIAL"))
+    # ПОЧЕМУ: исход для родителя, а не статус строки в БД — оплаченное пробное
+    # без места в БД SUCCEEDED, а для родителя это возврат
+    status = serializers.ChoiceField(
+        choices=("PENDING", "SUCCEEDED", "CANCELED", "REFUND")
+    )
+    # ПОЧЕМУ: заполнен только у REFUND. У CANCELED null — причину отказа
+    # банка адаптер ЮКассы пока не разбирает
+    reason = serializers.ChoiceField(
+        choices=(
+            "SEATS_TAKEN",
+            "GROUP_CLOSED",
+            "PAID_AFTER_EXPIRY",
+            "AMOUNT_MISMATCH",
+            "NOT_FULFILLED",
+        ),
+        allow_null=True,
+    )
+    amount = serializers.IntegerField(
+        help_text="Копейки: сколько прошло через карту (оно же вернётся), "
+        "до оплаты — сколько предстоит заплатить"
+    )
+    created_at = serializers.DateTimeField()
+    expires_at = serializers.DateTimeField(
+        help_text="До какого момента ждём оплату; осмысленно только для PENDING"
+    )
+    order = CheckoutOrderSerializer()
+
+
 class _YookassaPaymentObjectSerializer(serializers.Serializer):
     id = serializers.RegexField(regex=r"^[A-Za-z0-9\-]{1,64}$")
 
