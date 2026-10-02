@@ -16,7 +16,7 @@
 ## Статус реализации
 
 Ядро реализовано по этому контракту: OTP-вход, чекаут абонемента и пробного
-с Idempotency-Key, вебхук ЮКассы, публичная витрина, ЛК, RFC 9457.
+с `X-Idempotency-Key`, вебхук ЮКассы, публичная витрина, ЛК, RFC 9457.
 Два осознанных отклонения:
 
 - **Пробные занятия** (`POST /checkout/trial`) — реализованы. Запись — это
@@ -69,14 +69,21 @@ curl-ом и читать логи. Группировка по аудитори
 | Заголовок (запрос)         | Назначение |
 | -------------------------- | ---------- |
 | `Authorization: Bearer …` *(или cookie, см. 1.4)* | Сессия родителя/преподавателя |
-| `Idempotency-Key: <uuid4>` | Обязателен для `POST` checkout и отметок посещаемости (Шаг 2) |
+| `X-Idempotency-Key: <uuid4>` | Обязателен для `POST /checkout/subscription` и `/checkout/trial` (Шаг 2.1) |
 | `Content-Type: application/json` | Везде, кроме загрузки файлов |
 
 | Заголовок (ответ)          | Назначение |
 | -------------------------- | ---------- |
 | `Content-Type: application/problem+json` | Только для ошибок (RFC 9457) |
-| `Retry-After: <сек>`       | На `429` и на cooldown OTP |
+| `Retry-After: <сек>`       | На `429`, cooldown OTP, `409 PAYMENT_IN_PROGRESS` и `503 PAYMENT_GATEWAY_UNAVAILABLE` |
+| `X-Request-ID`             | На каждом ответе; его же пишем в `request_id` ошибки — для разбора с бэкендом |
 | `X-RateLimit-Remaining`    | Сколько запросов осталось в окне |
+
+**CORS.** Браузер пускает с фронта только origin из `CORS_ALLOWED_ORIGINS` (env).
+Сверх стандартного набора `django-cors-headers` разрешён заголовок запроса
+`X-Idempotency-Key` — без него браузер режет preflight чекаута. Заголовки ответа
+`Retry-After` и `X-Request-ID` открыты для JS через `Access-Control-Expose-Headers`
+(остальные нестандартные браузер от JS прячет).
 
 ### 0.3. Единый формат ошибок (RFC 9457) — на всю систему
 
@@ -801,6 +808,69 @@ POST /api/v1/checkout/event          (анонимно, «быстрая кас�
   (4) сохраняет `external_payment_id`, переводит `draft → pending`, отдаёт `confirmation_url`.
 - **Вебхуки** — см. Шаг 2.2 (отдельный раздел: replay, race conditions, валидация подлинности).
 
+#### После оплаты: страница «результат оплаты»
+
+ЮКасса возвращает родителя на `YOOKASSA_RETURN_URL` с id нашей транзакции:
+`/checkout/result?tx=<transaction_id>` (параметр дописывается к настроенному адресу,
+его собственные параметры сохраняются). Страница опрашивает статус:
+
+```
+GET /api/v1/checkout/transactions/{id}     (auth + анкета, как чекаут)
+```
+
+Чужая, несуществующая или битая `{id}` → `404` (чужое неотличимо от несуществующего).
+Ответ — **исход для родителя**, а не сырой статус строки в БД:
+
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-1234-56789abcdef0",
+  "type": "SUBSCRIPTION",
+  "status": "REFUND",
+  "reason": "SEATS_TAKEN",
+  "amount": 700000,
+  "created_at": "2026-09-30T18:40:00+07:00",
+  "expires_at": "2026-09-30T18:55:00+07:00",
+  "order": {
+    "title": "Абонемент «8 занятий»",
+    "student_name": "Маша Иванова",
+    "trial_date": null,
+    "slots": [
+      {"schedule_id": 106, "activity_name": "Шахматы", "group_name": "Младшая",
+       "day_of_week": 0, "start_time": "16:00", "end_time": "17:00"}
+    ]
+  }
+}
+```
+
+| `status` | Для родителя | Когда (по строке `transaction`) |
+| -------- | ------------ | ------------------------------- |
+| `PENDING` | ждём банк | `status = PENDING` и возврата нет |
+| `SUCCEEDED` | оплачено и оформлено | `status = SUCCEEDED` и возврата нет |
+| `CANCELED` | не оплачено | `status = CANCELED` и возврата нет: не оплатили за 15 минут, шлюз не создал платёж, банк/ЮКасса отменили |
+| `REFUND` | оплачено, но не оформлено — деньги вернутся | `requires_compensation` **или** заполнен `refund_status` **или** `status = FAILED`. Проверяется первым: в БД такая строка бывает и `SUCCEEDED` (место ушло после оплаты), и `CANCELED` (оплатили после снятия заказа по TTL) |
+
+- `reason` — только у `REFUND`: `SEATS_TAKEN` (место заняли, пока платили),
+  `GROUP_CLOSED` (группу убрали из расписания), `PAID_AFTER_EXPIRY` (оплата пришла
+  после истечения брони или снятия заказа), `AMOUNT_MISMATCH` (пришла не та сумма),
+  `NOT_FULFILLED` (прочие сбои оформления; сюда же любая будущая причина). У остальных —
+  `null`: причину отказа банка адаптер ЮКассы пока не разбирает.
+- `amount` — копейки, сколько прошло через карту (оно же вернётся при возврате); до
+  оплаты — сколько предстоит заплатить. Часть, оплаченная с депозита, сюда не входит
+  и при срыве заказа возвращается на депозит.
+- `expires_at` = `created_at` + 15 минут — до какого момента держим место за
+  неоплаченным заказом. Это наш TTL, не ЮКассы.
+- `order` — что покупали: для пробного `title = "Пробное занятие"`, `trial_date` и один
+  слот; `day_of_week` — 0 = понедельник.
+- Ответ `CANCELED` не всегда окончательный: если банк подтвердил оплату уже после
+  снятия заказа, позже транзакция станет `REFUND`.
+
+**Досрочная сверка.** Если строка `PENDING`, платёж заведён в ЮКассе и с первого
+опроса прошло 10 секунд, ручка ставит в очередь ту же задачу, что вебхук
+(`verify_and_process_payment`), — не чаще раза в 15 секунд на транзакцию (ключ в
+Redis). В самом запросе к ЮКассе не ходим. Нужна, когда вебхук опоздал или не доходит
+(локальная машина). Повтор безопасен: путь вебхука работает со строкой только из
+`PENDING` под `SELECT … FOR UPDATE`.
+
 ---
 
 ### Сценарий 5 — Журнал посещаемости и списание фишек
@@ -832,7 +902,7 @@ PATCH /api/v1/staff/attendance/{enrollment_id}
 
 ```
 PATCH /api/v1/staff/attendance/88
-Idempotency-Key: 7c9e...        ← обязателен
+X-Idempotency-Key: 7c9e...      ← обязателен
 { "status": "PRESENT", "date": "2026-06-15" }
 ```
 
@@ -849,7 +919,7 @@ Idempotency-Key: 7c9e...        ← обязателен
 - **`PRESENT` → списание, `ABSENT/NONE` → возврат** выполняются в одной БД-транзакции
   вместе с записью `attendance`; `CHECK(remaining >= 0)` — последний рубеж.
 - **Идемпотентность двух уровней**: (1) натуральный ключ `UNIQUE(student, slot, date)`
-  не даёт второй фишке списаться при дубль-отметке; (2) `Idempotency-Key` гасит
+  не даёт второй фишке списаться при дубль-отметке; (2) `X-Idempotency-Key` гасит
   сетевой ретрай того же `PATCH` (Шаг 2.1). При конкурентных запросах второй ждёт на
   `FOR UPDATE` и видит уже актуальный баланс.
 - `409 SUBSCRIPTION_EXPIRED` — если на момент отметки абонемент просрочен.
@@ -858,11 +928,12 @@ Idempotency-Key: 7c9e...        ← обязателен
 
 ## Шаг 2. Безопасность, идемпотентность, вебхуки
 
-### 2.1. Idempotency-Key (checkout + отметки)
+### 2.1. X-Idempotency-Key (checkout)
 
-Опираемся на IETF draft `Idempotency-Key` и паттерн Stripe.
+Опираемся на IETF draft `Idempotency-Key` и паттерн Stripe. Заголовок у нас
+называется **`X-Idempotency-Key`** (имя из драфта не используем).
 
-**Контракт:** клиент шлёт `Idempotency-Key: <uuid4>` на чувствительный `POST/PATCH`.
+**Контракт:** клиент шлёт `X-Idempotency-Key: <uuid4>` на чувствительный `POST/PATCH`.
 Логика бэкенда:
 
 1. Завести таблицу `idempotency_record(key PK, request_fingerprint, response_status,
@@ -1038,7 +1109,7 @@ POST /api/v1/webhooks/yookassa
 
 ## Сводная карта эндпоинтов
 
-| Метод | URI | Auth | Idempotency-Key |
+| Метод | URI | Auth | X-Idempotency-Key |
 | ----- | --- | ---- | --------------- |
 | POST  | `/api/v1/auth/otp/request` | — | — |
 | POST  | `/api/v1/auth/otp/verify` | — | — |
@@ -1058,9 +1129,10 @@ POST /api/v1/webhooks/yookassa
 | GET   | `/api/v1/me/deposit/entries/` | да + анкета | — |
 | POST  | `/api/v1/checkout/subscription` | да + анкета | да |
 | POST  | `/api/v1/checkout/trial` | да + анкета | да |
+| GET   | `/api/v1/checkout/transactions/{id}` | да + анкета | — |
 | POST  | `/api/v1/checkout/event` | — | да |
 | GET   | `/api/v1/staff/journal` | да (staff) | — |
-| PATCH | `/api/v1/staff/attendance/{id}` | да (staff) | да |
+| PATCH | `/api/v1/staff/attendance/{id}` (не реализована — журнал в админке) | да (staff) | — |
 | POST  | `/api/v1/webhooks/yookassa` | IP-allowlist | по `external_payment_id` |
 
 ---
