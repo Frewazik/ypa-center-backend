@@ -9,9 +9,15 @@ from __future__ import annotations
 import datetime
 from typing import Final
 
+from django.utils import timezone
+
 from apps.billing.ports import SlotTrialInfo, UnknownSlotError
 from apps.schedule.models import MaskType, Schedule, ScheduleMask
-from apps.schedule.services import normalize_week_start
+from apps.schedule.services import (
+    _effective_session,
+    is_lesson_bookable,
+    normalize_week_start,
+)
 
 # ПОЧЕМУ: год сплошных отмен в реальности означает мёртвую группу;
 # ограничение защищает от бесконечного сканирования при битых данных
@@ -47,19 +53,17 @@ class DjangoSchedulePort:
         return SlotTrialInfo(activity_id=activity_id, price_kopecks=price)
 
     def get_next_lesson_date(
-        self, slot_id: int, on_or_after: datetime.date
+        self, slot_id: int, after: datetime.datetime
     ) -> datetime.date:
-        schedule = (
-            Schedule.objects.filter(
-                pk=slot_id, is_active=True, activity__is_active=True
-            )
-            .only("id", "day_of_week")
-            .first()
-        )
+        schedule = Schedule.objects.filter(
+            pk=slot_id, is_active=True, activity__is_active=True
+        ).first()
         if schedule is None:
             raise UnknownSlotError(slot_id)
 
-        first_week = normalize_week_start(on_or_after)
+        # ПОЧЕМУ localdate: `after` приходит в UTC, а неделя и время групп —
+        # местные; .date() от UTC-момента до 07:00 дал бы вчерашний день
+        first_week = normalize_week_start(timezone.localdate(after))
         horizon_end = first_week + datetime.timedelta(weeks=_LOOKAHEAD_WEEKS)
         # Все маски горизонта одним запросом; ключ target_date уникален
         # в пределах группы по констрейнту uniq_mask_per_schedule_per_date
@@ -76,20 +80,15 @@ class DjangoSchedulePort:
             original = week_start + datetime.timedelta(days=schedule.day_of_week)
             mask = masks.get(original)
             if mask is None:
-                if original >= on_or_after:
-                    return original
+                lesson_date, start_time = original, schedule.start_time
+            elif mask.type == MaskType.CANCELLATION:
                 continue
-            if mask.type == MaskType.CANCELLATION:
-                continue
-            # ПОЧЕМУ: перенос приземляется внутри той же недели — та же
-            # семантика, что в schedule.services._effective_session
-            landing_day = (
-                mask.new_day_of_week
-                if mask.new_day_of_week is not None
-                else schedule.day_of_week
-            )
-            landing = week_start + datetime.timedelta(days=landing_day)
-            if landing >= on_or_after:
-                return landing
+            else:
+                # ПОЧЕМУ: перенос двигает и день, и время — граница записи
+                # считается от фактического начала, как в сетке next-slots
+                session = _effective_session(schedule, mask)
+                lesson_date, start_time = session.date, session.start_time
+            if is_lesson_bookable(lesson_date, start_time, now=after):
+                return lesson_date
 
         raise UnknownSlotError(slot_id)
