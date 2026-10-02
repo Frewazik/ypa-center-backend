@@ -309,6 +309,7 @@ class ActivityTrialSlotsView(APIView):
             "Кэш 30 секунд."
         ),
         responses=TrialSlotsResponseSerializer,
+        tags=["schedule"],
     )
     def get(self, request: Request, pk: int) -> Response:
         return cached_payload(
