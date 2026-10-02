@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 from typing import Literal
 
+from corsheaders.defaults import default_headers
 import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
 from pydantic import Field
@@ -394,6 +395,12 @@ STATIC_URL = "/static/"
 
 CORS_ALLOWED_ORIGINS = _env.CORS_ALLOWED_ORIGINS
 CORS_ALLOW_CREDENTIALS = True
+# ПОЧЕМУ: заголовок чекаута не входит в стандартный набор django-cors-headers —
+# без него браузер режет preflight и POST /checkout/* до бэкенда не доходит
+CORS_ALLOW_HEADERS = (*default_headers, "x-idempotency-key")
+# ПОЧЕМУ: браузер прячет от JS всё, кроме простых заголовков ответа. Retry-After
+# нужен фронту на 409 PAYMENT_IN_PROGRESS и 503, X-Request-ID — для разбора ошибок
+CORS_EXPOSE_HEADERS = ["Retry-After", "X-Request-ID"]
 
 LANGUAGE_CODE = "ru-ru"
 TIME_ZONE = "Asia/Novosibirsk"

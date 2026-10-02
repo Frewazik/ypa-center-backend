@@ -137,5 +137,5 @@ class TestCheckoutEndToEnd:
         assert body["amount"] == {"value": "7000.00", "currency": "RUB"}
         assert body["confirmation"] == {
             "type": "redirect",
-            "return_url": "https://ulitsa-radosti.ru/checkout/result",
+            "return_url": f"https://ulitsa-radosti.ru/checkout/result?tx={tx.pk}",
         }

@@ -23,7 +23,12 @@ from apps.billing.adapters import (
 )
 from apps.billing.models import Subscription, SubscriptionStatus, Transaction
 from apps.billing.services import sweep_stale_pending_transactions
-from apps.billing.tests.test_billing import FakeSchedulePort, _make_pending_payment
+from apps.billing.tests.test_billing import (
+    FakeSchedulePort,
+    _checkout,
+    _make_pending_payment,
+)
+from apps.billing.tests.test_trials import _trial_checkout
 
 _SETTINGS = YookassaSettings(shop_id="test-shop", secret_key="test-secret")
 _PAYMENT_ID = "2e8f3c1a-000f-5000-9000-1db2a1a1e0c1"
@@ -180,3 +185,56 @@ class TestSweeperReconciliationOverHttp:
             Subscription.objects.get(pk=tx.subscription_id).status
             == SubscriptionStatus.ACTIVE
         )
+
+
+def _capture_created_payment(sent: list[dict[str, object]]) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        sent.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": _PAYMENT_ID,
+                "status": "pending",
+                "confirmation": {"confirmation_url": "https://yoomoney.ru/pay"},
+            },
+        )
+
+    return handler
+
+
+@pytest.mark.django_db
+class TestReturnUrlCarriesTransaction:
+    # ПОЧЕМУ: страница «результат оплаты» узнаёт заказ только из адреса возврата
+
+    def test_subscription_checkout_sends_tx_in_return_url(self) -> None:
+        sent: list[dict[str, object]] = []
+
+        result = _checkout(
+            [101],
+            gateway=_gateway(_capture_created_payment(sent)),  # type: ignore[arg-type]
+        )
+
+        assert sent[0]["confirmation"] == {
+            "type": "redirect",
+            "return_url": f"{_SETTINGS.return_url}?tx={result.transaction_id}",
+        }
+
+    def test_trial_checkout_sends_tx_in_return_url(self) -> None:
+        sent: list[dict[str, object]] = []
+
+        result, _, _ = _trial_checkout(
+            101,
+            gateway=_gateway(_capture_created_payment(sent)),  # type: ignore[arg-type]
+        )
+
+        confirmation = sent[0]["confirmation"]
+        assert isinstance(confirmation, dict)
+        assert confirmation["return_url"].endswith(f"?tx={result.transaction_id}")
+
+    def test_existing_query_and_fragment_survive(self) -> None:
+        url = adapters._return_url_for(
+            "https://site.ru/checkout/result?utm=ya&tx=old#top", "abc"
+        )
+
+        assert url == "https://site.ru/checkout/result?utm=ya&tx=abc#top"

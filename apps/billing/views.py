@@ -27,11 +27,13 @@ from apps.billing.ports import resolve_schedule_port
 from apps.billing.serializers import (
     CheckoutResponseSerializer,
     CheckoutSubscriptionSerializer,
+    CheckoutTransactionSerializer,
     CheckoutTrialSerializer,
     YookassaWebhookSerializer,
 )
 from apps.billing.services import (
     CheckoutResult,
+    CheckoutTransactionNotFoundError,
     DuplicateEnrollmentError,
     IdempotencyKeyReusedError,
     NoAvailableSeatsError,
@@ -45,6 +47,7 @@ from apps.billing.services import (
     TrialLimitExceededError,
     create_payment,
     create_trial_payment,
+    get_checkout_outcome,
 )
 from apps.billing.tasks import verify_and_process_payment
 from apps.users.models import Parent
@@ -272,6 +275,32 @@ class CheckoutTrialView(_CheckoutView):
             return self._gateway_unavailable_response(request)
 
         return self._checkout_response(result)
+
+
+class CheckoutTransactionView(_CheckoutView):
+    @extend_schema(
+        responses={status.HTTP_200_OK: CheckoutTransactionSerializer},
+        description="Итог оплаты для страницы «результат оплаты» (id приходит "
+        "в return_url как ?tx=). Фронт опрашивает, пока status = PENDING. "
+        "Чужая или несуществующая транзакция — 404.",
+        parameters=[
+            OpenApiParameter(
+                name="transaction_id",
+                location=OpenApiParameter.PATH,
+                type=OpenApiTypes.UUID,
+            )
+        ],
+        tags=["checkout"],
+    )
+    def get(self, request: Request, transaction_id: str) -> Response:
+        # ПОЧЕМУ str в URL и разбор здесь: битый id отвечает тем же 404
+        # в формате RFC 9457, что и чужой, а не HTML-страницей Django
+        try:
+            tx_id = uuid.UUID(transaction_id)
+            outcome = get_checkout_outcome(tx_id, self._resolve_parent_id(request))
+        except (ValueError, CheckoutTransactionNotFoundError) as exc:
+            raise NotFound(detail="Транзакция не найдена.") from exc
+        return Response(CheckoutTransactionSerializer(outcome).data)
 
 
 class YookassaWebhookView(APIView):

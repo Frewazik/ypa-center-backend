@@ -4,6 +4,7 @@ from django.urls import path
 
 from apps.billing.views import (
     CheckoutSubscriptionView,
+    CheckoutTransactionView,
     CheckoutTrialView,
     YookassaWebhookView,
 )
@@ -24,6 +25,11 @@ urlpatterns = [
         "checkout/trial",
         CheckoutTrialView.as_view(),
         name="checkout-trial",
+    ),
+    path(
+        "checkout/transactions/<str:transaction_id>",
+        CheckoutTransactionView.as_view(),
+        name="checkout-transaction",
     ),
     path(
         "webhooks/yookassa",
