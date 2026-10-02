@@ -20,6 +20,7 @@ class PublicScheduleView(APIView):
     authentication_classes = ()
 
     @extend_schema(
+        tags=["schedule"],
         operation_id="public_schedule_week",
         summary="Недельная сетка расписания",
         parameters=[

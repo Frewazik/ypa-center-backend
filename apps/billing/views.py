@@ -7,7 +7,8 @@ from collections.abc import Mapping
 from typing import cast
 
 from asgiref.sync import async_to_sync
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status
 from rest_framework.exceptions import (
     APIException,
@@ -50,6 +51,15 @@ from apps.users.models import Parent
 from apps.users.permissions import IsProfileCompleted
 
 _IDEMPOTENCY_HEADER = "X-Idempotency-Key"
+# Поле для заголовка в Swagger — без него чекаут оттуда не вызвать
+_IDEMPOTENCY_PARAMETER = OpenApiParameter(
+    name=_IDEMPOTENCY_HEADER,
+    location=OpenApiParameter.HEADER,
+    type=OpenApiTypes.UUID,
+    required=True,
+    description="UUID v4, новый на каждую покупку. Повтор с тем же ключом "
+    "и тем же телом вернёт тот же ответ, с другим телом — 409.",
+)
 _PAYMENT_EVENTS = frozenset(
     ("payment.succeeded", "payment.canceled", "payment.waiting_for_capture")
 )
@@ -155,6 +165,8 @@ class CheckoutSubscriptionView(_CheckoutView):
         description="Идемпотентное создание платежа за абонемент. "
         f"Заголовок {_IDEMPOTENCY_HEADER} (UUID v4) обязателен. "
         "Родитель определяется по сессии — parent_id в теле не принимается.",
+        parameters=[_IDEMPOTENCY_PARAMETER],
+        tags=["checkout"],
     )
     def post(self, request: Request) -> Response:
         idempotency_key = self._require_idempotency_key(request)
@@ -208,6 +220,8 @@ class CheckoutTrialView(_CheckoutView):
         f"Заголовок {_IDEMPOTENCY_HEADER} (UUID v4) обязателен. "
         "Не более одного пробного на ребёнка по кружку. "
         "Бесплатное пробное подтверждается сразу (CONFIRMED).",
+        parameters=[_IDEMPOTENCY_PARAMETER],
+        tags=["checkout"],
     )
     def post(self, request: Request) -> Response:
         idempotency_key = self._require_idempotency_key(request)
@@ -271,6 +285,7 @@ class YookassaWebhookView(APIView):
         request=YookassaWebhookSerializer,
         responses={status.HTTP_200_OK: None},
         description="Вебхук ЮКассы. Быстро ставит верификацию платежа в очередь.",
+        tags=["webhooks"],
     )
     def post(self, request: Request) -> Response:
         # ПОЧЕМУ: фильтруем чужие события до валидации сериализатором
