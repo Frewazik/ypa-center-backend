@@ -28,6 +28,7 @@ erDiagram
     enrollment ||--o{ attendance : ""
     parent ||--o{ transaction : ""
     subscription ||--o{ transaction : ""
+    enrollment ||--o{ transaction : ""
     schedule ||--o{ lesson : ""
     event ||--o{ event_registration : ""
     parent ||--o{ event_registration : "nullable"
@@ -102,7 +103,8 @@ erDiagram
 копейку), `is_unlimited`, `is_active`.
 
 **subscription** — купленный абонемент: `parent`, `plan`, `status`
-(`PENDING` / `ACTIVE` / `EXPIRED` / `CANCELED`), `purchase_price` и
+(`PENDING` / `ACTIVE` / `EXPIRED` / `CANCELED`; в модели есть и `DRAFT` — не
+используется, абонемент создаётся сразу `PENDING`), `purchase_price` и
 `base_session_price` — снапшоты на момент покупки (смена тарифа не трогает купленное),
 `start_date`, `expires_at` — месяц от первого фактического занятия.
 
@@ -110,7 +112,9 @@ erDiagram
 (id из домена schedule, намеренно без FK через границу домена), `granted_tokens`,
 `remaining_tokens` (по умолчанию 4 на слот).
 
-**transaction** — платёж: UUID PK, `parent`, `subscription` (nullable), `amount`
+**transaction** — платёж: UUID PK, `parent`, `subscription` (nullable — у пробного
+`NULL`), `enrollment` (nullable — бронь пробного: по ней вебхук находит, что
+подтверждать; у абонемента `NULL`), `amount`
 (ожидаемая сумма к оплате картой), `received_amount` (nullable — сколько фактически
 пришло по подтверждённому платежу; `NULL` = успешной оплаты ещё не было; на неё
 делается возврат и по ней повторный вебхук не ставит возврат второй раз),
@@ -127,7 +131,8 @@ erDiagram
 
 **enrollment** — запись ребёнка в группу: `student`, `subscription`, `schedule`,
 `status` (`HELD` — бронь на время оплаты, `ENROLLED`, `CANCELED`). HELD старше TTL
-транзакции (15 мин) считается протухшей и вычищается свипером.
+транзакции (15 мин) считается протухшей и сразу перестаёт занимать место в подсчёте;
+статус `CANCELED` ей ставит следующий чекаут в этот слот или свипер, снимая транзакцию.
 `type` — `REGULAR` (по абонементу) или `TRIAL` (пробное: `trial_date`, `activity`,
 без `subscription`; форму строки держит `ck_billing_enrollment_type_shape`).
 
@@ -160,6 +165,11 @@ erDiagram
 знаковый журнал движений (`reason`: списание на чекаут, возврат при отмене заказа,
 кредит при истечении абонемента) со ссылками на транзакцию и абонемент. Уникальные
 констрейнты журнала защищают от двойного начисления при ретраях.
+
+Все деньги — `integer` в копейках. CHECK на неотрицательность есть только у
+`parent_deposit.balance` и `subscription_slot.remaining_tokens`; у цен тарифа,
+`purchase_price`, `transaction.amount` / `received_amount` и у `slots_count >= 1` его
+пока нет — известный пробел, добавить отдельной миграцией.
 
 ## journal
 
