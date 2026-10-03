@@ -247,11 +247,18 @@ class TransactionAdmin(ModelAdmin):
     def refund_error(self, obj: Transaction) -> str:
         return str(obj.metadata.get("refund_error", ""))
 
-    # ПОЧЕМУ право строкой: has_change_permission закрыт ради read-only формы,
-    # а закрытие возврата — отдельное осознанное действие
+    # ПОЧЕМУ отдельный метод, а не "change": has_change_permission закрыт ради
+    # read-only формы, а закрытие возврата — отдельное осознанное действие.
+    # Не "billing.change_transaction" строкой: системная проверка unfold ищет
+    # такое право в auth_permission и роняет migrate на пустой базе
+    def has_resolve_refund_permission(
+        self, request: HttpRequest, object_id: str | None = None
+    ) -> bool:
+        return request.user.has_perm("billing.change_transaction")
+
     @action(
         description="Возврат разобран вручную",
-        permissions=["billing.change_transaction"],
+        permissions=["resolve_refund"],
     )
     def row_resolve_refund(
         self, request: HttpRequest, object_id: str
