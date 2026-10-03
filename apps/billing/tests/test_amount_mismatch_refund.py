@@ -5,8 +5,10 @@ from datetime import timedelta
 import pytest
 from django.contrib.admin.sites import AdminSite
 from django.contrib.auth.base_user import AbstractBaseUser
+from django.contrib.auth.models import Permission
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.contrib.sessions.middleware import SessionMiddleware
+from django.core.exceptions import PermissionDenied
 from django.http import HttpRequest
 from django.test import Client, RequestFactory
 from django.urls import reverse
@@ -248,3 +250,35 @@ class TestTransactionAdmin:
         assert response.status_code == 302
         assert tx.refund_status == "MANUAL"
         assert tx.metadata["refund_resolved_by"] == admin_user.get_username()
+
+    def test_row_action_hidden_without_change_permission(
+        self, rf: RequestFactory
+    ) -> None:
+        model_admin = TransactionAdmin(Transaction, AdminSite())
+        manager = ParentFactory(is_staff=True)
+        allowed = ParentFactory(is_staff=True)
+        allowed.user_permissions.add(
+            Permission.objects.get(
+                content_type__app_label="billing", codename="change_transaction"
+            )
+        )
+
+        def row_actions(user: AbstractBaseUser) -> list[str]:
+            request = _admin_request(rf, user)
+            return [a.method.__name__ for a in model_admin.get_actions_row(request)]
+
+        assert "row_resolve_refund" not in row_actions(manager)
+        assert "row_resolve_refund" in row_actions(allowed)
+
+    def test_row_action_denied_without_change_permission(
+        self, rf: RequestFactory
+    ) -> None:
+        tx = _awaiting_manual()
+        model_admin = TransactionAdmin(Transaction, AdminSite())
+        request = _admin_request(rf, ParentFactory(is_staff=True))
+
+        with pytest.raises(PermissionDenied):
+            model_admin.row_resolve_refund(request, str(tx.pk))
+
+        tx.refresh_from_db()
+        assert tx.refund_status != "MANUAL"
