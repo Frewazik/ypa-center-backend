@@ -800,6 +800,10 @@ def create_trial_payment(
                 tx.save(update_fields=["status", "metadata"])
                 enrollment.status = EnrollmentStatus.ENROLLED
                 enrollment.save(update_fields=["status"])
+                # ПОЧЕМУ: как у платного (_apply_trial_success) — журнал дня
+                # собран в 07:00, без этого ребёнка нет в сегодняшнем занятии
+                if trial_date == timezone.localdate():
+                    _add_to_journal({enrollment.pk: trial_date})
                 result = CheckoutResult(
                     transaction_id=tx.pk,
                     status="CONFIRMED",

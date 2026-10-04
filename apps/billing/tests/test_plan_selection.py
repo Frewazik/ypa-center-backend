@@ -10,6 +10,8 @@ from django.utils import timezone
 from rest_framework import status
 
 from apps.billing.models import (
+    Attendance,
+    AttendanceStatus,
     DepositEntry,
     Enrollment,
     EnrollmentStatus,
@@ -35,6 +37,7 @@ from apps.billing.tests.test_billing import (
     _checkout,
     _gateway_for,
 )
+from apps.billing.tests.test_trials import _trial_checkout
 from apps.core.management.commands.seed_demo import Command as SeedDemo
 from apps.schedule.tests.factories import ScheduleFactory
 
@@ -252,3 +255,19 @@ class TestFingerprintSlotOrder:
         assert again.status_code == status.HTTP_201_CREATED, again.data
         assert again.data["transaction_id"] == first.data["transaction_id"]
         assert Transaction.objects.count() == 1
+
+
+@pytest.mark.django_db
+class TestFreeTrialToday:
+    def test_free_trial_today_lands_in_todays_journal(self) -> None:
+        result, _, _ = _trial_checkout(101, days_ahead=0, price=0)
+
+        assert result.status == "CONFIRMED"
+        attendance = Attendance.objects.get()
+        assert attendance.date == timezone.localdate()
+        assert attendance.status == AttendanceStatus.ATTENDED
+
+    def test_free_trial_in_future_not_in_journal(self) -> None:
+        _trial_checkout(101, days_ahead=3, price=0)
+
+        assert not Attendance.objects.exists()
