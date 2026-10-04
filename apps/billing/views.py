@@ -41,6 +41,7 @@ from apps.billing.services import (
     PaymentInProgressError,
     PlanNotFoundError,
     PlanSlotsMismatchError,
+    PlanUnavailableError,
     SlotNotFoundError,
     StudentNotOwnedError,
     TrialDateUnavailableError,
@@ -90,6 +91,12 @@ class EnrollmentConflict(APIException):
     status_code = status.HTTP_409_CONFLICT
     default_detail = "Ребёнок уже записан или забронирован в этот слот."
     default_code = "STUDENT_ALREADY_ENROLLED"
+
+
+class PlanUnavailableConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "Тариф снят с продажи. Обновите список тарифов."
+    default_code = "PLAN_UNAVAILABLE"
 
 
 class TrialLimitConflict(APIException):
@@ -179,7 +186,11 @@ class CheckoutSubscriptionView(_CheckoutView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        fingerprint = _request_fingerprint(request.path, data, parent_id)
+        # ПОЧЕМУ sorted: сервис слоты сортирует, значит [101, 102] и [102, 101] —
+        # один и тот же заказ; иначе повтор с тем же ключом ловит ложный 409
+        fingerprint = _request_fingerprint(
+            request.path, {**data, "slot_ids": sorted(data["slot_ids"])}, parent_id
+        )
 
         try:
             result = create_payment(
@@ -195,6 +206,8 @@ class CheckoutSubscriptionView(_CheckoutView):
             )
         except PlanNotFoundError as exc:
             raise NotFound(detail=str(exc)) from exc
+        except PlanUnavailableError as exc:
+            raise PlanUnavailableConflict(detail=str(exc)) from exc
         except SlotNotFoundError as exc:
             raise NotFound(detail=str(exc)) from exc
         except PlanSlotsMismatchError as exc:
