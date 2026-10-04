@@ -129,7 +129,10 @@ class SubscriptionPlanFactory(factory.django.DjangoModelFactory):
         model = "billing.SubscriptionPlan"
 
     name = "Test Plan"
-    slots_count = 4
+    # ПОЧЕМУ последовательность: в БД один активный тариф на slots_count
+    # (uq_billing_active_plan_per_slots_count) — фабрика по умолчанию не должна
+    # сталкивать тарифы в одном тесте. Нужное число слотов тест задаёт явно
+    slots_count = factory.Sequence(lambda n: 1000 + n)
     price = 4000
     base_session_price = 1000
 

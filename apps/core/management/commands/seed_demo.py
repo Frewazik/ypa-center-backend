@@ -260,6 +260,10 @@ _PLANS: list[tuple[str, int, int, bool]] = [
     ("20 занятий (5 слотов)", 5, 1_200_000, False),
     ("Безлимит", 6, 1_500_000, True),
 ]
+# ПОЧЕМУ: скидка тарифа действует только на цену покупки; при истечении
+# посещения считаются без скидки — по базовой цене занятия, одной для всех
+# тарифов (решение бизнеса 2026-10-04)
+_BASE_SESSION_PRICE = 120_000
 
 
 class Command(BaseCommand):
@@ -390,7 +394,7 @@ class Command(BaseCommand):
                 defaults={
                     "slots_count": slots_count,
                     "price": price,
-                    "base_session_price": round(price / (slots_count * 4)),
+                    "base_session_price": _BASE_SESSION_PRICE,
                     "is_unlimited": is_unlimited,
                     "is_active": True,
                 },

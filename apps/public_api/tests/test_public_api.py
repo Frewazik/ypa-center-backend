@@ -379,7 +379,7 @@ class TestPublicEvents:
 class TestPublicPlans:
     def test_lists_active_plans_unlimited_last(self, api_client: APIClient) -> None:
         SubscriptionPlanFactory(
-            name="Безлимит", slots_count=0, price=1_500_000, is_unlimited=True
+            name="Безлимит", slots_count=6, price=1_500_000, is_unlimited=True
         )
         SubscriptionPlanFactory(name="4 занятия", slots_count=4, price=400_000)
         SubscriptionPlanFactory(name="Скрытый", is_active=False)

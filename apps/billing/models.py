@@ -58,6 +58,36 @@ class SubscriptionPlan(models.Model):
     class Meta:
         verbose_name = "Тарифный план"
         verbose_name_plural = "Тарифные планы"
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(slots_count__gte=1),
+                name="ck_billing_plan_slots_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(price__gte=0, base_session_price__gte=0),
+                name="ck_billing_plan_prices_nonnegative",
+            ),
+            # ПОЧЕМУ: фронт берёт тариф с витрины по числу слотов — два активных
+            # на одно число дали бы выбор цены. Снятые с продажи не мешают:
+            # замена тарифа — сначала снять старый, затем завести новый
+            models.UniqueConstraint(
+                fields=["slots_count"],
+                condition=Q(is_active=True, is_unlimited=False),
+                name="uq_billing_active_plan_per_slots_count",
+                violation_error_message=(
+                    "Активный тариф на это число слотов уже есть — "
+                    "сначала снимите его с продажи."
+                ),
+            ),
+            models.UniqueConstraint(
+                fields=["is_unlimited"],
+                condition=Q(is_active=True, is_unlimited=True),
+                name="uq_billing_single_active_unlimited_plan",
+                violation_error_message=(
+                    "Активный безлимит уже есть — сначала снимите его с продажи."
+                ),
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.name

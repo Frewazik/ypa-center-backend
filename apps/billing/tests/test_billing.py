@@ -109,7 +109,9 @@ class SubscriptionPlanFactory(factory.django.DjangoModelFactory):
         model = SubscriptionPlan
 
     name = factory.Sequence(lambda n: f"Тариф {n}")
-    slots_count = 2
+    # ПОЧЕМУ последовательность: в БД один активный тариф на slots_count —
+    # см. apps/schedule/tests/factories.py
+    slots_count = factory.Sequence(lambda n: 1000 + n)
     price = 700_000
     # ПОЧЕМУ: база для математических расчетов возврата по депозиту (1200 ₽)
     base_session_price = 120_000
@@ -300,11 +302,14 @@ def _checkout(
 ) -> CheckoutResult:
     the_parent = parent if parent is not None else ParentFactory()
     the_student = student if student is not None else StudentFactory(parent=the_parent)
-    the_plan = (
-        plan
-        if plan is not None
-        else SubscriptionPlanFactory(slots_count=len(set(slot_ids)))
-    )
+    # ПОЧЕМУ переиспользуем: повторный _checkout в одном тесте не должен
+    # заводить второй активный тариф на то же число слотов (запрещено в БД)
+    the_plan = plan
+    if the_plan is None:
+        slots_count = len(set(slot_ids))
+        the_plan = SubscriptionPlan.objects.filter(
+            slots_count=slots_count, is_active=True, is_unlimited=False
+        ).first() or SubscriptionPlanFactory(slots_count=slots_count)
     return create_payment(
         the_parent.pk,
         the_plan.pk,

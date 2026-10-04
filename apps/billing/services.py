@@ -102,13 +102,25 @@ class PlanNotFoundError(BillingError):
         self.plan_id = plan_id
 
 
-class PlanSlotsMismatchError(BillingError):
-    # ПОЧЕМУ: защита от подмены цены со стороны клиента,
-    # число переданных слотов обязано строго совпадать с тарифом
+class PlanUnavailableError(BillingError):
+    # ПОЧЕМУ отдельно от PlanNotFoundError: тариф есть, но снят с продажи —
+    # фронту нужно перечитать витрину, а не считать plan_id ошибкой
+    def __init__(self, plan_id: int) -> None:
+        super().__init__(f"Тариф id={plan_id} снят с продажи.")
+        self.plan_id = plan_id
 
-    def __init__(self, plan_id: int, expected: int, actual: int) -> None:
+
+class PlanSlotsMismatchError(BillingError):
+    # ПОЧЕМУ: защита от подмены цены со стороны клиента — обычный тариф
+    # требует ровно slots_count слотов, безлимит — не меньше slots_count
+
+    def __init__(
+        self, plan_id: int, expected: int, actual: int, *, at_least: bool = False
+    ) -> None:
+        bound = "от " if at_least else ""
         super().__init__(
-            f"Тариф id={plan_id} рассчитан на {expected} слот(ов), передано {actual}."
+            f"Тариф id={plan_id} рассчитан на {bound}{expected} слот(ов), "
+            f"передано {actual}."
         )
         self.plan_id = plan_id
         self.expected = expected
@@ -410,11 +422,24 @@ def create_payment(
         plan = SubscriptionPlan.objects.get(pk=plan_id)
     except SubscriptionPlan.DoesNotExist as exc:
         raise PlanNotFoundError(plan_id) from exc
+    # ПОЧЕМУ: витрина отдаёт только активные тарифы; без этой проверки снятый
+    # менеджером тариф покупается по старому plan_id из открытой вкладки
+    if not plan.is_active:
+        raise PlanUnavailableError(plan_id)
 
     normalized_slot_ids = sorted({int(slot_id) for slot_id in slot_ids})
-    if len(normalized_slot_ids) != plan.slots_count:
+    # ПОЧЕМУ: безлимит — фиксированная цена за «slots_count и больше»
+    # (project-context.md §6), верхнюю границу держит сериализатор
+    if plan.is_unlimited:
+        slots_fit = len(normalized_slot_ids) >= plan.slots_count
+    else:
+        slots_fit = len(normalized_slot_ids) == plan.slots_count
+    if not slots_fit:
         raise PlanSlotsMismatchError(
-            plan_id, plan.slots_count, len(normalized_slot_ids)
+            plan_id,
+            plan.slots_count,
+            len(normalized_slot_ids),
+            at_least=plan.is_unlimited,
         )
 
     # ПОЧЕМУ: защита от IDOR, проверяем принадлежность ребенка плательщику.
