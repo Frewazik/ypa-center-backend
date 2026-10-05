@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from threading import Barrier, Event, Lock, Thread
+from unittest.mock import AsyncMock
 
 import factory
 import pytest
@@ -12,7 +13,8 @@ from django.db import IntegrityError, connection
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
-from rest_framework.test import APIRequestFactory, force_authenticate
+from rest_framework.test import APIClient, APIRequestFactory, force_authenticate
+from taskiq.exceptions import SendTaskError
 from apps.schedule.models import Schedule
 
 from apps.billing import services as billing_services
@@ -71,7 +73,7 @@ from apps.billing.services import (
     sweep_finalized_idempotency_records,
     sweep_stale_pending_transactions,
 )
-from apps.billing.tasks import run_payment_verification
+from apps.billing.tasks import run_payment_verification, verify_and_process_payment
 from apps.billing.views import (
     CheckoutSubscriptionView,
     YookassaWebhookView,
@@ -1513,6 +1515,38 @@ class TestYookassaWebhookView:
 
         assert response.status_code == status.HTTP_200_OK
         assert enqueued == ["yk-42"]
+
+    def test_enqueues_through_shared_helper(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ПОЧЕМУ: голый async_to_sync без сброса пула ронял каждый второй
+        # вебхук в процессе — сброс живёт только в общем помощнике
+        calls: list[tuple[object, tuple[object, ...]]] = []
+
+        def fake_kiq_sync(task: object, *args: object) -> None:
+            calls.append((task, args))
+
+        monkeypatch.setattr("apps.billing.views.kiq_sync", fake_kiq_sync)
+        body = {"event": "payment.succeeded", "object": {"id": "yk-42"}}
+
+        response = self._post(body, remote_addr=_YOOKASSA_IP)
+
+        assert response.status_code == status.HTTP_200_OK
+        assert calls == [(verify_and_process_payment, ("yk-42",))]
+
+    def test_broker_failure_answers_500_so_yookassa_retries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            verify_and_process_payment, "kiq", AsyncMock(side_effect=SendTaskError())
+        )
+        body = {"event": "payment.succeeded", "object": {"id": "yk-42"}}
+
+        response = APIClient().post(
+            "/api/v1/webhooks/yookassa", body, format="json", REMOTE_ADDR=_YOOKASSA_IP
+        )
+
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
 
     def test_malformed_body_rejected_before_enqueue(
         self, monkeypatch: pytest.MonkeyPatch
