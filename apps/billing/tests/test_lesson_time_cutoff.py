@@ -38,6 +38,7 @@ from apps.schedule.tests.factories import (
     TimeSlotFactory,
 )
 from apps.users.models import Student
+from apps.events.ports import DjangoEventBookingPort
 
 pytestmark = pytest.mark.django_db
 
@@ -96,7 +97,12 @@ def _buy_subscription(
             parent_id=child.parent_id, subscription__isnull=False
         )
         payment_id, gateway = _gateway_for(tx, "succeeded")
-        confirm_payment(payment_id=payment_id, gateway=gateway, schedule_port=port)
+        confirm_payment(
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=port,
+            event_port=DjangoEventBookingPort(),
+        )
     return Subscription.objects.get(parent_id=child.parent_id)
 
 
@@ -123,7 +129,10 @@ def _buy_trial(
 def _pay(tx: Transaction) -> None:
     payment_id, gateway = _gateway_for(tx, "succeeded")
     confirm_payment(
-        payment_id=payment_id, gateway=gateway, schedule_port=DjangoSchedulePort()
+        payment_id=payment_id,
+        gateway=gateway,
+        schedule_port=DjangoSchedulePort(),
+        event_port=DjangoEventBookingPort(),
     )
 
 

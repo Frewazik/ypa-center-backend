@@ -3,7 +3,7 @@ from __future__ import annotations
 import calendar
 import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -42,7 +42,13 @@ from apps.billing.models import (
     Transaction,
     TransactionStatus,
 )
-from apps.billing.ports import SchedulePort, UnknownSlotError
+from apps.billing.ports import (
+    EventBookingPort,
+    EventBookingSummary,
+    EventHold,
+    SchedulePort,
+    UnknownSlotError,
+)
 from apps.billing.selectors import active_seat_q, attendances_awaiting_debit
 from apps.core.locks import advisory_xact_lock, advisory_xact_lock_many
 from apps.core.queue import kiq_safely
@@ -301,6 +307,7 @@ _CHECKOUT_ABORTED_REASON = "CHECKOUT_ABORTED"
 # ПОЧЕМУ: если по аннулированному заказу всё же придёт успешный платёж
 # (клиент оплатил по устаревшей ссылке), обе причины ведут в возврат
 _REFUNDABLE_CANCEL_REASONS = frozenset({_TTL_EXPIRED_REASON, _CHECKOUT_ABORTED_REASON})
+CANCELED_BY_CENTER_REASON = "CANCELED_BY_CENTER"
 _SLOT_LOCK_CLASS = 815_001
 
 # ПОЧЕМУ: лимит выборки защищает воркер от OOM Death Loop
@@ -562,6 +569,7 @@ def create_payment(
             transaction_id=str(tx.pk),
             idempotence_key=f"payment-{tx.pk}",
             description=f"Абонемент «{plan.name}»",
+            return_kind="checkout",
         )
     except GatewayError as exc:
         # Заказ уже закоммичен — аннулируем компенсацией, а не откатом
@@ -663,20 +671,36 @@ def _recover_lost_idempotency(key: str) -> CheckoutResult:
 
 
 def _void_unpaid_order(transaction_id: uuid.UUID) -> None:
+    with db_transaction.atomic():
+        tx = _abort_unpaid(transaction_id)
+        if tx is not None:
+            _release_order_resources(tx)
+
+
+def _void_unpaid_event_order(
+    transaction_id: uuid.UUID, event_port: EventBookingPort
+) -> None:
+    with db_transaction.atomic():
+        tx = _abort_unpaid(transaction_id)
+        if tx is not None:
+            # ПОЧЕМУ без письма «бронь снята»: семья тут же видит ошибку оплаты
+            _release_tx_resources(tx, event_port, notify_expired=False)
+
+
+def _abort_unpaid(transaction_id: uuid.UUID) -> Transaction | None:
     # ПОЧЕМУ: причина из _REFUNDABLE_CANCEL_REASONS — если провайдер всё же
     # проведёт оплату по аннулированному заказу, _apply_success отправит возврат
-    with db_transaction.atomic():
-        tx = (
-            Transaction.objects.select_for_update()
-            .filter(pk=transaction_id, status=TransactionStatus.PENDING)
-            .first()
-        )
-        if tx is None:
-            return
-        tx.status = TransactionStatus.CANCELED
-        tx.metadata = {**tx.metadata, "canceled_reason": _CHECKOUT_ABORTED_REASON}
-        tx.save(update_fields=["status", "metadata"])
-        _release_order_resources(tx)
+    tx = (
+        Transaction.objects.select_for_update()
+        .filter(pk=transaction_id, status=TransactionStatus.PENDING)
+        .first()
+    )
+    if tx is None:
+        return None
+    tx.status = TransactionStatus.CANCELED
+    tx.metadata = {**tx.metadata, "canceled_reason": _CHECKOUT_ABORTED_REASON}
+    tx.save(update_fields=["status", "metadata"])
+    return tx
 
 
 def create_trial_payment(
@@ -824,6 +848,7 @@ def create_trial_payment(
             transaction_id=str(tx.pk),
             idempotence_key=f"payment-{tx.pk}",
             description=f"Пробное занятие {trial_date.isoformat()}",
+            return_kind="checkout",
         )
     except GatewayError as exc:
         logger.warning(
@@ -856,6 +881,93 @@ def create_trial_payment(
         raise
 
     return result
+
+
+def create_event_payment(
+    *,
+    hold: Callable[[], EventHold],
+    parent_id: int | None,
+    idempotency_key: str,
+    request_fingerprint: str,
+    gateway: PaymentGateway,
+    event_port: EventBookingPort,
+) -> CheckoutResult:
+    # ПОЧЕМУ hold колбэком: проверки формы (места, телефон, согласие на ПД)
+    # живут в events, а бронь и платёж должны закоммититься вместе.
+    # !!!: порядок локов — hold берёт лок события; транзакция вставляется
+    # после него и никому не видна до коммита, ждать на ней некому
+    replay, lock_token = _reserve_idempotency(idempotency_key, request_fingerprint)
+    if replay is not None:
+        return replay
+
+    try:
+        with db_transaction.atomic():
+            booking = hold()
+            tx = Transaction.objects.create(
+                parent_id=parent_id,
+                event_registration_id=booking.registration_id,
+                amount=booking.amount_kopecks,
+                status=TransactionStatus.PENDING,
+                metadata={"kind": "event"},
+            )
+    except Exception:
+        _release_reservation(idempotency_key, lock_token)
+        raise
+
+    # ПОЧЕМУ вне транзакции: сетевой вызов под локом события держал бы
+    # в очереди все параллельные записи на это событие
+    try:
+        payment = gateway.create_payment(
+            amount_kopecks=tx.amount,
+            transaction_id=str(tx.pk),
+            idempotence_key=f"payment-{tx.pk}",
+            description=booking.description,
+            return_kind="event",
+        )
+    except GatewayError as exc:
+        logger.warning(
+            "Event checkout %s: шлюз не создал платёж (%s); бронь снята.",
+            tx.pk,
+            exc,
+        )
+        _void_unpaid_event_order(tx.pk, event_port)
+        _release_reservation(idempotency_key, lock_token)
+        raise PaymentGatewayUnavailableError(idempotency_key) from exc
+
+    result = CheckoutResult(
+        transaction_id=tx.pk,
+        status="PENDING_PAYMENT",
+        payment_url=payment.confirmation_url,
+        expires_at=tx.created_at + _PENDING_TRANSACTION_TTL,
+    )
+    try:
+        with db_transaction.atomic():
+            Transaction.objects.filter(
+                pk=tx.pk, status=TransactionStatus.PENDING
+            ).update(external_id=payment.id)
+            _finalize_idempotency_record(idempotency_key, lock_token, result)
+    except _IdempotencyLockLostError:
+        _void_unpaid_event_order(tx.pk, event_port)
+        return _recover_lost_idempotency(idempotency_key)
+    except Exception:
+        _void_unpaid_event_order(tx.pk, event_port)
+        _release_reservation(idempotency_key, lock_token)
+        raise
+
+    return result
+
+
+def decoy_event_checkout(payment_url_for: Callable[[str], str]) -> CheckoutResult:
+    # ПОЧЕМУ: ловушка для ботов на платном событии отвечает той же формой, что
+    # настоящий чекаут. Ссылка ведёт на наш экран результата, а не на ЮКассу:
+    # человек, попавший в ловушку автозаполнением, увидит «Заказ не найден»
+    fake_id = uuid.uuid4()
+    return CheckoutResult(
+        transaction_id=fake_id,
+        status="PENDING_PAYMENT",
+        payment_url=payment_url_for(str(fake_id)),
+        expires_at=timezone.now() + _PENDING_TRANSACTION_TTL,
+    )
 
 
 def _fulfill_prepaid_order(tx: Transaction, schedule_port: SchedulePort) -> None:
@@ -1013,24 +1125,33 @@ def _release_reservation(idempotency_key: str, lock_token: uuid.UUID) -> int:
 
 
 def confirm_payment(
-    *, payment_id: str, gateway: PaymentGateway, schedule_port: SchedulePort
+    *,
+    payment_id: str,
+    gateway: PaymentGateway,
+    schedule_port: SchedulePort,
+    event_port: EventBookingPort,
 ) -> None:
     # !!!: мы не доверяем payload вебхука
     # применяем строго верифицированный статус напрямую из API провайдера
     info = gateway.get_payment(payment_id)
-    _apply_verified_payment(info, _verified_transaction_id(info), schedule_port)
+    _apply_verified_payment(
+        info, _verified_transaction_id(info), schedule_port, event_port
+    )
 
 
 def _apply_verified_payment(
-    info: PaymentInfo, transaction_id: uuid.UUID, schedule_port: SchedulePort
+    info: PaymentInfo,
+    transaction_id: uuid.UUID,
+    schedule_port: SchedulePort,
+    event_port: EventBookingPort,
 ) -> None:
     # ПОЧЕМУ: общий хвост вебхука и сверки в свипере — статус уже получен
     # из API провайдера, обе дороги проводят его одним и тем же кодом
     if info.status == "succeeded":
-        _apply_success(info, transaction_id, schedule_port)
+        _apply_success(info, transaction_id, schedule_port, event_port)
         return
     if info.status == "canceled":
-        _apply_cancellation(transaction_id, info.id)
+        _apply_cancellation(transaction_id, info.id, event_port)
         return
     # ПОЧЕМУ: промежуточные статусы (pending, waiting_for_capture) игнорируются,
     # ожидаем терминального состояния платежа от провайдера
@@ -1046,7 +1167,10 @@ def _verified_transaction_id(info: PaymentInfo) -> uuid.UUID:
 
 
 def _apply_success(
-    info: PaymentInfo, transaction_id: uuid.UUID, schedule_port: SchedulePort
+    info: PaymentInfo,
+    transaction_id: uuid.UUID,
+    schedule_port: SchedulePort,
+    event_port: EventBookingPort,
 ) -> None:
     deferred: BillingError | None = None
 
@@ -1092,9 +1216,13 @@ def _apply_success(
             # ПОЧЕМУ: заказ не исполняется, а деньги у нас — возвращаем всё
             # пришедшее; депозитную часть вернёт _release_order_resources
             _queue_refund(tx, info.currency, {})
-            _release_order_resources(tx)
+            _release_tx_resources(tx, event_port, notify_expired=False)
             deferred = AmountMismatchError(
                 info.id, tx.amount, info.amount_kopecks, info.currency
+            )
+        elif tx.event_registration_id is not None:
+            deferred = _apply_event_success(
+                info, tx, tx.event_registration_id, event_port
             )
         elif tx.enrollment_id is not None:
             deferred = _apply_trial_success(info, tx, tx.enrollment_id, schedule_port)
@@ -1274,6 +1402,31 @@ def _apply_trial_success(
     return None
 
 
+def _apply_event_success(
+    info: PaymentInfo,
+    tx: Transaction,
+    registration_id: int,
+    event_port: EventBookingPort,
+) -> BillingError | None:
+    # !!!: вызывается строго под select_for_update по tx из _apply_success —
+    # порядок «транзакция → событие → бронь» (лок события берёт порт).
+    # ПОЧЕМУ без пересчёта мест: PENDING_PAYMENT держит места в счётчике
+    # события; бронь могли только снять — тогда деньги возвращаются
+    tx.status = TransactionStatus.SUCCEEDED
+    tx.external_id = info.id
+    tx.received_amount = info.amount_kopecks
+    tx.save(update_fields=["status", "external_id", "received_amount"])
+
+    # ПОЧЕМУ без проверки времени: оплату после начала события принимаем, как
+    # у пробного (решение бизнеса 2026-10-05) — места держала бронь
+    if event_port.confirm_paid(registration_id):
+        return None
+    _mark_for_compensation(
+        tx, {"reason": "HOLD_LOST", "event_registration_id": registration_id}
+    )
+    return SeatsTakenAfterPaymentError(info.id, 0, "HOLD_LOST")
+
+
 def _mark_for_compensation(tx: Transaction, extra: dict[str, object]) -> None:
     tx.requires_compensation = True
     tx.metadata = {**tx.metadata, "compensation_required": True, **extra}
@@ -1364,9 +1517,27 @@ def _try_enroll_held_seats(
     return None
 
 
+def _release_tx_resources(
+    tx: Transaction, event_port: EventBookingPort, *, notify_expired: bool
+) -> None:
+    # Освобождает то, что держал заказ любого вида. notify_expired — бронь
+    # события снята по сроку: семье уходит письмо «бронь снята»
+    if tx.event_registration_id is not None:
+        event_port.release_unpaid(tx.event_registration_id, notify=notify_expired)
+        return
+    _release_order_resources(tx)
+
+
 def _release_order_resources(tx: Transaction) -> None:
     # !!!: жесткий порядок отката (Enrollment -> Subscription -> депозит)
     # предотвращает ABBA-дедлок с процессом checkout
+    if tx.event_registration_id is not None:
+        # ПОЧЕМУ громко: бронь события освобождает только порт — тихий пропуск
+        # оставил бы места занятыми без оплаты
+        raise RuntimeError(
+            f"Транзакция {tx.pk}: бронь события освобождается через "
+            "_release_tx_resources."
+        )
     if tx.subscription_id is not None:
         Enrollment.objects.filter(
             subscription_id=tx.subscription_id,
@@ -1390,8 +1561,13 @@ def _return_deposit_hold(tx: Transaction) -> None:
         return
     if tx.metadata.get("deposit_returned"):
         return
+    parent_id = tx.parent_id
+    if parent_id is None:
+        # ПОЧЕМУ: депозит списывает только чекаут абонемента, где родитель
+        # обязателен (ck_billing_tx_single_target) — иначе данные испорчены
+        raise UnlinkedPaymentError(str(tx.pk), "депозит списан без родителя")
     deposit = (
-        ParentDeposit.objects.select_for_update().filter(parent_id=tx.parent_id).first()
+        ParentDeposit.objects.select_for_update().filter(parent_id=parent_id).first()
     )
     if deposit is None:
         return
@@ -1412,7 +1588,9 @@ def _return_deposit_hold(tx: Transaction) -> None:
     tx.save(update_fields=["metadata"])
 
 
-def _apply_cancellation(transaction_id: uuid.UUID, payment_id: str) -> None:
+def _apply_cancellation(
+    transaction_id: uuid.UUID, payment_id: str, event_port: EventBookingPort
+) -> None:
     with db_transaction.atomic():
         claimed = Transaction.objects.filter(
             pk=transaction_id,
@@ -1422,7 +1600,8 @@ def _apply_cancellation(transaction_id: uuid.UUID, payment_id: str) -> None:
             return
 
         tx = Transaction.objects.get(pk=transaction_id)
-        _release_order_resources(tx)
+        # ПОЧЕМУ без письма: оплату отменил банк — семья видела это на ЮКассе
+        _release_tx_resources(tx, event_port, notify_expired=False)
 
 
 def _result_from_record(record: IdempotencyRecord) -> CheckoutResult:
@@ -1546,6 +1725,7 @@ RefundReason = Literal[
     "GROUP_CLOSED",
     "PAID_AFTER_EXPIRY",
     "AMOUNT_MISMATCH",
+    "CANCELED_BY_CENTER",
     "NOT_FULFILLED",
 ]
 
@@ -1559,6 +1739,7 @@ _REFUND_REASONS: dict[str, RefundReason] = {
     "SLOT_REMOVED": "GROUP_CLOSED",
     "PAYMENT_SUCCEEDED_AFTER_EXPIRY": "PAID_AFTER_EXPIRY",
     "AMOUNT_MISMATCH": "AMOUNT_MISMATCH",
+    CANCELED_BY_CENTER_REASON: "CANCELED_BY_CENTER",
 }
 
 # ПОЧЕМУ: страница результата опрашивает статус раз в пару секунд. Если вебхук
@@ -1614,7 +1795,9 @@ def get_checkout_outcome(
             "enrollment__student",
             "enrollment__schedule__activity",
         )
-        .filter(pk=transaction_id, parent_id=parent_id)
+        # ПОЧЕМУ без событий: их экран — публичная ручка без ПД
+        # (get_event_checkout_outcome); здесь у них нет вида заказа
+        .filter(pk=transaction_id, parent_id=parent_id, event_registration=None)
         .first()
     )
     if tx is None:
@@ -1634,6 +1817,49 @@ def get_checkout_outcome(
         created_at=tx.created_at,
         expires_at=tx.created_at + _PENDING_TRANSACTION_TTL,
         order=_checkout_order(tx),
+    )
+
+
+@dataclass(frozen=True)
+class EventCheckoutOutcome:
+    # ПОЧЕМУ без ПД: отдаётся по одному id (uuid4 из return_url) без входа
+    id: uuid.UUID
+    status: CheckoutOutcomeStatus
+    reason: RefundReason | None
+    amount: int
+    created_at: datetime
+    expires_at: datetime
+    order: EventBookingSummary
+
+
+def get_event_checkout_outcome(
+    transaction_id: uuid.UUID,
+    *,
+    event_port: EventBookingPort,
+    now: datetime | None = None,
+) -> EventCheckoutOutcome:
+    # ПОЧЕМУ только транзакции события: id абонемента или пробного здесь —
+    # тот же 404, что и несуществующий; их отдаёт только владельцу
+    # get_checkout_outcome
+    tx = (
+        Transaction.objects.filter(pk=transaction_id)
+        .exclude(event_registration=None)
+        .first()
+    )
+    if tx is None or tx.event_registration_id is None:
+        raise CheckoutTransactionNotFoundError(transaction_id)
+
+    outcome = _parent_outcome(tx)
+    if outcome == "PENDING":
+        _request_payment_recheck(tx, now if now is not None else timezone.now())
+    return EventCheckoutOutcome(
+        id=tx.pk,
+        status=outcome,
+        reason=_refund_reason(tx) if outcome == "REFUND" else None,
+        amount=tx.received_amount if tx.received_amount is not None else tx.amount,
+        created_at=tx.created_at,
+        expires_at=tx.created_at + _PENDING_TRANSACTION_TTL,
+        order=event_port.get_summary(tx.event_registration_id),
     )
 
 
@@ -1748,6 +1974,7 @@ def sweep_stale_pending_transactions(
     *,
     gateway: PaymentGateway,
     schedule_port: SchedulePort,
+    event_port: EventBookingPort,
     now: datetime | None = None,
 ) -> int:
     # ПОЧЕМУ: защита от зависания забронированных слотов, если вебхук
@@ -1784,7 +2011,7 @@ def sweep_stale_pending_transactions(
             reconcile_budget -= 1
             try:
                 settled = _reconcile_stale_payment(
-                    tx_id, external_id, gateway, schedule_port
+                    tx_id, external_id, gateway, schedule_port, event_port
                 )
             except GatewayError as exc:
                 # ПОЧЕМУ: ЮКасса лежит или отвергает наши запросы — остальные
@@ -1796,7 +2023,9 @@ def sweep_stale_pending_transactions(
                 continue
 
         if _expire_pending_transaction(
-            tx_id, recheck_until=moment + _POST_EXPIRY_RECHECK_WINDOW
+            tx_id,
+            recheck_until=moment + _POST_EXPIRY_RECHECK_WINDOW,
+            event_port=event_port,
         ):
             swept += 1
             if gave_up:
@@ -1812,7 +2041,9 @@ def sweep_stale_pending_transactions(
     # важнее: оно держит места в группах
     _close_overdue_rechecks(moment)
     if not gateway_down and reconcile_budget > 0:
-        _recheck_expired_payments(gateway, schedule_port, moment, reconcile_budget)
+        _recheck_expired_payments(
+            gateway, schedule_port, event_port, moment, reconcile_budget
+        )
     return swept
 
 
@@ -1837,6 +2068,7 @@ def _reconcile_stale_payment(
     payment_id: str,
     gateway: PaymentGateway,
     schedule_port: SchedulePort,
+    event_port: EventBookingPort,
 ) -> bool:
     # ПОЧЕМУ: True — провайдер дал окончательный статус, и он проведён тем же
     # путём, что и вебхук; False — снимать заказ по TTL локально.
@@ -1888,7 +2120,7 @@ def _reconcile_stale_payment(
             payment_id,
         )
     try:
-        _apply_verified_payment(info, tx_id, schedule_port)
+        _apply_verified_payment(info, tx_id, schedule_port, event_port)
     except BillingError:
         # ПОЧЕМУ: как в run_payment_verification — бизнес-исход (компенсация,
         # несовпадение суммы) уже закоммичен, ошибка лишь сообщает о нём
@@ -1900,7 +2132,9 @@ def _reconcile_stale_payment(
     return True
 
 
-def _expire_pending_transaction(tx_id: uuid.UUID, *, recheck_until: datetime) -> bool:
+def _expire_pending_transaction(
+    tx_id: uuid.UUID, *, recheck_until: datetime, event_port: EventBookingPort
+) -> bool:
     with db_transaction.atomic():
         tx = (
             Transaction.objects.select_for_update()
@@ -1916,13 +2150,14 @@ def _expire_pending_transaction(tx_id: uuid.UUID, *, recheck_until: datetime) ->
         if tx.external_id is not None:
             tx.payment_recheck_until = recheck_until
         tx.save(update_fields=["status", "metadata", "payment_recheck_until"])
-        _release_order_resources(tx)
+        _release_tx_resources(tx, event_port, notify_expired=True)
         return True
 
 
 def _recheck_expired_payments(
     gateway: PaymentGateway,
     schedule_port: SchedulePort,
+    event_port: EventBookingPort,
     moment: datetime,
     budget: int,
 ) -> None:
@@ -1945,7 +2180,9 @@ def _recheck_expired_payments(
             _finish_recheck(tx_id)
             continue
         try:
-            final = _recheck_expired_payment(tx_id, external_id, gateway, schedule_port)
+            final = _recheck_expired_payment(
+                tx_id, external_id, gateway, schedule_port, event_port
+            )
         except GatewayError as exc:
             _log_reconcile_postponed(tx_id, exc)
             return
@@ -1958,6 +2195,7 @@ def _recheck_expired_payment(
     payment_id: str,
     gateway: PaymentGateway,
     schedule_port: SchedulePort,
+    event_port: EventBookingPort,
 ) -> bool:
     # ПОЧЕМУ: True — статус окончательный, досверку закрываем; False —
     # платёж ещё открыт, спросим в следующем тике.
@@ -2003,7 +2241,7 @@ def _recheck_expired_payment(
         payment_id,
     )
     try:
-        _apply_verified_payment(info, tx_id, schedule_port)
+        _apply_verified_payment(info, tx_id, schedule_port, event_port)
     except PaymentSucceededAfterExpiryError:
         pass  # ожидаемый исход: заказ не восстанавливается, возврат поставлен
     except BillingError:
@@ -2329,6 +2567,63 @@ def _quarantine_refund(tx_id: uuid.UUID, reason: str) -> None:
             ]
         )
         _schedule_refund_review_alert(locked.pk)
+
+
+class EventPaymentNotFoundError(BillingError):
+    def __init__(self, registration_id: int) -> None:
+        super().__init__(f"У брони события {registration_id} нет онлайн-платежа.")
+        self.registration_id = registration_id
+
+
+class EventPaymentStateError(BillingError):
+    # Подтверждённая бронь, чей платёж не «чистый успех», — нарушен инвариант
+    def __init__(self, registration_id: int, transaction_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Бронь {registration_id}: платёж {transaction_id} не в состоянии "
+            "«оплачен без возврата» — отмена с возвратом невозможна, нужен разбор."
+        )
+        self.registration_id = registration_id
+        self.transaction_id = transaction_id
+
+
+EventCancelOutcome = Literal["REFUND_QUEUED", "AWAITING_PAYMENT", "ALREADY_CANCELED"]
+
+
+def cancel_event_registration(
+    registration_id: int, *, event_port: EventBookingPort, canceled_by: str
+) -> EventCancelOutcome:
+    # Отмена онлайн-брони менеджером: места освобождаются, деньги — в очередь
+    # возвратов той же транзакцией БД (правило «деньги без услуги возвращаются»).
+    # !!!: порядок «транзакция → событие → бронь», как у вебхука — иначе
+    # отмена и вебхук по одной брони ловят взаимную блокировку
+    with db_transaction.atomic():
+        tx = (
+            Transaction.objects.select_for_update()
+            .filter(event_registration_id=registration_id)
+            .first()
+        )
+        if tx is None:
+            raise EventPaymentNotFoundError(registration_id)
+        if tx.status == TransactionStatus.PENDING:
+            # ПОЧЕМУ не отменяем: ссылка на оплату уже у семьи, а external_id
+            # может быть ещё не сохранён — оплата прошла бы мимо досверки.
+            # Неоплаченная бронь снимется сама по сроку
+            return "AWAITING_PAYMENT"
+        if not event_port.cancel_paid(registration_id):
+            return "ALREADY_CANCELED"
+        if (
+            tx.status != TransactionStatus.SUCCEEDED
+            or tx.received_amount is None
+            or tx.requires_compensation
+            or tx.refund_status is not None
+        ):
+            raise EventPaymentStateError(registration_id, tx.pk)
+        _queue_refund(
+            tx,
+            _EXPECTED_CURRENCY,
+            {"reason": CANCELED_BY_CENTER_REASON, "canceled_by": canceled_by},
+        )
+        return "REFUND_QUEUED"
 
 
 def resolve_refund_manually(transaction_id: uuid.UUID, *, resolved_by: str) -> None:

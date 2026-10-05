@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import cast
 
 from drf_spectacular.types import OpenApiTypes
@@ -15,19 +15,25 @@ from rest_framework.exceptions import (
     PermissionDenied,
     ValidationError,
 )
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.billing.adapters import YookassaHttpGateway
+from apps.billing.adapters import YookassaHttpGateway, event_return_url
 from apps.billing.permissions import YookassaIPAllowlist
-from apps.billing.ports import resolve_schedule_port
+from apps.billing.ports import (
+    EventHold,
+    EventPriceChangedError,
+    resolve_event_port,
+    resolve_schedule_port,
+)
 from apps.billing.serializers import (
     CheckoutResponseSerializer,
     CheckoutSubscriptionSerializer,
     CheckoutTransactionSerializer,
     CheckoutTrialSerializer,
+    EventCheckoutTransactionSerializer,
     YookassaWebhookSerializer,
 )
 from apps.billing.services import (
@@ -45,12 +51,16 @@ from apps.billing.services import (
     StudentNotOwnedError,
     TrialDateUnavailableError,
     TrialLimitExceededError,
+    create_event_payment,
     create_payment,
     create_trial_payment,
+    decoy_event_checkout,
     get_checkout_outcome,
+    get_event_checkout_outcome,
 )
 from apps.billing.tasks import verify_and_process_payment
 from apps.core.queue import kiq_sync
+from apps.core.throttling import ClientIPRateThrottle
 from apps.users.models import Parent
 from apps.users.permissions import IsProfileCompleted
 
@@ -105,25 +115,111 @@ class TrialLimitConflict(APIException):
     default_code = "TRIAL_LIMIT_EXCEEDED"
 
 
+class EventPriceChangedConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "Цена события изменилась. Обновите страницу."
+    default_code = "EVENT_PRICE_CHANGED"
+
+
+def require_idempotency_key(request: Request) -> str:
+    raw_key = request.headers.get(_IDEMPOTENCY_HEADER)
+    if not raw_key:
+        raise ValidationError(
+            {_IDEMPOTENCY_HEADER: "Заголовок обязателен для этой операции."},
+            code="IDEMPOTENCY_KEY_REQUIRED",
+        )
+    try:
+        return str(uuid.UUID(raw_key))
+    except ValueError as exc:
+        raise ValidationError(
+            {_IDEMPOTENCY_HEADER: "Значение должно быть валидным UUID."},
+            code="IDEMPOTENCY_KEY_MALFORMED",
+        ) from exc
+
+
+def checkout_response(result: CheckoutResult) -> Response:
+    response = CheckoutResponseSerializer(
+        {
+            "transaction_id": result.transaction_id,
+            "status": result.status,
+            "payment_url": result.payment_url,
+            "expires_at": result.expires_at,
+        }
+    )
+    return Response(response.data, status=status.HTTP_201_CREATED)
+
+
+def payment_in_progress_response(request: Request) -> Response:
+    # ПОЧЕМУ: стандартный DRF APIException не позволяет передать кастомные
+    # заголовки — формируем ответ вручную для возврата Retry-After
+    return _problem_response(
+        code=PaymentProcessingConflict.default_code,
+        title="Платёж уже обрабатывается",
+        detail=str(PaymentProcessingConflict.default_detail),
+        status_code=status.HTTP_409_CONFLICT,
+        instance=request.path,
+        headers={"Retry-After": "5"},
+    )
+
+
+def gateway_unavailable_response(request: Request) -> Response:
+    # ПОЧЕМУ: заказ аннулирован, резервация ключа снята — повтор с тем же
+    # Idempotency-Key безопасен, поэтому 503 с Retry-After, а не 500
+    return _problem_response(
+        code="PAYMENT_GATEWAY_UNAVAILABLE",
+        title="Платёжный шлюз недоступен",
+        detail="Не удалось создать платёж. Повторите запрос позже.",
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        instance=request.path,
+        headers={"Retry-After": "30"},
+    )
+
+
+def event_checkout_response(
+    request: Request,
+    *,
+    idempotency_key: str,
+    fingerprint_payload: Mapping[str, object],
+    phone: str,
+    parent_id: int | None,
+    hold: Callable[[], EventHold],
+) -> Response:
+    # Платная ветка POST /public/events/{id}/register/: ручка формы остаётся
+    # в events, а деньги и их ошибки — здесь, как у остальных чекаутов
+    fingerprint = _request_fingerprint(
+        request.path, fingerprint_payload, salt=f"phone:{phone}"
+    )
+    try:
+        result = create_event_payment(
+            hold=hold,
+            parent_id=parent_id,
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
+            gateway=YookassaHttpGateway(),
+            event_port=resolve_event_port(),
+        )
+    except EventPriceChangedError as exc:
+        raise EventPriceChangedConflict() from exc
+    except IdempotencyKeyReusedError as exc:
+        raise IdempotencyKeyConflict() from exc
+    except PaymentInProgressError:
+        return payment_in_progress_response(request)
+    except PaymentGatewayUnavailableError:
+        return gateway_unavailable_response(request)
+    return checkout_response(result)
+
+
+def decoy_event_checkout_response() -> Response:
+    return checkout_response(decoy_event_checkout(event_return_url))
+
+
 class _CheckoutView(APIView):
     # ПОЧЕМУ: список задан явно (не из settings), поэтому анкету проверяем
     # тут же — покупка до заполнения анкеты закрыта
     permission_classes = [IsAuthenticated, IsProfileCompleted]
 
     def _require_idempotency_key(self, request: Request) -> str:
-        raw_key = request.headers.get(_IDEMPOTENCY_HEADER)
-        if not raw_key:
-            raise ValidationError(
-                {_IDEMPOTENCY_HEADER: "Заголовок обязателен для этой операции."},
-                code="IDEMPOTENCY_KEY_REQUIRED",
-            )
-        try:
-            return str(uuid.UUID(raw_key))
-        except ValueError as exc:
-            raise ValidationError(
-                {_IDEMPOTENCY_HEADER: "Значение должно быть валидным UUID."},
-                code="IDEMPOTENCY_KEY_MALFORMED",
-            ) from exc
+        return require_idempotency_key(request)
 
     def _resolve_parent_id(self, request: Request) -> int:
         # !!!: ID родителя берется строго из контекста авторизации
@@ -133,39 +229,13 @@ class _CheckoutView(APIView):
         return int(cast(Parent, request.user).pk)
 
     def _checkout_response(self, result: CheckoutResult) -> Response:
-        response = CheckoutResponseSerializer(
-            {
-                "transaction_id": result.transaction_id,
-                "status": result.status,
-                "payment_url": result.payment_url,
-                "expires_at": result.expires_at,
-            }
-        )
-        return Response(response.data, status=status.HTTP_201_CREATED)
+        return checkout_response(result)
 
     def _payment_in_progress_response(self, request: Request) -> Response:
-        # ПОЧЕМУ: стандартный DRF APIException не позволяет передать кастомные
-        # заголовки — формируем ответ вручную для возврата Retry-After
-        return _problem_response(
-            code=PaymentProcessingConflict.default_code,
-            title="Платёж уже обрабатывается",
-            detail=str(PaymentProcessingConflict.default_detail),
-            status_code=status.HTTP_409_CONFLICT,
-            instance=request.path,
-            headers={"Retry-After": "5"},
-        )
+        return payment_in_progress_response(request)
 
     def _gateway_unavailable_response(self, request: Request) -> Response:
-        # ПОЧЕМУ: заказ аннулирован, резервация ключа снята — повтор с тем же
-        # Idempotency-Key безопасен, поэтому 503 с Retry-After, а не 500
-        return _problem_response(
-            code="PAYMENT_GATEWAY_UNAVAILABLE",
-            title="Платёжный шлюз недоступен",
-            detail="Не удалось создать платёж. Повторите запрос позже.",
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            instance=request.path,
-            headers={"Retry-After": "30"},
-        )
+        return gateway_unavailable_response(request)
 
 
 class CheckoutSubscriptionView(_CheckoutView):
@@ -189,7 +259,9 @@ class CheckoutSubscriptionView(_CheckoutView):
         # ПОЧЕМУ sorted: сервис слоты сортирует, значит [101, 102] и [102, 101] —
         # один и тот же заказ; иначе повтор с тем же ключом ловит ложный 409
         fingerprint = _request_fingerprint(
-            request.path, {**data, "slot_ids": sorted(data["slot_ids"])}, parent_id
+            request.path,
+            {**data, "slot_ids": sorted(data["slot_ids"])},
+            salt=f"parent:{parent_id}",
         )
 
         try:
@@ -254,7 +326,7 @@ class CheckoutTrialView(_CheckoutView):
                 "schedule_id": data["schedule_id"],
                 "trial_date": data["trial_date"].isoformat(),
             },
-            parent_id,
+            salt=f"parent:{parent_id}",
         )
 
         try:
@@ -314,6 +386,44 @@ class CheckoutTransactionView(_CheckoutView):
         except (ValueError, CheckoutTransactionNotFoundError) as exc:
             raise NotFound(detail="Транзакция не найдена.") from exc
         return Response(CheckoutTransactionSerializer(outcome).data)
+
+
+class EventPaymentStatusIPThrottle(ClientIPRateThrottle):
+    scope = "event_payment_status"
+
+
+class EventCheckoutTransactionView(APIView):
+    # ПОЧЕМУ без входа: гость платит без аккаунта, доказательство — только id
+    # из return_url (uuid4, не угадать). Поэтому в ответе нет ПД, а id
+    # абонемента или пробного здесь — тот же 404, что и несуществующий
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [EventPaymentStatusIPThrottle]
+
+    @extend_schema(
+        responses={status.HTTP_200_OK: EventCheckoutTransactionSerializer},
+        description="Итог оплаты события для страницы «результат оплаты» "
+        "(return_url приходит с ?tx=…&kind=event). Без входа, без "
+        "персональных данных. Фронт опрашивает, пока status = PENDING. "
+        "Не транзакция события — 404.",
+        parameters=[
+            OpenApiParameter(
+                name="transaction_id",
+                location=OpenApiParameter.PATH,
+                type=OpenApiTypes.UUID,
+            )
+        ],
+        tags=["forms"],
+        operation_id="public_event_payment_status",
+    )
+    def get(self, request: Request, transaction_id: str) -> Response:
+        try:
+            outcome = get_event_checkout_outcome(
+                uuid.UUID(transaction_id), event_port=resolve_event_port()
+            )
+        except (ValueError, CheckoutTransactionNotFoundError) as exc:
+            raise NotFound(detail="Транзакция не найдена.") from exc
+        return Response(EventCheckoutTransactionSerializer(outcome).data)
 
 
 class YookassaWebhookView(APIView):
@@ -378,12 +488,10 @@ def _problem_response(
     )
 
 
-def _request_fingerprint(
-    path: str, payload: Mapping[str, object], parent_id: int
-) -> str:
-    # ПОЧЕМУ: добавление parent_id в соль изолирует ключи идемпотентности по аккаунту
-    # это математически исключает кросс-тенантные коллизии
+def _request_fingerprint(path: str, payload: Mapping[str, object], *, salt: str) -> str:
+    # ПОЧЕМУ соль: изолирует ключи идемпотентности по владельцу — родителю
+    # (parent:<id>) или, у гостя без входа, телефону брони (phone:<E.164>)
     canonical = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
-    return hashlib.sha256(f"{path}|parent:{parent_id}|{canonical}".encode()).hexdigest()
+    return hashlib.sha256(f"{path}|{salt}|{canonical}".encode()).hexdigest()

@@ -50,6 +50,7 @@ from apps.billing.views import CheckoutTrialView
 from apps.journal.services import open_lesson
 from apps.schedule.models import Schedule
 from apps.users.models import Parent, Student
+from apps.events.ports import DjangoEventBookingPort
 
 if TYPE_CHECKING:
     from pytest_django import DjangoAssertNumQueries
@@ -289,6 +290,7 @@ class TestTrialWebhookConfirmation:
             payment_id=payment_id,
             gateway=gateway,
             schedule_port=_trial_port(101, trial_date),
+            event_port=DjangoEventBookingPort(),
         )
 
         tx.refresh_from_db()
@@ -305,6 +307,7 @@ class TestTrialWebhookConfirmation:
             payment_id=payment_id,
             gateway=gateway,
             schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
 
         tx.refresh_from_db()
@@ -325,6 +328,7 @@ class TestTrialWebhookConfirmation:
                 payment_id=payment_id,
                 gateway=gateway,
                 schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
 
         tx.refresh_from_db()
@@ -343,6 +347,7 @@ class TestTrialWebhookConfirmation:
                 payment_id=payment_id,
                 gateway=gateway,
                 schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
 
         tx.refresh_from_db()
@@ -640,6 +645,7 @@ class TestTrialAndSubscriptionSameGroup:
             payment_id=payment_id,
             gateway=gateway,
             schedule_port=_trial_port(101, trial_date),
+            event_port=DjangoEventBookingPort(),
         )
         trial = Enrollment.objects.get(type=EnrollmentType.TRIAL)
         assert trial.status == EnrollmentStatus.ENROLLED
@@ -656,6 +662,7 @@ class TestTrialAndSubscriptionSameGroup:
             payment_id=payment_id,
             gateway=gateway,
             schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
 
         regular = Enrollment.objects.get(type=EnrollmentType.REGULAR)

@@ -34,6 +34,7 @@ from apps.billing.tests.test_billing import (
 from apps.billing.tests.test_trials import _trial_checkout
 from apps.billing.views import CheckoutTransactionView
 from apps.users.models import Parent
+from apps.events.ports import DjangoEventBookingPort
 
 
 def _get(user: Parent, transaction_id: object):  # noqa: ANN202 — DRF Response
@@ -105,7 +106,10 @@ class TestOutcomes:
         tx = _make_pending_payment([101])
         payment_id, gateway = _gateway_for(tx, "succeeded")
         confirm_payment(
-            payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
 
         body = _get(tx.parent, tx.pk).data
@@ -117,7 +121,10 @@ class TestOutcomes:
         tx = _make_pending_payment([101])
         payment_id, gateway = _gateway_for(tx, "canceled")
         confirm_payment(
-            payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
 
         body = _get(tx.parent, tx.pk).data
@@ -138,7 +145,10 @@ class TestOutcomes:
         payment_id, gateway = _gateway_for(tx, "succeeded")
         with pytest.raises(BillingError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=_port(s101=0)
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=_port(s101=0),
+                event_port=DjangoEventBookingPort(),
             )
         tx.refresh_from_db()
         assert tx.status == TransactionStatus.SUCCEEDED
@@ -155,7 +165,10 @@ class TestOutcomes:
         payment_id, gateway = _gateway_for(tx, "succeeded")
         with pytest.raises(BillingError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=_port(s101=0)
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=_port(s101=0),
+                event_port=DjangoEventBookingPort(),
             )
         issue_pending_refunds(gateway=FakeGateway())
         tx.refresh_from_db()
@@ -173,7 +186,10 @@ class TestOutcomes:
         payment_id, gateway = _gateway_for(tx, "succeeded")
         with pytest.raises(BillingError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
         tx.refresh_from_db()
         assert tx.status == TransactionStatus.CANCELED
@@ -188,7 +204,10 @@ class TestOutcomes:
         payment_id, gateway = _gateway_for(tx, "succeeded", amount_kopecks=100)
         with pytest.raises(BillingError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
 
         body = _get(tx.parent, tx.pk).data
@@ -295,7 +314,10 @@ class TestPaymentRecheck:
         paid = _make_pending_payment([101])
         payment_id, gateway = _gateway_for(paid, "succeeded")
         confirm_payment(
-            payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
         unregistered = _make_pending_payment([102])
         Transaction.objects.filter(pk=unregistered.pk).update(external_id=None)

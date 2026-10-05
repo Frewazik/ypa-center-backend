@@ -21,33 +21,32 @@ async def release_expired_event_registrations_task() -> int:
 
 
 @broker.task(retry_on_error=True, max_retries=5)
-async def notify_new_registration_task(registration_id: int) -> None:
-    # ПОЧЕМУ: ставится строго из on_commit (services._schedule_task).
-    # Сбой Telegram (TelegramDeliveryError) уходит в ретрай брокера
+async def notify_paid_registration_task(registration_id: int) -> None:
+    # ПОЧЕМУ: ставится строго из on_commit (services.confirm_paid_registration) —
+    # после оплаты, а не при записи: неоплаченная бронь не требует действий
+    # менеджера. Сбой Telegram (TelegramDeliveryError) уходит в ретрай брокера
     registration = (
         await EventRegistration.objects.select_related("event")
-        .filter(pk=registration_id, status=RegistrationStatus.PENDING_PAYMENT)
+        .filter(pk=registration_id, status=RegistrationStatus.CONFIRMED)
         .afirst()
     )
     if registration is None:
-        # ПОЧЕМУ: менеджер мог подтвердить или отменить раньше, чем дошла очередь
-        logger.info("Регистрация на событие %s: уже не ждёт оплаты.", registration_id)
+        # ПОЧЕМУ: менеджер мог отменить бронь раньше, чем дошла очередь
+        logger.info("Регистрация на событие %s: уже не подтверждена.", registration_id)
         return
     event = registration.event
     starts = timezone.localtime(event.start_datetime).strftime("%d.%m.%Y %H:%M")
     contacts = ", ".join(
         part for part in (str(registration.phone), registration.email) if part
     )
-    # ПОЧЕМУ: имя и телефон в сообщении — менеджеру нужно связаться с семьёй
-    # и договориться об оплате (решение владельца)
+    # ПОЧЕМУ: имена и контакты в сообщении — решение владельца (менеджер
+    # готовит места и при необходимости связывается с семьёй)
     text = (
-        f"Новая запись на платное событие #{registration.pk}\n"
+        f"Оплачена онлайн запись на событие #{registration.pk}\n"
         f"«{event.title}», {starts}\n"
         f"Мест: {registration.attendees_count}\n"
         f"Ребёнок: {registration.child_name}\n"
         f"Родитель: {registration.parent_name}, {contacts}\n"
-        f"Без «Подтвердить оплату» бронь снимется через "
-        f"{settings.EVENT_PENDING_PAYMENT_TTL_MINUTES} мин.\n"
         "Админка → «Регистрации на события»"
     )
     await send_manager_message(text, context=f"event_registration id={registration.pk}")

@@ -8,7 +8,7 @@ from django.test import RequestFactory
 
 from apps.billing.models import EnrollmentStatus, TransactionStatus
 from apps.core.dashboard import DASHBOARD_CACHE_KEY, dashboard_callback
-from apps.schedule.tests.factories import EnrollmentFactory, ParentFactory
+from apps.schedule.tests.factories import EnrollmentFactory, SubscriptionFactory
 
 pytestmark = pytest.mark.django_db
 
@@ -24,8 +24,11 @@ def _clear_dashboard_cache():
 def _succeeded_transaction(amount: int):
     from apps.billing.models import Transaction
 
+    # ПОЧЕМУ абонемент: у транзакции обязана быть цель (ck_billing_tx_single_target)
+    subscription = SubscriptionFactory()
     return Transaction.objects.create(
-        parent=ParentFactory(),
+        parent=subscription.parent,
+        subscription=subscription,
         amount=amount,
         status=TransactionStatus.SUCCEEDED,
     )

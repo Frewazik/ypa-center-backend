@@ -177,10 +177,14 @@ class SubscriptionSlot(models.Model):
 
 class Transaction(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # ПОЧЕМУ nullable: событие оплачивает гость без входа; для абонемента и
+    # пробного родитель обязателен — держит ck_billing_tx_single_target
     parent = models.ForeignKey(
         "users.Parent",
         on_delete=models.PROTECT,
         related_name="transactions",
+        null=True,
+        blank=True,
         verbose_name="Родитель",
     )
     subscription = models.ForeignKey(
@@ -232,6 +236,18 @@ class Transaction(models.Model):
         blank=True,
         verbose_name="Запись (пробное)",
     )
+    # ПОЧЕМУ: как enrollment у пробного — вебхук находит бронь события по прямой
+    # ссылке; меняет её billing только через EventBookingPort.
+    # db_index=False: поиск по ней покрывает uq_billing_tx_per_event_registration
+    event_registration = models.ForeignKey(
+        "events.EventRegistration",
+        on_delete=models.PROTECT,
+        related_name="transactions",
+        null=True,
+        blank=True,
+        db_index=False,
+        verbose_name="Бронь события",
+    )
     # ПОЧЕМУ: вынесено из metadata в отдельную колонку, поиск должников по JSONB даст Seq Scan
     requires_compensation = models.BooleanField("Требуется возврат", default=False)
     # ПОЧЕМУ: lease-резервация возврата (claim check) — параллельный тик
@@ -264,6 +280,39 @@ class Transaction(models.Model):
     class Meta:
         verbose_name = "Транзакция"
         verbose_name_plural = "Транзакции"
+        constraints = [
+            # ПОЧЕМУ: у платежа ровно одна цель — иначе вебхук не знает, что
+            # подтверждать. Без родителя — только гостевая оплата события
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        subscription__isnull=False,
+                        enrollment__isnull=True,
+                        event_registration__isnull=True,
+                        parent__isnull=False,
+                    )
+                    | Q(
+                        subscription__isnull=True,
+                        enrollment__isnull=False,
+                        event_registration__isnull=True,
+                        parent__isnull=False,
+                    )
+                    | Q(
+                        subscription__isnull=True,
+                        enrollment__isnull=True,
+                        event_registration__isnull=False,
+                    )
+                ),
+                name="ck_billing_tx_single_target",
+            ),
+            # ПОЧЕМУ: отмена брони менеджером ищет её платёж — второй платёж
+            # на ту же бронь оставил бы деньги без возврата
+            models.UniqueConstraint(
+                fields=["event_registration"],
+                condition=Q(event_registration__isnull=False),
+                name="uq_billing_tx_per_event_registration",
+            ),
+        ]
         indexes = [
             # ПОЧЕМУ: B-Tree индекс по boolean неэффективен;
             # partial-индекс отсекает только реальных должников

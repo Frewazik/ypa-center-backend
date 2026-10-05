@@ -192,6 +192,7 @@ class TransactionAdmin(ModelAdmin):
     # единственное ручное действие — закрыть разобранный возврат кнопкой строки
     list_display = (
         "created_at",
+        "order_kind",
         "parent",
         "amount",
         "received_amount",
@@ -206,9 +207,25 @@ class TransactionAdmin(ModelAdmin):
         ("created_at", RangeDateFilter),
     )
     list_select_related = ("parent",)
-    search_fields = ("parent__email", "parent__phone", "external_id")
+    # ПОЧЕМУ поля брони: гость платит за событие без аккаунта — его платёж
+    # находится только по контактам из брони
+    search_fields = (
+        "parent__email",
+        "parent__phone",
+        "event_registration__email",
+        "event_registration__phone",
+        "external_id",
+    )
     ordering = ("-created_at",)
     actions_row = ("row_resolve_refund",)
+
+    @admin.display(description="Заказ")
+    def order_kind(self, obj: Transaction) -> str:
+        if obj.event_registration_id is not None:
+            return f"Событие (бронь #{obj.event_registration_id})"
+        if obj.enrollment_id is not None:
+            return "Пробное"
+        return "Абонемент"
 
     def has_add_permission(self, request: HttpRequest) -> bool:
         return False

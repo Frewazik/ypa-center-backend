@@ -115,9 +115,11 @@ erDiagram
 (id из домена schedule, намеренно без FK через границу домена), `granted_tokens`,
 `remaining_tokens` (по умолчанию 4 на слот).
 
-**transaction** — платёж: UUID PK, `parent`, `subscription` (nullable — у пробного
-`NULL`), `enrollment` (nullable — бронь пробного: по ней вебхук находит, что
-подтверждать; у абонемента `NULL`), `amount`
+**transaction** — платёж: UUID PK, `parent` (nullable — только у гостевой оплаты
+события), `subscription` (nullable — у пробного `NULL`), `enrollment` (nullable — бронь
+пробного: по ней вебхук находит, что подтверждать; у абонемента `NULL`),
+`event_registration` (nullable, `PROTECT` — бронь события; меняет её billing только
+через порт `EventBookingPort`), `amount`
 (ожидаемая сумма к оплате картой), `received_amount` (nullable — сколько фактически
 пришло по подтверждённому платежу; `NULL` = успешной оплаты ещё не было; на неё
 делается возврат и по ней повторный вебхук не ставит возврат второй раз),
@@ -131,6 +133,10 @@ erDiagram
 статусы ЮКассы, `FAILED` — не отправлен, `MANUAL` — закрыт менеджером). По
 `refund_status` опрашиваются незавершённые возвраты и строится экран ручного
 разбора, поэтому он в колонке, а не в `metadata`.
+Ограничения: `ck_billing_tx_single_target` — у платежа ровно одна цель (абонемент,
+пробное или бронь события), `parent` пуст только у события;
+`uq_billing_tx_per_event_registration` — не больше одного платежа на бронь события
+(частичный unique; он же индекс поиска по брони).
 
 **enrollment** — запись ребёнка в группу: `student`, `subscription`, `schedule`,
 `status` (`HELD` — бронь на время оплаты, `ENROLLED`, `CANCELED`). HELD старше TTL
@@ -187,10 +193,18 @@ erDiagram
 денормализованный счётчик под `select_for_update`. Check-констрейнты:
 `seats_taken <= capacity`, неотрицательность.
 
-**event_registration** — гостевая запись: `event` FK, `parent` (nullable —
-единственное анонимное действие в системе), контакты, `attendees_count`, `source`,
-`comment`, `status` (`PENDING_PAYMENT` / `CONFIRMED` / `CANCELED`). PENDING_PAYMENT
-старше 30 минут освобождается свипером.
+**event_registration** — гостевая запись: `event` FK (`PROTECT`), `parent` (nullable —
+единственное анонимное действие в системе; при удалении родителя обнуляется), контакты,
+`attendees_count`, `amount` — снимок суммы брони в копейках (цена × места в момент
+записи, у бесплатной 0; `CHECK amount >= 0`; старые брони заполнены миграцией по цене
+на момент выкладки), `source`, `comment`, `status` (`PENDING_PAYMENT` / `CONFIRMED` /
+`CANCELED`; `NEW` объявлен, но не выставляется). Частичный уникальный индекс
+`uq_event_registration_active_phone` — одна живая запись на телефон в событии.
+
+Срок жизни `PENDING_PAYMENT`: бронь с онлайн-платежом (есть `transaction`) живёт как
+неоплаченная транзакция — 15 минут, снимает свипер оплат после сверки с ЮКассой. Старая
+бронь «оплата на месте» (без транзакции) — `EVENT_PENDING_PAYMENT_TTL_MINUTES`, снимает
+свипер событий. Снятие освобождает места и телефон.
 
 ## public_forms / content
 

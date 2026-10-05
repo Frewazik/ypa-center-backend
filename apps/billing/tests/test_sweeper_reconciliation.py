@@ -40,6 +40,7 @@ from apps.billing.tests.test_billing import (
     _gateway_for,
     _make_pending_payment,
 )
+from apps.events.ports import DjangoEventBookingPort
 
 
 def _stale_order(
@@ -57,6 +58,7 @@ def _sweep(gateway: PaymentGateway, *, later: timedelta = timedelta(0)) -> int:
         gateway=gateway,
         schedule_port=FakeSchedulePort(),
         now=timezone.now() + later,
+        event_port=DjangoEventBookingPort(),
     )
 
 
@@ -185,6 +187,7 @@ class TestReconciliationOutcomes:
                 payment_id=payment_id,
                 gateway=paid_gateway,
                 schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
         assert issue_pending_refunds(gateway=paid_gateway) == 1
         assert paid_gateway.refund_calls == [(payment_id, tx.amount, f"refund-{tx.pk}")]
@@ -330,6 +333,7 @@ class TestReconciliationWebhookInterleaving:
                     payment_id=requested_id,
                     gateway=base,
                     schedule_port=FakeSchedulePort(),
+                    event_port=DjangoEventBookingPort(),
                 )
                 return info
 
@@ -382,6 +386,7 @@ class TestReconciliationWebhookRace:
                     payment_id=payment_id,
                     gateway=gateway,
                     schedule_port=FakeSchedulePort(),
+                    event_port=DjangoEventBookingPort(),
                 ),
             ),
         )
@@ -480,7 +485,10 @@ class TestPostExpiryRecheck:
         payment_id, paid = _gateway_for(tx, "succeeded")
         with pytest.raises(PaymentSucceededAfterExpiryError):
             confirm_payment(
-                payment_id=payment_id, gateway=paid, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=paid,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
         assert issue_pending_refunds(gateway=paid) == 1
 
@@ -502,7 +510,10 @@ class TestPostExpiryRecheck:
         payment_id, paid = _gateway_for(tx, "succeeded", currency="USD")
         with pytest.raises(PaymentSucceededAfterExpiryError):
             confirm_payment(
-                payment_id=payment_id, gateway=paid, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=paid,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
 
         with caplog.at_level(logging.CRITICAL, logger="apps.billing.services"):
@@ -527,6 +538,7 @@ class TestPostExpiryRecheck:
                         payment_id=requested_id,
                         gateway=base,
                         schedule_port=FakeSchedulePort(),
+                        event_port=DjangoEventBookingPort(),
                     )
                 return info
 

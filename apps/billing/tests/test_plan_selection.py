@@ -40,6 +40,7 @@ from apps.billing.tests.test_billing import (
 from apps.billing.tests.test_trials import _trial_checkout
 from apps.core.management.commands.seed_demo import Command as SeedDemo
 from apps.schedule.tests.factories import ScheduleFactory
+from apps.events.ports import DjangoEventBookingPort
 
 # ПОЧЕМУ 100–106 + свои: пакетный conftest сеет 7 слотов, безлимиту нужно до 10
 _SLOTS = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109]
@@ -101,7 +102,10 @@ class TestUnlimitedPlanSlots:
         tx = Transaction.objects.get()
         payment_id, gateway = _gateway_for(tx, "succeeded")
         confirm_payment(
-            payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
 
         tx.refresh_from_db()

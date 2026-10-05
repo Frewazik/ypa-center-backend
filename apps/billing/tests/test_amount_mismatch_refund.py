@@ -34,6 +34,7 @@ from apps.billing.tests.test_billing import (
     _make_pending_payment,
     _sweep_unpaid,
 )
+from apps.events.ports import DjangoEventBookingPort
 
 
 def _mismatched(
@@ -44,7 +45,10 @@ def _mismatched(
     )
     with pytest.raises(AmountMismatchError):
         confirm_payment(
-            payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
     return gateway
 
@@ -58,7 +62,10 @@ class TestAmountMismatchRefund:
 
         with pytest.raises(AmountMismatchError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
 
         tx.refresh_from_db()
@@ -78,7 +85,10 @@ class TestAmountMismatchRefund:
 
         with pytest.raises(AmountMismatchError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
         issue_pending_refunds(gateway=gateway)
 
@@ -103,6 +113,7 @@ class TestAmountMismatchRefund:
             payment_id=f"yk-{tx.pk}",
             gateway=gateway,
             schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
         assert issue_pending_refunds(gateway=gateway) == 0
 
@@ -150,7 +161,10 @@ class TestLatePaymentRefundAmount:
 
         with pytest.raises(PaymentSucceededAfterExpiryError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
         issue_pending_refunds(gateway=gateway)
 
@@ -163,12 +177,18 @@ class TestLatePaymentRefundAmount:
         payment_id, gateway = _gateway_for(tx, "succeeded")
         with pytest.raises(PaymentSucceededAfterExpiryError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
         assert issue_pending_refunds(gateway=gateway) == 1
 
         confirm_payment(
-            payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
 
         tx.refresh_from_db()
