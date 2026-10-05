@@ -27,6 +27,7 @@ from apps.billing.adapters import (
     PaymentNotFoundError,
     RefundInfo,
     RefundStatus,
+    ReturnKind,
     _parse_payment_body,
 )
 from apps.billing.models import (
@@ -80,6 +81,7 @@ from apps.billing.views import (
     _request_fingerprint,
 )
 from apps.users.models import Parent, Student
+from apps.events.ports import DjangoEventBookingPort
 
 _FP = "test-fingerprint"
 _YOOKASSA_IP = "185.71.76.5"
@@ -175,6 +177,7 @@ class FakeGateway:
     refund_calls: list[tuple[str, int, str]] = field(default_factory=list)
     failing_refund_ids: set[str] = field(default_factory=set)
     created_payments: list[tuple[str, int, str]] = field(default_factory=list)
+    return_kinds: list[ReturnKind] = field(default_factory=list)
     # ПОЧЕМУ: статус, с которым ЮКасса принимает возврат, и итог при опросе
     new_refund_status: RefundStatus = "succeeded"
     refund_outcomes: dict[str, RefundStatus] = field(default_factory=dict)
@@ -192,8 +195,10 @@ class FakeGateway:
         transaction_id: str,
         idempotence_key: str,
         description: str,
+        return_kind: ReturnKind,
     ) -> CreatedPayment:
         self.created_payments.append((transaction_id, amount_kopecks, idempotence_key))
+        self.return_kinds.append(return_kind)
         return CreatedPayment(
             id=f"yk-{transaction_id}",
             status="pending",
@@ -232,6 +237,7 @@ class RaisingGateway:
         transaction_id: str,
         idempotence_key: str,
         description: str,
+        return_kind: ReturnKind,
     ) -> CreatedPayment:
         raise self.error_factory("сбой шлюза")
 
@@ -395,7 +401,10 @@ def _sweep_unpaid(*, now: datetime | None = None) -> int:
         }
     )
     return sweep_stale_pending_transactions(
-        gateway=gateway, schedule_port=FakeSchedulePort(), now=now
+        gateway=gateway,
+        schedule_port=FakeSchedulePort(),
+        now=now,
+        event_port=DjangoEventBookingPort(),
     )
 
 
@@ -870,6 +879,7 @@ class TestIdempotencyFencingRace:
                 transaction_id: str,
                 idempotence_key: str,
                 description: str,
+                return_kind: ReturnKind,
             ) -> CreatedPayment:
                 with call_lock:
                     call_counter["n"] += 1
@@ -882,6 +892,7 @@ class TestIdempotencyFencingRace:
                     transaction_id=transaction_id,
                     idempotence_key=idempotence_key,
                     description=description,
+                    return_kind=return_kind,
                 )
 
         gateway = GatingGateway()
@@ -955,7 +966,10 @@ class TestConfirmPayment:
         payment_id, gateway = _gateway_for(tx, "succeeded")
 
         confirm_payment(
-            payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
 
         tx.refresh_from_db()
@@ -978,8 +992,18 @@ class TestConfirmPayment:
         payment_id, gateway = _gateway_for(tx, "succeeded")
         port = FakeSchedulePort()
 
-        confirm_payment(payment_id=payment_id, gateway=gateway, schedule_port=port)
-        confirm_payment(payment_id=payment_id, gateway=gateway, schedule_port=port)
+        confirm_payment(
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=port,
+            event_port=DjangoEventBookingPort(),
+        )
+        confirm_payment(
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=port,
+            event_port=DjangoEventBookingPort(),
+        )
 
         assert SubscriptionSlot.objects.count() == 2
         assert Transaction.objects.count() == 1
@@ -995,6 +1019,7 @@ class TestConfirmPayment:
                 payment_id="fake-payment-id",
                 gateway=gateway,
                 schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
 
         tx.refresh_from_db()
@@ -1008,7 +1033,10 @@ class TestConfirmPayment:
         payment_id, gateway = _gateway_for(tx, "pending")
 
         confirm_payment(
-            payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
 
         tx.refresh_from_db()
@@ -1020,7 +1048,10 @@ class TestConfirmPayment:
         payment_id, gateway = _gateway_for(tx, "canceled")
 
         confirm_payment(
-            payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
 
         tx.refresh_from_db()
@@ -1045,7 +1076,12 @@ class TestConfirmPaymentEnrollmentFSM:
         payment_id, gateway = _gateway_for(tx, "succeeded")
 
         with pytest.raises(SeatsTakenAfterPaymentError):
-            confirm_payment(payment_id=payment_id, gateway=gateway, schedule_port=port)
+            confirm_payment(
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=port,
+                event_port=DjangoEventBookingPort(),
+            )
 
         tx.refresh_from_db()
         own = Enrollment.objects.get(subscription_id=tx.subscription_id)
@@ -1070,6 +1106,7 @@ class TestConfirmPaymentEnrollmentFSM:
                 payment_id=payment_id,
                 gateway=gateway,
                 schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
 
         tx.refresh_from_db()
@@ -1083,7 +1120,10 @@ class TestConfirmPaymentEnrollmentFSM:
 
         with pytest.raises(SeatsTakenAfterPaymentError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=vanished
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=vanished,
+                event_port=DjangoEventBookingPort(),
             )
 
         tx.refresh_from_db()
@@ -1100,7 +1140,10 @@ class TestConfirmPaymentAmountVerification:
 
         with pytest.raises(AmountMismatchError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
 
         tx.refresh_from_db()
@@ -1123,7 +1166,10 @@ class TestConfirmPaymentAmountVerification:
 
         with pytest.raises(AmountMismatchError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
 
         tx.refresh_from_db()
@@ -1136,8 +1182,18 @@ class TestConfirmPaymentAmountVerification:
         port = FakeSchedulePort()
 
         with pytest.raises(AmountMismatchError):
-            confirm_payment(payment_id=payment_id, gateway=gateway, schedule_port=port)
-        confirm_payment(payment_id=payment_id, gateway=gateway, schedule_port=port)
+            confirm_payment(
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=port,
+                event_port=DjangoEventBookingPort(),
+            )
+        confirm_payment(
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=port,
+            event_port=DjangoEventBookingPort(),
+        )
 
         tx.refresh_from_db()
         assert tx.status == TransactionStatus.FAILED
@@ -1155,7 +1211,10 @@ class TestConfirmPaymentDataIntegrity:
 
         with pytest.raises(UnlinkedPaymentError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
 
         tx.refresh_from_db()
@@ -1177,7 +1236,10 @@ class TestConfirmPaymentZombieGuard:
 
         with pytest.raises(SubscriptionNotActivatableError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
 
         tx.refresh_from_db()
@@ -1281,7 +1343,10 @@ class TestLateSuccessCompensationFlow:
 
         with pytest.raises(PaymentSucceededAfterExpiryError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
 
         tx.refresh_from_db()
@@ -1295,7 +1360,10 @@ class TestLateSuccessCompensationFlow:
         tx, payment_id, gateway = self._swept_then_paid()
         with pytest.raises(PaymentSucceededAfterExpiryError):
             confirm_payment(
-                payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
             )
 
         first_run = issue_pending_refunds(gateway=gateway)
@@ -1315,7 +1383,12 @@ class TestLateSuccessCompensationFlow:
         EnrollmentFactory(schedule_id=101, status=EnrollmentStatus.ENROLLED)
         payment_id, gateway = _gateway_for(tx, "succeeded")
         with pytest.raises(SeatsTakenAfterPaymentError):
-            confirm_payment(payment_id=payment_id, gateway=gateway, schedule_port=port)
+            confirm_payment(
+                payment_id=payment_id,
+                gateway=gateway,
+                schedule_port=port,
+                event_port=DjangoEventBookingPort(),
+            )
 
         issued = issue_pending_refunds(gateway=gateway)
 
@@ -1418,7 +1491,12 @@ class TestLateSuccessCompensationFlow:
 class TestTaskRetryClassification:
     def test_transient_network_error_propagates_for_retry(self) -> None:
         with pytest.raises(GatewayNetworkError):
-            run_payment_verification("yk-1", RaisingGateway(), FakeSchedulePort())
+            run_payment_verification(
+                "yk-1",
+                RaisingGateway(),
+                FakeSchedulePort(),
+                event_port=DjangoEventBookingPort(),
+            )
 
     def test_permanent_contract_error_is_swallowed_as_critical(
         self, caplog: pytest.LogCaptureFixture
@@ -1429,6 +1507,7 @@ class TestTaskRetryClassification:
             "yk-1",
             RaisingGateway(error_factory=GatewayContractError),
             FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
 
         assert any(record.levelname == "CRITICAL" for record in caplog.records)
@@ -1436,7 +1515,12 @@ class TestTaskRetryClassification:
     def test_permanent_not_found_is_swallowed_and_logged(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        run_payment_verification("yk-unknown", FakeGateway(), FakeSchedulePort())
+        run_payment_verification(
+            "yk-unknown",
+            FakeGateway(),
+            FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
+        )
 
         assert any("поддельный" in message for message in caplog.messages)
 
@@ -1446,7 +1530,9 @@ class TestTaskRetryClassification:
         tx = _make_pending_payment([101])
         payment_id, gateway = _gateway_for(tx, "succeeded", amount_kopecks=100)
 
-        run_payment_verification(payment_id, gateway, FakeSchedulePort())
+        run_payment_verification(
+            payment_id, gateway, FakeSchedulePort(), event_port=DjangoEventBookingPort()
+        )
 
         tx.refresh_from_db()
         assert tx.status == TransactionStatus.FAILED
@@ -1821,7 +1907,10 @@ class TestDepositHoldReturn:
         payment_id, gateway = _gateway_for(tx, "canceled")
 
         confirm_payment(
-            payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
 
         tx.refresh_from_db()
@@ -1889,7 +1978,12 @@ class TestActivationWindow:
         tx = _make_pending_payment([101, 102])
         payment_id, gateway = _gateway_for(tx, "succeeded")
 
-        confirm_payment(payment_id=payment_id, gateway=gateway, schedule_port=port)
+        confirm_payment(
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=port,
+            event_port=DjangoEventBookingPort(),
+        )
 
         subscription = Subscription.objects.get()
         assert subscription.start_date == date(2026, 7, 10)
@@ -1924,7 +2018,10 @@ class TestPriceSnapshotImmunity:
         tx = Transaction.objects.get()
         payment_id, gateway = _gateway_for(tx, "succeeded")
         confirm_payment(
-            payment_id=payment_id, gateway=gateway, schedule_port=FakeSchedulePort()
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
         SubscriptionPlan.objects.filter(pk=plan.pk).update(
             price=1_200_000, base_session_price=999_999, slots_count=5
@@ -1947,7 +2044,12 @@ class TestSeatNecromancy:
         _checkout([101], port=port)
         tx = Transaction.objects.get()
         payment_id, gateway = _gateway_for(tx, "succeeded")
-        confirm_payment(payment_id=payment_id, gateway=gateway, schedule_port=port)
+        confirm_payment(
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=port,
+            event_port=DjangoEventBookingPort(),
+        )
         dead = Enrollment.objects.get()
         assert (
             dead.status == EnrollmentStatus.ENROLLED
@@ -2160,8 +2262,12 @@ class TestFingerprintScoping:
             "use_deposit": False,
         }
 
-        fp_one = _request_fingerprint("/api/v1/checkout/subscription", body, 1)
-        fp_two = _request_fingerprint("/api/v1/checkout/subscription", body, 2)
+        fp_one = _request_fingerprint(
+            "/api/v1/checkout/subscription", body, salt="parent:1"
+        )
+        fp_two = _request_fingerprint(
+            "/api/v1/checkout/subscription", body, salt="parent:2"
+        )
 
         assert fp_one != fp_two
 
@@ -2264,7 +2370,7 @@ class TestPaymentInProgressEnvelope:
         IdempotencyRecord.objects.create(
             key=key,
             request_fingerprint=_request_fingerprint(
-                "/api/v1/checkout/subscription", body, owner.pk
+                "/api/v1/checkout/subscription", body, salt=f"parent:{owner.pk}"
             ),
             response_status=202,
             response_body={},

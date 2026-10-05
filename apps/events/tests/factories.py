@@ -49,6 +49,7 @@ class EventRegistrationFactory(DjangoModelFactory):
     phone = factory.Sequence(lambda n: f"+7912{n % 10000000:07d}")
     email = factory.Sequence(lambda n: f"guest{n}@example.com")
     attendees_count = 1
+    amount = factory.LazyAttribute(lambda o: o.event.price * o.attendees_count)
     source = "instagram"
     status = RegistrationStatus.NEW
 

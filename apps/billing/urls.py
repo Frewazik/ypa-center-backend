@@ -6,6 +6,7 @@ from apps.billing.views import (
     CheckoutSubscriptionView,
     CheckoutTransactionView,
     CheckoutTrialView,
+    EventCheckoutTransactionView,
     YookassaWebhookView,
 )
 
@@ -30,6 +31,13 @@ urlpatterns = [
         "checkout/transactions/<str:transaction_id>",
         CheckoutTransactionView.as_view(),
         name="checkout-transaction",
+    ),
+    # ПОЧЕМУ со слешем: публичная зона /public/* у нас со слешем, а GET
+    # без тела редирект APPEND_SLASH не ломает
+    path(
+        "public/events/payments/<str:transaction_id>/",
+        EventCheckoutTransactionView.as_view(),
+        name="event-payment-status",
     ),
     path(
         "webhooks/yookassa",

@@ -2,6 +2,8 @@
 # владелец вычисляется строго на уровне view через токен авторизации
 from __future__ import annotations
 
+from typing import Literal
+
 from rest_framework import serializers
 
 
@@ -41,6 +43,22 @@ class CheckoutResponseSerializer(serializers.Serializer):
 
 
 _TIME_FORMAT = "%H:%M"
+# ПОЧЕМУ публичные: на них ссылается SPECTACULAR_SETTINGS["ENUM_NAME_OVERRIDES"] —
+# оба экрана результата (свой и гостевой) отдают один и тот же набор
+CHECKOUT_OUTCOME_STATUS_CHOICES = ("PENDING", "SUCCEEDED", "CANCELED", "REFUND")
+REFUND_REASON_CHOICES = (
+    "SEATS_TAKEN",
+    "GROUP_CLOSED",
+    "PAID_AFTER_EXPIRY",
+    "AMOUNT_MISMATCH",
+    "CANCELED_BY_CENTER",
+    "NOT_FULFILLED",
+)
+_AMOUNT_HELP = (
+    "Копейки: сколько прошло через карту (оно же вернётся), "
+    "до оплаты — сколько предстоит заплатить"
+)
+_EXPIRES_HELP = "До какого момента ждём оплату; осмысленно только для PENDING"
 
 
 class CheckoutOrderSlotSerializer(serializers.Serializer):
@@ -64,30 +82,36 @@ class CheckoutTransactionSerializer(serializers.Serializer):
     type = serializers.ChoiceField(choices=("SUBSCRIPTION", "TRIAL"))
     # ПОЧЕМУ: исход для родителя, а не статус строки в БД — оплаченное пробное
     # без места в БД SUCCEEDED, а для родителя это возврат
-    status = serializers.ChoiceField(
-        choices=("PENDING", "SUCCEEDED", "CANCELED", "REFUND")
-    )
+    status = serializers.ChoiceField(choices=CHECKOUT_OUTCOME_STATUS_CHOICES)
     # ПОЧЕМУ: заполнен только у REFUND. У CANCELED null — причину отказа
     # банка адаптер ЮКассы пока не разбирает
-    reason = serializers.ChoiceField(
-        choices=(
-            "SEATS_TAKEN",
-            "GROUP_CLOSED",
-            "PAID_AFTER_EXPIRY",
-            "AMOUNT_MISMATCH",
-            "NOT_FULFILLED",
-        ),
-        allow_null=True,
-    )
-    amount = serializers.IntegerField(
-        help_text="Копейки: сколько прошло через карту (оно же вернётся), "
-        "до оплаты — сколько предстоит заплатить"
-    )
+    reason = serializers.ChoiceField(choices=REFUND_REASON_CHOICES, allow_null=True)
+    amount = serializers.IntegerField(help_text=_AMOUNT_HELP)
     created_at = serializers.DateTimeField()
-    expires_at = serializers.DateTimeField(
-        help_text="До какого момента ждём оплату; осмысленно только для PENDING"
-    )
+    expires_at = serializers.DateTimeField(help_text=_EXPIRES_HELP)
     order = CheckoutOrderSerializer()
+
+
+class EventCheckoutOrderSerializer(serializers.Serializer):
+    # ПОЧЕМУ без имён и контактов: ответ отдаётся по одному id без входа
+    event_id = serializers.IntegerField()
+    title = serializers.CharField()
+    starts_at = serializers.DateTimeField()
+    attendees_count = serializers.IntegerField()
+
+
+class EventCheckoutTransactionSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    type = serializers.SerializerMethodField()
+    status = serializers.ChoiceField(choices=CHECKOUT_OUTCOME_STATUS_CHOICES)
+    reason = serializers.ChoiceField(choices=REFUND_REASON_CHOICES, allow_null=True)
+    amount = serializers.IntegerField(help_text=_AMOUNT_HELP)
+    created_at = serializers.DateTimeField()
+    expires_at = serializers.DateTimeField(help_text=_EXPIRES_HELP)
+    order = EventCheckoutOrderSerializer()
+
+    def get_type(self, obj: object) -> Literal["EVENT"]:
+        return "EVENT"
 
 
 class _YookassaPaymentObjectSerializer(serializers.Serializer):

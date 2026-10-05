@@ -427,6 +427,7 @@ class Command(BaseCommand):
                     phone="+79990001122",
                     email="maria@example.com",
                     attendees_count=2,
+                    amount=price * 2,
                     source="instagram",
                     status=RegistrationStatus.CONFIRMED,
                 )

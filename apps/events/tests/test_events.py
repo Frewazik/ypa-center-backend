@@ -12,6 +12,7 @@ from rest_framework import status
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.test import APIClient
 
+from apps.billing.ports import EventPriceChangedError
 from apps.events.admin import EventRegistrationAdmin
 from apps.events.models import EventRegistration, RegistrationStatus
 from apps.events.services import (
@@ -91,12 +92,17 @@ class TestRegisterForEventService:
         assert registration.status == RegistrationStatus.CONFIRMED
         assert event.seats_taken == 2
 
-    def test_paid_event_waits_for_payment(self) -> None:
+    def test_paid_event_is_not_booked_without_online_payment(self) -> None:
+        # ПОЧЕМУ: платная бронь создаётся только вместе с платежом
+        # (billing.create_event_payment) — «оплата на месте» больше не заводится
         event = EventFactory(paid=True)
 
-        registration = register_for_event(event.pk, _submission())
+        with pytest.raises(EventPriceChangedError):
+            register_for_event(event.pk, _submission())
 
-        assert registration.status == RegistrationStatus.PENDING_PAYMENT
+        event.refresh_from_db()
+        assert event.seats_taken == 0
+        assert not EventRegistration.objects.exists()
 
     def test_rejects_when_not_enough_seats(self) -> None:
         event = EventFactory(capacity=5)
@@ -155,15 +161,19 @@ class TestCancelRegistration:
         assert event.seats_taken == 0
 
     def test_release_expired_pending_registrations(self) -> None:
+        # ПОЧЕМУ фабрика: бронь «оплата на месте» (без транзакции) новым кодом
+        # не создаётся, но живые на момент выкладки свипер events снимает
         event = EventFactory(paid=True)
-        expired = register_for_event(event.pk, _submission(attendees_count=2))
+        expired = EventRegistrationFactory(
+            event=event, attendees_count=2, status=RegistrationStatus.PENDING_PAYMENT
+        )
         EventRegistration.objects.filter(pk=expired.pk).update(
             created_at=timezone.now()
             - pending_payment_ttl()
             - datetime.timedelta(minutes=1)
         )
-        fresh = register_for_event(
-            event.pk, _submission(attendees_count=1, phone="+79991234568")
+        fresh = EventRegistrationFactory(
+            event=event, attendees_count=1, status=RegistrationStatus.PENDING_PAYMENT
         )
 
         released = release_expired_pending_registrations()

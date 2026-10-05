@@ -6,7 +6,6 @@ from collections.abc import Iterator
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from asgiref.sync import async_to_sync
 from django.contrib import messages
 from django.contrib.admin.sites import AdminSite
 from django.contrib.messages.storage.fallback import FallbackStorage
@@ -21,7 +20,7 @@ from rest_framework.test import APIClient
 
 from apps.events import services
 from apps.events.admin import EventRegistrationAdmin
-from apps.events.models import EventRegistration, RegistrationStatus
+from apps.events.models import Event, EventRegistration, RegistrationStatus
 from apps.events.services import (
     MAX_ATTENDEES_PER_REGISTRATION,
     RegistrationSubmission,
@@ -29,11 +28,8 @@ from apps.events.services import (
     register_for_event,
     release_expired_pending_registrations,
 )
-from apps.events.tasks import (
-    notify_new_registration_task,
-    send_registration_expired_email_task,
-)
-from apps.events.tests.factories import EventFactory
+from apps.events.tasks import send_registration_expired_email_task
+from apps.events.tests.factories import EventFactory, EventRegistrationFactory
 
 pytestmark = pytest.mark.django_db
 
@@ -65,6 +61,18 @@ def _submission(**overrides: object) -> RegistrationSubmission:
     return RegistrationSubmission(**{**defaults, **overrides})  # type: ignore[arg-type]
 
 
+def _legacy_pending(event: Event, **overrides: object) -> EventRegistration:
+    # ПОЧЕМУ фабрика: брони «оплата на месте» новым кодом не создаются, но
+    # живые на момент выкладки доживают по старым правилам — их и проверяем
+    defaults: dict[str, object] = {
+        "event": event,
+        "status": RegistrationStatus.PENDING_PAYMENT,
+        "parent_name": "Ольга",
+        "email": "olga@example.com",
+    }
+    return EventRegistrationFactory(**{**defaults, **overrides})
+
+
 def _age(registration: EventRegistration, delta: datetime.timedelta) -> None:
     EventRegistration.objects.filter(pk=registration.pk).update(
         created_at=timezone.now() - delta
@@ -92,7 +100,7 @@ def queued() -> Iterator[dict[str, AsyncMock]]:
     # ПОЧЕМУ: подменяется постановка в брокер — проверяем, что задача
     # действительно ушла в очередь после коммита
     with (
-        patch("apps.events.tasks.notify_new_registration_task") as notify,
+        patch("apps.events.tasks.notify_paid_registration_task") as notify,
         patch("apps.events.tasks.send_registration_expired_email_task") as email,
     ):
         notify.kiq = AsyncMock()
@@ -110,7 +118,7 @@ class TestSweeperVsManagerRace:
         # 3) свипер дошёл до снятия этого id.
         # Шаг 2 вклинивается обёрткой вокруг поштучного снятия свипера
         event = EventFactory(paid=True)
-        registration = register_for_event(event.pk, _submission(attendees_count=2))
+        registration = _legacy_pending(event, attendees_count=2)
         _age(registration, datetime.timedelta(hours=2))
 
         original = services.expire_pending_registration
@@ -138,7 +146,7 @@ class TestSweeperVsManagerRace:
 
     def test_confirming_already_expired_booking_warns_manager(self) -> None:
         event = EventFactory(paid=True)
-        registration = register_for_event(event.pk, _submission())
+        registration = _legacy_pending(event)
         _age(registration, datetime.timedelta(hours=2))
         release_expired_pending_registrations()
 
@@ -158,8 +166,8 @@ class TestPendingRegistrationLifetime:
     @override_settings(EVENT_PENDING_PAYMENT_TTL_MINUTES=60)
     def test_ttl_is_configurable(self) -> None:
         event = EventFactory(paid=True)
-        fresh = register_for_event(event.pk, _submission())
-        expired = register_for_event(event.pk, _submission(phone="+79991234568"))
+        fresh = _legacy_pending(event)
+        expired = _legacy_pending(event)
         _age(fresh, datetime.timedelta(minutes=31))
         _age(expired, datetime.timedelta(minutes=61))
 
@@ -178,8 +186,7 @@ class TestPendingRegistrationLifetime:
         queued: dict[str, AsyncMock],
         django_capture_on_commit_callbacks: DjangoCaptureOnCommitCallbacks,
     ) -> None:
-        event = EventFactory(paid=True)
-        registration = register_for_event(event.pk, _submission())
+        registration = _legacy_pending(EventFactory(paid=True))
         _age(registration, datetime.timedelta(hours=1))
 
         with django_capture_on_commit_callbacks(execute=True):
@@ -192,8 +199,7 @@ class TestPendingRegistrationLifetime:
         queued: dict[str, AsyncMock],
         django_capture_on_commit_callbacks: DjangoCaptureOnCommitCallbacks,
     ) -> None:
-        event = EventFactory(paid=True)
-        registration = register_for_event(event.pk, _submission(email=""))
+        registration = _legacy_pending(EventFactory(paid=True), email="")
         _age(registration, datetime.timedelta(hours=1))
 
         with django_capture_on_commit_callbacks(execute=True):
@@ -207,8 +213,7 @@ class TestPendingRegistrationLifetime:
         django_capture_on_commit_callbacks: DjangoCaptureOnCommitCallbacks,
     ) -> None:
         # ПОЧЕМУ: при ручной отмене менеджер говорит с семьёй сам
-        event = EventFactory(paid=True)
-        registration = register_for_event(event.pk, _submission())
+        registration = _legacy_pending(EventFactory(paid=True))
 
         with django_capture_on_commit_callbacks(execute=True):
             cancel_registration(registration.pk)
@@ -217,7 +222,7 @@ class TestPendingRegistrationLifetime:
 
     def test_email_task_sends_letter(self) -> None:
         event = EventFactory(paid=True, title="Театральные игры")
-        registration = register_for_event(event.pk, _submission())
+        registration = _legacy_pending(event)
         cancel_registration(registration.pk)
 
         send_registration_expired_email_task.original_func(registration.pk)
@@ -229,84 +234,14 @@ class TestPendingRegistrationLifetime:
         assert "Ольга" in letter.body
 
 
-class TestManagerNotification:
-    def test_paid_registration_notifies_managers_after_commit(
+class TestLegacyBookingConfirmedByManager:
+    def test_confirmed_legacy_booking_survives_sweeper(
         self,
         queued: dict[str, AsyncMock],
         django_capture_on_commit_callbacks: DjangoCaptureOnCommitCallbacks,
     ) -> None:
         event = EventFactory(paid=True)
-
-        with django_capture_on_commit_callbacks(execute=True):
-            registration = register_for_event(event.pk, _submission())
-
-        queued["notify"].assert_awaited_once_with(registration.pk)
-
-    def test_free_registration_does_not_notify(
-        self,
-        queued: dict[str, AsyncMock],
-        django_capture_on_commit_callbacks: DjangoCaptureOnCommitCallbacks,
-    ) -> None:
-        event = EventFactory()
-
-        with django_capture_on_commit_callbacks(execute=True):
-            register_for_event(event.pk, _submission())
-
-        queued["notify"].assert_not_awaited()
-
-    def test_message_has_contacts_for_callback(self) -> None:
-        event = EventFactory(paid=True, title="Театральные игры")
-        registration = register_for_event(event.pk, _submission(attendees_count=2))
-
-        with patch(
-            "apps.events.tasks.send_manager_message", new_callable=AsyncMock
-        ) as send:
-            async_to_sync(notify_new_registration_task.original_func)(registration.pk)
-
-        text = send.await_args.args[0]
-        assert f"#{registration.pk}" in text
-        assert "Театральные игры" in text
-        assert "Мест: 2" in text
-        assert "Миша" in text
-        assert "Ольга, +79991234567, olga@example.com" in text
-        assert "30 мин" in text
-
-    def test_already_confirmed_booking_is_not_announced(self) -> None:
-        event = EventFactory(paid=True)
-        registration = register_for_event(event.pk, _submission())
-        _admin_confirm(registration.pk)
-
-        with patch(
-            "apps.events.tasks.send_manager_message", new_callable=AsyncMock
-        ) as send:
-            async_to_sync(notify_new_registration_task.original_func)(registration.pk)
-
-        send.assert_not_awaited()
-
-
-class TestPaidRegistrationEndToEnd:
-    def test_notified_confirmed_booking_survives_sweeper(
-        self,
-        queued: dict[str, AsyncMock],
-        django_capture_on_commit_callbacks: DjangoCaptureOnCommitCallbacks,
-    ) -> None:
-        event = EventFactory(paid=True)
-        payload = {
-            "child_name": "Миша",
-            "parent_name": "Ольга",
-            "phone": "+79991234567",
-            "email": "olga@example.com",
-            "attendees_count": 2,
-            "pd_consent": True,
-        }
-
-        with django_capture_on_commit_callbacks(execute=True):
-            response = APIClient().post(
-                f"/api/v1/public/events/{event.pk}/register/", payload, format="json"
-            )
-        assert response.status_code == status.HTTP_201_CREATED
-        registration = EventRegistration.objects.get(event=event)
-        queued["notify"].assert_awaited_once_with(registration.pk)
+        registration = _legacy_pending(event, attendees_count=2)
 
         _admin_confirm(registration.pk)
         _age(registration, datetime.timedelta(days=1))

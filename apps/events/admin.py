@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+from collections import Counter
+
 from django.contrib import admin, messages
 from django.db.models import QuerySet
 from django.http import HttpRequest
 
 from unfold.admin import ModelAdmin
 
+from apps.billing.ports import resolve_event_port
+from apps.billing.services import BillingError, cancel_event_registration
 from apps.events.models import Event, EventRegistration
-from apps.events.services import cancel_registration, confirm_registration
+from apps.events.services import (
+    cancel_registration,
+    confirm_registration,
+    has_online_payment,
+)
 
 
 @admin.register(Event)
@@ -34,6 +42,7 @@ class EventRegistrationAdmin(ModelAdmin):
         "parent_name",
         "phone",
         "attendees_count",
+        "amount",
         "status",
         "created_at",
     )
@@ -41,8 +50,9 @@ class EventRegistrationAdmin(ModelAdmin):
     search_fields = ("child_name", "parent_name", "phone", "email")
     list_select_related = ("event",)
     # ПОЧЕМУ: status/attendees_count/event участвуют в инварианте
-    # Event.seats_taken — правки только через сервисы и экшены
-    readonly_fields = ("event", "attendees_count", "status")
+    # Event.seats_taken — правки только через сервисы и экшены; amount —
+    # снимок цены на момент записи, по нему ЛК и выручка
+    readonly_fields = ("event", "attendees_count", "amount", "status")
     actions = ("confirm_selected", "cancel_selected")
 
     def has_add_permission(self, request: HttpRequest) -> bool:
@@ -62,11 +72,22 @@ class EventRegistrationAdmin(ModelAdmin):
         self, request: HttpRequest, queryset: QuerySet[EventRegistration]
     ) -> None:
         ids = list(queryset.values_list("pk", flat=True))
-        confirmed = sum(1 for pk in ids if confirm_registration(pk))
+        online = {pk for pk in ids if has_online_payment(pk)}
+        confirmed = sum(
+            1 for pk in ids if pk not in online and confirm_registration(pk)
+        )
         # ПОЧЕМУ: бронь могла сняться по TTL, пока менеджер держал страницу
         # открытой, — без сообщения он решил бы, что подтвердил её
         self.message_user(request, f"Подтверждено: {confirmed}.")
-        if skipped := len(ids) - confirmed:
+        if online:
+            # ПОЧЕМУ: наличные поверх онлайн-платежа — семья заплатит дважды
+            self.message_user(
+                request,
+                f"Пропущено: {len(online)} — оплачиваются онлайн, "
+                "подтверждаются сами после оплаты.",
+                level=messages.WARNING,
+            )
+        if skipped := len(ids) - len(online) - confirmed:
             self.message_user(
                 request,
                 f"Пропущено: {skipped} — уже подтверждены или отменены.",
@@ -77,5 +98,43 @@ class EventRegistrationAdmin(ModelAdmin):
     def cancel_selected(
         self, request: HttpRequest, queryset: QuerySet[EventRegistration]
     ) -> None:
+        # ПОЧЕМУ поштучно: у каждой брони своя короткая транзакция — пачка под
+        # одной держала бы локи всех событий сразу
+        counts: Counter[str] = Counter()
+        event_port = resolve_event_port()
         for registration_id in queryset.values_list("pk", flat=True):
-            cancel_registration(registration_id)
+            if not has_online_payment(registration_id):
+                counts[
+                    "canceled" if cancel_registration(registration_id) else "skipped"
+                ] += 1
+                continue
+            try:
+                outcome = cancel_event_registration(
+                    registration_id,
+                    event_port=event_port,
+                    canceled_by=request.user.get_username(),
+                )
+            except BillingError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+                continue
+            counts[outcome] += 1
+
+        refunded = counts["REFUND_QUEUED"]
+        self.message_user(
+            request,
+            f"Отменено: {counts['canceled'] + refunded}, "
+            f"поставлено возвратов: {refunded}.",
+        )
+        if awaiting := counts["AWAITING_PAYMENT"]:
+            self.message_user(
+                request,
+                f"Пропущено: {awaiting} — ждут онлайн-оплаты и снимутся сами "
+                "примерно через 20 минут, если не оплатят.",
+                level=messages.WARNING,
+            )
+        if skipped := counts["skipped"] + counts["ALREADY_CANCELED"]:
+            self.message_user(
+                request,
+                f"Пропущено: {skipped} — уже отменены.",
+                level=messages.WARNING,
+            )

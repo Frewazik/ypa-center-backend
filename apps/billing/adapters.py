@@ -68,6 +68,11 @@ class RefundInfo:
     status: RefundStatus
 
 
+# ПОЧЕМУ: страница результата одна, а ручек статуса две — для гостевой оплаты
+# события фронт узнаёт из адреса возврата, что звать публичную ручку
+ReturnKind = Literal["checkout", "event"]
+
+
 @dataclass(frozen=True)
 class CreatedPayment:
     id: str
@@ -85,6 +90,7 @@ class PaymentGateway(Protocol):
         transaction_id: str,
         idempotence_key: str,
         description: str,
+        return_kind: ReturnKind,
     ) -> CreatedPayment:
         # ПОЧЕМУ: metadata.transaction_id — единственная связь платежа
         # провайдера с нашей транзакцией при верификации вебхука
@@ -183,6 +189,7 @@ class YookassaHttpGateway:
         transaction_id: str,
         idempotence_key: str,
         description: str,
+        return_kind: ReturnKind,
     ) -> CreatedPayment:
         body = {
             "amount": {
@@ -192,8 +199,8 @@ class YookassaHttpGateway:
             "capture": True,
             "confirmation": {
                 "type": "redirect",
-                "return_url": _return_url_for(
-                    self._settings.return_url, transaction_id
+                "return_url": return_url_for(
+                    self._settings.return_url, transaction_id, return_kind
                 ),
             },
             "description": description,
@@ -340,15 +347,25 @@ def _raise_for_client_error(payment_id: str, response: httpx.Response) -> None:
         )
 
 
-def _return_url_for(base_url: str, transaction_id: str) -> str:
+def event_return_url(transaction_id: str) -> str:
+    # ПОЧЕМУ ignore: shop_id/secret_key заполняет pydantic-settings из env
+    settings = YookassaSettings()  # type: ignore[call-arg]
+    return return_url_for(settings.return_url, transaction_id, "event")
+
+
+def return_url_for(base_url: str, transaction_id: str, kind: ReturnKind) -> str:
     # ПОЧЕМУ: страница результата узнаёт, какой заказ опрашивать, только из
     # адреса возврата. Собираем через urlsplit, а не склейкой «?tx=» — в
     # настроенном адресе уже могут быть свои параметры и #фрагмент
     parts = urlsplit(base_url)
     query = [
-        (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "tx"
+        (k, v)
+        for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if k not in ("tx", "kind")
     ]
     query.append(("tx", transaction_id))
+    if kind == "event":
+        query.append(("kind", "event"))
     return urlunsplit(parts._replace(query=urlencode(query)))
 
 

@@ -732,9 +732,9 @@ def _event_bookings(
                 date=event_start.date(),
                 start_time=event_start.time(),
                 end_time=event_end.time(),
-                # ПОЧЕМУ не снапшот: цены в регистрации нет, а модель не
-                # меняем — после смены цены события карточка покажет новую
-                cost=event.price * registration.attendees_count,
+                # ПОЧЕМУ снимок брони, а не цена события: менеджер мог сменить
+                # цену после записи — семья видит, сколько бронь стоила
+                cost=registration.amount,
                 child_name=registration.child_name,
                 student_id=None,
                 attendees_count=registration.attendees_count,

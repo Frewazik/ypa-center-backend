@@ -29,6 +29,7 @@ from apps.billing.tests.test_billing import (
     _make_pending_payment,
 )
 from apps.billing.tests.test_trials import _trial_checkout
+from apps.events.ports import DjangoEventBookingPort
 
 _SETTINGS = YookassaSettings(shop_id="test-shop", secret_key="test-secret")
 _PAYMENT_ID = "2e8f3c1a-000f-5000-9000-1db2a1a1e0c1"
@@ -178,7 +179,9 @@ class TestSweeperReconciliationOverHttp:
             return httpx.Response(200, json=payment)
 
         sweep_stale_pending_transactions(
-            gateway=_gateway(handler), schedule_port=FakeSchedulePort()
+            gateway=_gateway(handler),
+            schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
         )
 
         assert (
@@ -233,8 +236,15 @@ class TestReturnUrlCarriesTransaction:
         assert confirmation["return_url"].endswith(f"?tx={result.transaction_id}")
 
     def test_existing_query_and_fragment_survive(self) -> None:
-        url = adapters._return_url_for(
-            "https://site.ru/checkout/result?utm=ya&tx=old#top", "abc"
+        url = adapters.return_url_for(
+            "https://site.ru/checkout/result?utm=ya&tx=old#top", "abc", "checkout"
         )
 
         assert url == "https://site.ru/checkout/result?utm=ya&tx=abc#top"
+
+    def test_event_return_url_marks_kind(self) -> None:
+        url = adapters.return_url_for(
+            "https://site.ru/checkout/result?kind=old", "abc", "event"
+        )
+
+        assert url == "https://site.ru/checkout/result?tx=abc&kind=event"

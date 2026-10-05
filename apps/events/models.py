@@ -92,6 +92,9 @@ class EventRegistration(models.Model):
     attendees_count = models.PositiveSmallIntegerField(
         "Количество участников", default=1
     )
+    # ПОЧЕМУ снимок: цена события меняется, а ЛК и выручка должны видеть,
+    # сколько бронь стоила в момент записи (цена × места; бесплатная — 0)
+    amount = models.IntegerField("Сумма брони, в копейках")
     source = models.CharField("Откуда узнали", max_length=100, blank=True)
     comment = models.TextField("Комментарий", blank=True)
     status = models.CharField(
@@ -112,6 +115,10 @@ class EventRegistration(models.Model):
             models.CheckConstraint(
                 condition=Q(attendees_count__gte=1),
                 name="event_registration_attendees_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(amount__gte=0),
+                name="event_registration_amount_non_negative",
             ),
             # ПОЧЕМУ: одна активная запись на номер в рамках события — иначе
             # скрипт выкупал бесплатное событие повторными заявками

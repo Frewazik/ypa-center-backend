@@ -285,6 +285,8 @@ if _enable_throttling:
         "public_forms_callback": "3/min",
         "public_forms_feedback": "3/min",
         "events_registration": "3/min",
+        # ПОЧЕМУ: экран результата оплаты опрашивает статус раз в 2 секунды
+        "event_payment_status": "60/min",
         # ПОЧЕМУ: за одним IP сидят абоненты мобильного оператора (CGNAT)
         # и родители на Wi-Fi ресепшена. Ящик жертвы бережёт лимит по email
         "otp_request_ip": "30/hour",
@@ -301,6 +303,7 @@ else:
         "public_forms_callback": None,
         "public_forms_feedback": None,
         "events_registration": None,
+        "event_payment_status": None,
         "otp_request_ip": None,
         "otp_request_email": None,
         "otp_verify_ip": None,
@@ -349,6 +352,14 @@ SPECTACULAR_SETTINGS = {
     # Токен из Authorize переживает перезагрузку страницы; у каждой ручки
     # своя ссылка (#/profile/me_profile) — удобно кидать в чат
     "SWAGGER_UI_SETTINGS": {"persistAuthorization": True, "deepLinking": True},
+    # ПОЧЕМУ: экраны результата оплаты (свой и гостевой для события) отдают
+    # одни и те же исход и причину возврата — один enum на оба для фронта
+    "ENUM_NAME_OVERRIDES": {
+        "CheckoutOutcomeStatusEnum": (
+            "apps.billing.serializers.CHECKOUT_OUTCOME_STATUS_CHOICES"
+        ),
+        "RefundReasonEnum": "apps.billing.serializers.REFUND_REASON_CHOICES",
+    },
     # Порядок групп в Swagger. Новая ручка обязана получить один из этих
     # тегов — проверяет apps/core/tests/test_openapi_schema.py
     "TAGS": [
@@ -358,7 +369,7 @@ SPECTACULAR_SETTINGS = {
         {
             "name": "forms",
             "description": "Заявки с сайта: звонок, обратная связь, регистрация "
-            "на событие. Вход необязателен",
+            "на событие и онлайн-оплата платного события. Вход необязателен",
         },
         {"name": "profile", "description": "Анкета родителя и дети"},
         {
