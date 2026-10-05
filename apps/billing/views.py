@@ -6,7 +6,6 @@ import uuid
 from collections.abc import Mapping
 from typing import cast
 
-from asgiref.sync import async_to_sync
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status
@@ -51,6 +50,7 @@ from apps.billing.services import (
     get_checkout_outcome,
 )
 from apps.billing.tasks import verify_and_process_payment
+from apps.core.queue import kiq_sync
 from apps.users.models import Parent
 from apps.users.permissions import IsProfileCompleted
 
@@ -342,9 +342,9 @@ class YookassaWebhookView(APIView):
         serializer.is_valid(raise_exception=True)
         payment_id: str = serializer.validated_data["object"]["id"]
 
-        # ПОЧЕМУ: Taskiq-брокер использует async/await
-        # вызов из синхронного Django-view требует обертки async_to_sync
-        async_to_sync(verify_and_process_payment.kiq)(payment_id)
+        # ПОЧЕМУ kiq_sync, а не kiq_safely: сбой брокера должен дойти до 500,
+        # иначе ЮКасса не повторит вебхук
+        kiq_sync(verify_and_process_payment, payment_id)
         return Response({"status": "accepted"}, status=status.HTTP_200_OK)
 
 
