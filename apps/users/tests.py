@@ -849,9 +849,72 @@ class TestAuthTokenRefreshView:
         )
         assert resp.status_code == 401
 
+    def test_refresh_of_deleted_parent_returns_401_auth_required(
+        self, api_client: APIClient
+    ) -> None:
+        parent = ParentFactory(email="deleted_refresh@example.com")
+        refresh = str(RefreshToken.for_user(parent))
+        parent.delete()
+
+        resp = api_client.post(
+            "/api/v1/auth/token/refresh/",
+            {"refresh": refresh},
+            content_type="application/json",
+        )
+        assert resp.status_code == 401
+        assert resp.json()["code"] == "AUTH_REQUIRED"
+
+    def test_refresh_of_inactive_parent_returns_401_auth_required(
+        self, api_client: APIClient
+    ) -> None:
+        parent = ParentFactory(email="inactive_refresh@example.com", is_active=False)
+
+        resp = api_client.post(
+            "/api/v1/auth/token/refresh/",
+            {"refresh": str(RefreshToken.for_user(parent))},
+            content_type="application/json",
+        )
+        assert resp.status_code == 401
+        assert resp.json()["code"] == "AUTH_REQUIRED"
+
 
 @pytest.mark.django_db
 class TestAuthLogoutView:
+    def test_logout_with_expired_access_header_blacklists_refresh(
+        self, api_client: APIClient
+    ) -> None:
+        parent = ParentFactory(email="expired_logout@example.com")
+        refresh = str(RefreshToken.for_user(parent))
+        access = AccessToken.for_user(parent)
+        access.set_exp(lifetime=-timedelta(seconds=1))
+
+        resp = api_client.post(
+            "/api/v1/auth/logout/",
+            {"refresh": refresh},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {access}",
+        )
+        assert resp.status_code == 205
+
+        refresh_resp = api_client.post(
+            "/api/v1/auth/token/refresh/",
+            {"refresh": refresh},
+            content_type="application/json",
+        )
+        assert refresh_resp.status_code == 401
+
+    def test_logout_with_invalid_refresh_returns_401_not_403(
+        self, api_client: APIClient
+    ) -> None:
+        resp = api_client.post(
+            "/api/v1/auth/logout/",
+            {"refresh": "invalid.jwt.token"},
+            content_type="application/json",
+        )
+        assert resp.status_code == 401
+        assert resp.json()["code"] == "AUTH_REQUIRED"
+        assert resp.headers["WWW-Authenticate"].startswith("Bearer")
+
     def test_logout_blacklists_refresh_token(self, api_client: APIClient) -> None:
         parent = ParentFactory(email="logout_user@example.com")
         refresh = RefreshToken.for_user(parent)
