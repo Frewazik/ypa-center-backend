@@ -23,6 +23,8 @@ _DRF_CODE_TO_CATALOG: dict[str, str] = {
     "not_authenticated": "AUTH_REQUIRED",
     "authentication_failed": "AUTH_REQUIRED",
     "token_not_valid": "AUTH_REQUIRED",
+    # refresh удалённого/деактивированного — фронту нужно лишь «на вход»
+    "no_active_account": "AUTH_REQUIRED",
     "permission_denied": "FORBIDDEN_RESOURCE",
     "not_found": "NOT_FOUND",
     "throttled": "RATE_LIMITED",

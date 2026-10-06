@@ -6,6 +6,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenRefreshView
@@ -15,6 +16,7 @@ from apps.users.serializers import (
     LogoutSerializer,
     OTPRequestSerializer,
     OTPVerifySerializer,
+    TokenRefreshSerializer,
 )
 from apps.users.throttling import (
     AuthLogoutThrottle,
@@ -154,13 +156,23 @@ class OTPVerifyView(APIView):
     tags=["auth"],
 )
 class AuthTokenRefreshView(TokenRefreshView):
+    serializer_class = TokenRefreshSerializer
     permission_classes = ()
     throttle_classes = [AuthTokenRefreshThrottle]
 
 
 class LogoutView(APIView):
+    # ПОЧЕМУ: владение доказывает refresh в теле; с JWT по умолчанию
+    # протухший access в заголовке давал 401 до ручки, и refresh не
+    # аннулировался — «выйти» на общем компьютере не срабатывало
+    authentication_classes = ()
     permission_classes = [AllowAny]
     throttle_classes = [AuthLogoutThrottle]
+
+    def get_authenticate_header(self, request: Request) -> str:
+        # ПОЧЕМУ: без классов аутентификации DRF превращает 401 от InvalidToken
+        # в 403 — ему нечего положить в WWW-Authenticate. Так же делает TokenViewBase
+        return JWTAuthentication().authenticate_header(request)
 
     @extend_schema(
         request=LogoutSerializer,
