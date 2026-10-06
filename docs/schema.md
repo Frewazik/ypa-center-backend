@@ -40,7 +40,8 @@ erDiagram
 
 **parent** — кастомная модель пользователя (AUTH_USER_MODEL). `email` (unique, логин),
 `full_name`, `phone` (PhoneNumberField), `referral_source` («откуда узнали», enum-строка,
-пусто до анкеты), `pd_consent_at` (дата согласия на обработку ПД из анкеты, `NULL` —
+пусто до анкеты; `UNKNOWN` — у всех, у кого поле было пустым на момент миграции
+`users.0005`), `pd_consent_at` (дата согласия на обработку ПД из анкеты, `NULL` —
 не давалось), `comments`, `is_active`, `is_staff`. Паролей у
 родителей нет (unusable password), пароль есть только у staff для входа в админку.
 Анкета заполнена, когда непусты `full_name`, `phone`, `referral_source` и `pd_consent_at`
@@ -63,7 +64,8 @@ erDiagram
 Детали — `personal-data.md`.
 
 **magic_tokens** — OTP-коды входа: `email`, `code` (6 цифр), `attempts_count`,
-`expires_at`, `is_used`. Составные индексы `(is_used, expires_at)` и
+`expires_at`, `is_used`, `created_at` (по нему cooldown 60 с). Составные индексы
+`(is_used, expires_at)` и
 `(email, -created_at)` под выборку последнего кода и чистку протухших.
 
 **teacher_profile** — 1:1 к пользователю: `middle_name`, `photo_url`, `position`,
