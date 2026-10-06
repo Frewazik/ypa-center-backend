@@ -12,7 +12,8 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from apps.content.tests.factories import GalleryImageFactory
-from apps.events.tests.factories import EventFactory
+from apps.events.models import RegistrationStatus
+from apps.events.tests.factories import EventFactory, EventRegistrationFactory
 from apps.schedule.tests.factories import (
     ActivityFactory,
     EnrollmentFactory,
@@ -24,6 +25,7 @@ from apps.schedule.tests.factories import (
 
 if TYPE_CHECKING:
     from pytest_django import DjangoAssertNumQueries
+    from pytest_django.fixtures import DjangoCaptureOnCommitCallbacks
 
 pytestmark = pytest.mark.django_db
 
@@ -33,6 +35,18 @@ GALLERY_URL = "/api/v1/public/gallery/"
 EVENTS_URL = "/api/v1/public/events/"
 PLANS_URL = "/api/v1/public/plans/"
 CATALOG_URL = "/api/v1/public/activities/"
+_REGISTRATION_PAYLOAD: dict[str, object] = {
+    "child_name": "Миша",
+    "parent_name": "Ольга",
+    "phone": "+79991234567",
+    "email": "olga@example.com",
+    "attendees_count": 2,
+    "pd_consent": True,
+}
+
+
+def _register_url(event_id: int) -> str:
+    return f"/api/v1/public/events/{event_id}/register/"
 
 
 def _detail_url(activity_id: int) -> str:
@@ -374,6 +388,67 @@ class TestPublicEvents:
         assert payload["is_free"] is False
         assert payload["is_upcoming"] is True
         assert payload["capacity"] == 20
+
+    @pytest.mark.parametrize(
+        ("capacity", "taken", "expected_free"),
+        [(20, 0, 20), (20, 3, 17), (2, 2, 0)],
+        ids=["empty", "partial", "full"],
+    )
+    def test_seats_free_reflects_active_registrations(
+        self, api_client: APIClient, capacity: int, taken: int, expected_free: int
+    ) -> None:
+        event = EventFactory(capacity=capacity)
+        if taken:
+            EventRegistrationFactory(
+                event=event,
+                attendees_count=taken,
+                status=RegistrationStatus.CONFIRMED,
+            )
+        EventRegistrationFactory(
+            event=event, attendees_count=1, status=RegistrationStatus.CANCELED
+        )
+
+        payload = api_client.get(EVENTS_URL).json()[0]
+
+        assert payload["capacity"] == capacity
+        assert payload["seats_free"] == expected_free
+
+    def test_seats_free_decreases_after_registration_despite_cache(
+        self,
+        api_client: APIClient,
+        django_capture_on_commit_callbacks: DjangoCaptureOnCommitCallbacks,
+    ) -> None:
+        event = EventFactory(capacity=20)
+        assert api_client.get(EVENTS_URL).json()[0]["seats_free"] == 20
+
+        with django_capture_on_commit_callbacks(execute=True):
+            registered = api_client.post(
+                _register_url(event.pk), _REGISTRATION_PAYLOAD, format="json"
+            )
+
+        assert registered.status_code == status.HTTP_201_CREATED
+        assert api_client.get(EVENTS_URL).json()[0]["seats_free"] == 18
+
+    def test_events_cache_is_invalidated_on_commit_not_on_save(
+        self,
+        api_client: APIClient,
+        django_capture_on_commit_callbacks: DjangoCaptureOnCommitCallbacks,
+    ) -> None:
+        # !!!: регресс-тест гонки: сброс до коммита давал параллельному запросу
+        # закэшировать старый остаток на весь TTL
+        event = EventFactory(capacity=20)
+        api_client.get(EVENTS_URL)
+
+        with django_capture_on_commit_callbacks(execute=False) as callbacks:
+            api_client.post(
+                _register_url(event.pk), _REGISTRATION_PAYLOAD, format="json"
+            )
+            before_commit = api_client.get(EVENTS_URL).json()[0]["seats_free"]
+        for callback in callbacks:
+            callback()
+
+        assert before_commit == 20
+        assert api_client.get(EVENTS_URL).json()[0]["seats_free"] == 18
 
 
 class TestPublicPlans:

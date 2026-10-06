@@ -156,6 +156,8 @@ class SubscriptionPlanPublicSerializer(serializers.ModelSerializer[SubscriptionP
 class EventPublicSerializer(serializers.ModelSerializer[Event]):
     is_free = serializers.BooleanField(read_only=True)
     is_upcoming = serializers.BooleanField(read_only=True)
+    # ПОЧЕМУ: остаток считает бэк — фронт не знает, какие брони держат места
+    seats_free = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = Event
@@ -169,6 +171,7 @@ class EventPublicSerializer(serializers.ModelSerializer[Event]):
             "price",
             "is_free",
             "capacity",
+            "seats_free",
             "is_upcoming",
         )
 

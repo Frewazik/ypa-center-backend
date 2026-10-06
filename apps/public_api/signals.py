@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from django.db import transaction
 from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 from django.urls import reverse
@@ -66,7 +67,10 @@ def on_gallery_change(
 @receiver(post_save, sender=Event)
 @receiver(post_delete, sender=Event)
 def on_event_change(sender: type[Event], instance: Event, **kwargs: object) -> None:
-    invalidate_payload_cache("events", reverse("public_api:events-list"))
+    # ПОЧЕМУ после коммита: seats_taken меняется в транзакции брони — сброс до
+    # коммита давал параллельному запросу закэшировать старый остаток на весь TTL
+    path = reverse("public_api:events-list")
+    transaction.on_commit(lambda: invalidate_payload_cache("events", path))
 
 
 @receiver(post_save, sender=SubscriptionPlan)
