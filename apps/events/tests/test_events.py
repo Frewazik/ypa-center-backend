@@ -13,8 +13,8 @@ from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.test import APIClient
 
 from apps.billing.ports import EventPriceChangedError
-from apps.events.admin import EventRegistrationAdmin
-from apps.events.models import EventRegistration, RegistrationStatus
+from apps.events.admin import EventAdmin, EventRegistrationAdmin
+from apps.events.models import Event, EventRegistration, RegistrationStatus
 from apps.events.services import (
     pending_payment_ttl,
     RegistrationSubmission,
@@ -293,6 +293,30 @@ class TestEventRegistrationAdminGuards:
         assert {"event", "attendees_count", "status"} <= set(
             registration_admin.readonly_fields
         )
+
+
+class TestEventAdminSave:
+    def test_edit_keeps_seats_booked_after_form_was_loaded(self) -> None:
+        # !!!: регресс-тест lost update: полный save() из формы записывал
+        # seats_taken, прочитанный до параллельной брони, — места продавались дважды
+        event = EventFactory(capacity=20)
+        event_admin = EventAdmin(Event, AdminSite())
+        request = RequestFactory().post("/admin/events/event/")
+        loaded_by_admin = Event.objects.get(pk=event.pk)
+
+        register_for_event(event.pk, _submission(attendees_count=2))
+        loaded_by_admin.title = "Новое название"
+        form = event_admin.get_form(request, loaded_by_admin)(instance=loaded_by_admin)
+        event_admin.save_model(request, loaded_by_admin, form, change=True)
+
+        event.refresh_from_db()
+        assert event.title == "Новое название"
+        assert event.seats_taken == 2
+
+    def test_seats_taken_is_readonly(self) -> None:
+        event_admin = EventAdmin(Event, AdminSite())
+
+        assert "seats_taken" in event_admin.readonly_fields
 
 
 class TestRegistrationParentBinding:

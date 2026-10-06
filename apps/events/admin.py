@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections import Counter
+from typing import Final
 
 from django.contrib import admin, messages
 from django.db.models import QuerySet
+from django.forms import ModelForm
 from django.http import HttpRequest
 
 from unfold.admin import ModelAdmin
@@ -15,6 +17,12 @@ from apps.events.services import (
     cancel_registration,
     confirm_registration,
     has_online_payment,
+)
+
+_EVENT_ADMIN_EDITABLE_FIELDS: Final[tuple[str, ...]] = tuple(
+    field.name
+    for field in Event._meta.concrete_fields
+    if not field.primary_key and field.name != "seats_taken"
 )
 
 
@@ -32,6 +40,17 @@ class EventAdmin(ModelAdmin):
     search_fields = ("title",)
     ordering = ("-start_datetime",)
     readonly_fields = ("seats_taken",)
+
+    def save_model(
+        self, request: HttpRequest, obj: Event, form: ModelForm[Event], change: bool
+    ) -> None:
+        if not change:
+            super().save_model(request, obj, form, change)
+            return
+        # ПОЧЕМУ: полный save() записал бы seats_taken, прочитанный при отправке
+        # формы, поверх брони, закоммиченной за это время, — места продались бы
+        # дважды. Счётчик меняют только сервисы events под локом события
+        obj.save(update_fields=_EVENT_ADMIN_EDITABLE_FIELDS)
 
 
 @admin.register(EventRegistration)
