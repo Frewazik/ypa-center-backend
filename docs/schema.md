@@ -190,8 +190,11 @@ erDiagram
 
 **event** — `title`, `description`, `cover_image`, `start_datetime`,
 `duration_minutes`, `price` (0 = бесплатно), `capacity`, `seats_taken` —
-денормализованный счётчик под `select_for_update`. Check-констрейнты:
-`seats_taken <= capacity`, неотрицательность.
+денормализованный счётчик под `select_for_update`. Check-констрейнты: `price >= 0`,
+`capacity >= 1`; `seats_taken` неотрицателен (`PositiveIntegerField`). Ограничения
+`seats_taken <= capacity` в БД нет: менеджер может уменьшить вместимость ниже уже
+занятых мест — новые брони тогда не пройдут проверку сервиса, а остаток
+(`Event.seats_free`) покажет 0, а не отрицательное число.
 
 **event_registration** — гостевая запись: `event` FK (`PROTECT`), `parent` (nullable —
 единственное анонимное действие в системе; при удалении родителя обнуляется), контакты,
