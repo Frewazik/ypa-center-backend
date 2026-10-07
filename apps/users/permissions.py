@@ -18,7 +18,6 @@ class ProfileIncomplete(PermissionDenied):
     # ПОЧЕМУ: отдельный класс, а не PermissionDenied с message — обработчик
     # ошибок строит `type` из имени класса, и фронт отличает этот 403
     # от «чужого ребёнка» уже сейчас: urn:problem-type:profileincomplete.
-    # default_code станет полем `code`, когда в обработчик вернётся code
     default_detail = (
         "Заполните анкету: ФИО, телефон, «откуда вы о нас узнали» "
         "и согласие на обработку персональных данных."

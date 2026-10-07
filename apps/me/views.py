@@ -79,7 +79,13 @@ _ONBOARDING_PERMISSIONS = [IsAuthenticated]
     patch=extend_schema(
         operation_id="me_profile_update",
         summary="Изменить анкету родителя",
-        responses=ProfileSerializer,
+        responses={
+            status.HTTP_200_OK: ProfileSerializer,
+            status.HTTP_401_UNAUTHORIZED: OpenApiResponse(description="Нет входа"),
+            status.HTTP_422_UNPROCESSABLE_ENTITY: OpenApiResponse(
+                description="Ошибка валидации полей анкеты"
+            ),
+        },
         tags=["profile"],
     ),
 )
@@ -97,7 +103,13 @@ class ProfileView(generics.RetrieveUpdateAPIView[Parent]):
         operation_id="me_child_create",
         summary="Добавить ребёнка",
         request=ChildSerializer,
-        responses={status.HTTP_201_CREATED: ChildSerializer},
+        responses={
+            status.HTTP_201_CREATED: ChildSerializer,
+            status.HTTP_401_UNAUTHORIZED: OpenApiResponse(description="Нет входа"),
+            status.HTTP_422_UNPROCESSABLE_ENTITY: OpenApiResponse(
+                description="Ошибка валидации полей ребёнка"
+            ),
+        },
         tags=["profile"],
     )
 )

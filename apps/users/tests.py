@@ -15,6 +15,8 @@ from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 
 from apps.users.constants import (
     OTP_COOLDOWN_SECONDS,
+    OTP_EMAIL_HOURLY_LIMIT,
+    OTP_EMAIL_LIMIT_WINDOW_SECONDS,
     OTP_MAX_ATTEMPTS,
     OTP_USED_RETENTION_DAYS,
 )
@@ -516,7 +518,8 @@ class TestOTPThrottling:
     def test_ip_limit_is_softer_than_email_limit(self) -> None:
         # ПОЧЕМУ: за одним IP — абоненты мобильного оператора (CGNAT) и Wi-Fi
         # ресепшена; строгим остаётся лимит по email, он бережёт ящик жертвы
-        assert _hourly_limit("otp_request_email") == 5
+        assert OTP_EMAIL_HOURLY_LIMIT == 5
+        assert OTP_EMAIL_LIMIT_WINDOW_SECONDS == 60 * 60
         assert _hourly_limit("otp_request_ip") == 30
 
     def test_valid_token_does_not_bypass_ip_limit(self, api_client: APIClient) -> None:
@@ -567,11 +570,11 @@ class TestOTPThrottling:
         assert resp.status_code == 429
         assert MagicTokens.objects.filter(email="hourly@example.com").count() == 5
 
-    def test_request_per_email_limit_survives_ip_rotation(
+    def test_request_per_email_limit_survives_ip_rotation_and_case(
         self, api_client: APIClient
     ) -> None:
         # ПОЧЕМУ: лимит по email отсекает ботов, ротирующих IP-адреса
-        with patch("apps.users.views.request_otp"):
+        with patch("apps.users.services.send_otp_email_task"):
             for i in range(5):
                 resp = api_client.post(
                     "/api/v1/auth/otp/request/",
@@ -580,6 +583,7 @@ class TestOTPThrottling:
                     REMOTE_ADDR=f"10.0.0.{i + 1}",
                 )
                 assert resp.status_code == 202
+                _backdate_token("victim@example.com", OTP_COOLDOWN_SECONDS + 1)
 
             resp = api_client.post(
                 "/api/v1/auth/otp/request/",
@@ -589,6 +593,73 @@ class TestOTPThrottling:
             )
 
         assert resp.status_code == 429
+        assert resp.json()["code"] == "RATE_LIMITED"
+
+    def test_cooldown_rejections_do_not_consume_email_limit(
+        self, api_client: APIClient
+    ) -> None:
+        # ПОЧЕМУ: лимит — 5 отправленных кодов, а не 5 нажатий «ещё раз»;
+        # раньше 1 код + 4 ранних повтора запирали email на час
+        with patch("apps.users.services.send_otp_email_task"):
+            statuses = [
+                api_client.post(
+                    "/api/v1/auth/otp/request/",
+                    {"email": "impatient@example.com"},
+                    content_type="application/json",
+                    REMOTE_ADDR=f"10.2.0.{i + 1}",
+                ).status_code
+                for i in range(5)
+            ]
+            _backdate_token("impatient@example.com", OTP_COOLDOWN_SECONDS + 1)
+            resp = api_client.post(
+                "/api/v1/auth/otp/request/",
+                {"email": "impatient@example.com"},
+                content_type="application/json",
+                REMOTE_ADDR="10.2.0.99",
+            )
+
+        assert statuses == [202, 429, 429, 429, 429]
+        assert resp.status_code == 202
+
+    def test_email_limit_retry_after_points_to_window_release(
+        self, api_client: APIClient
+    ) -> None:
+        email = "window@example.com"
+        now = timezone.now()
+        for minutes_ago in (50, 40, 30, 20, 10):
+            token = MagicTokensFactory(email=email, is_used=True)
+            MagicTokens.objects.filter(pk=token.pk).update(
+                created_at=now - timedelta(minutes=minutes_ago)
+            )
+
+        resp = api_client.post(
+            "/api/v1/auth/otp/request/",
+            {"email": email},
+            content_type="application/json",
+        )
+
+        assert resp.status_code == 429
+        # самый старый код выйдет из часового окна через ~10 минут
+        assert 595 <= int(resp["Retry-After"]) <= 600
+        assert MagicTokens.objects.filter(email=email).count() == 5
+
+    def test_codes_older_than_window_do_not_count(self, api_client: APIClient) -> None:
+        email = "old@example.com"
+        for _ in range(5):
+            token = MagicTokensFactory(email=email, is_used=True)
+            MagicTokens.objects.filter(pk=token.pk).update(
+                created_at=timezone.now()
+                - timedelta(seconds=OTP_EMAIL_LIMIT_WINDOW_SECONDS + 1)
+            )
+
+        with patch("apps.users.services.send_otp_email_task"):
+            resp = api_client.post(
+                "/api/v1/auth/otp/request/",
+                {"email": email},
+                content_type="application/json",
+            )
+
+        assert resp.status_code == 202
 
     def test_verify_per_ip_limit_blocks_code_spray(self, api_client: APIClient) -> None:
         # ПОЧЕМУ: отсекаем спрей-атаку (перебор кодов по разным ящикам с одного IP)
@@ -615,10 +686,11 @@ class TestOTPThrottling:
 
 @pytest.mark.django_db
 class TestPurgeStaleOtpTokens:
-    def test_deletes_expired_unused_immediately(self) -> None:
+    def test_deletes_expired_unused_after_email_limit_window(self) -> None:
         MagicTokensFactory(
             email="dead@example.com",
-            expires_at=timezone.now() - timedelta(minutes=1),
+            expires_at=timezone.now()
+            - timedelta(seconds=OTP_EMAIL_LIMIT_WINDOW_SECONDS + 60),
         )
         alive = MagicTokensFactory(
             email="alive@example.com",
@@ -630,6 +702,19 @@ class TestPurgeStaleOtpTokens:
         assert result.expired_unused == 1
         assert not MagicTokens.objects.filter(email="dead@example.com").exists()
         assert MagicTokens.objects.filter(pk=alive.pk).exists()
+
+    def test_keeps_expired_unused_inside_email_limit_window(self) -> None:
+        # ПОЧЕМУ: по этим строкам считается лимит «5 кодов в час» — удалив
+        # протухший код раньше, чистка подарила бы шестой код в том же часе
+        recent = MagicTokensFactory(
+            email="recent_dead@example.com",
+            expires_at=timezone.now() - timedelta(minutes=1),
+        )
+
+        result = purge_stale_otp_tokens()
+
+        assert result.expired_unused == 0
+        assert MagicTokens.objects.filter(pk=recent.pk).exists()
 
     def test_used_tokens_respect_retention_window(self) -> None:
         ancient = MagicTokensFactory(
@@ -744,7 +829,11 @@ class TestOTPVerifyView:
                 content_type="application/json",
             )
         assert resp.status_code == 401
-        assert resp.json()["code"] == "OTP_INVALID"
+        data = resp.json()
+        assert data["code"] == "OTP_INVALID"
+        assert data["status"] == 401
+        assert data["type"] == "urn:problem-type:otpinvalid"
+        assert "request_id" in data["extensions"]
 
     def test_expired_token_returns_same_response_as_wrong_code(
         self, api_client: APIClient
@@ -764,17 +853,43 @@ class TestOTPVerifyView:
             )
 
         assert resp_expired.status_code == resp_invalid.status_code == 401
-        assert resp_expired.json() == resp_invalid.json()
+        expired, invalid = resp_expired.json(), resp_invalid.json()
+        # request_id у каждого запроса свой
+        expired.pop("extensions")
+        invalid.pop("extensions")
+        assert expired == invalid
 
-    def test_returns_429_on_brute_force(self, api_client: APIClient) -> None:
-        with patch("apps.users.views.verify_otp", side_effect=OTPBruteForceError):
-            resp = api_client.post(
-                "/api/v1/auth/otp/verify/",
-                {"email": "v@example.com", "code": "000000"},
+    def test_returns_429_attempts_exceeded_without_retry_after(
+        self, api_client: APIClient
+    ) -> None:
+        with patch("apps.users.services.send_otp_email_task"):
+            api_client.post(
+                "/api/v1/auth/otp/request/",
+                {"email": "brute@example.com"},
                 content_type="application/json",
             )
+        for _ in range(OTP_MAX_ATTEMPTS):
+            api_client.post(
+                "/api/v1/auth/otp/verify/",
+                {"email": "brute@example.com", "code": "000000"},
+                content_type="application/json",
+            )
+        token = MagicTokens.objects.get(email="brute@example.com")
+
+        resp = api_client.post(
+            "/api/v1/auth/otp/verify/",
+            {"email": "brute@example.com", "code": token.code},
+            content_type="application/json",
+        )
+
         assert resp.status_code == 429
-        assert resp.json()["code"] == "RATE_LIMITED"
+        data = resp.json()
+        # ПОЧЕМУ: свой код — фронт должен предложить новый код, а не ждать:
+        # у 429 от лимита по IP код RATE_LIMITED и есть Retry-After
+        assert data["code"] == "OTP_ATTEMPTS_EXCEEDED"
+        assert data["status"] == 429
+        assert "request_id" in data["extensions"]
+        assert "Retry-After" not in resp
 
     def test_returns_422_on_non_digit_code(self, api_client: APIClient) -> None:
         resp = api_client.post(

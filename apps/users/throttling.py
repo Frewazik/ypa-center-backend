@@ -13,21 +13,6 @@ class OTPRequestPerIPThrottle(ClientIPRateThrottle):
     scope = "otp_request_ip"
 
 
-class OTPRequestPerEmailThrottle(SimpleRateThrottle):
-    scope = "otp_request_email"
-
-    def get_cache_key(self, request: Request, view: APIView) -> str | None:
-        email = request.data.get("email")
-        if not isinstance(email, str) or not email.strip():
-            # ПОЧЕМУ: возврат None отключает правило для запроса. Пустые email упадут дальше на валидации сериализатора.
-            return None
-
-        return self.cache_format % {
-            "scope": self.scope,
-            "ident": email.strip().lower(),
-        }
-
-
 class OTPVerifyPerIPThrottle(ClientIPRateThrottle):
     scope = "otp_verify_ip"
 

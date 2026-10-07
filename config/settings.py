@@ -290,7 +290,6 @@ if _enable_throttling:
         # ПОЧЕМУ: за одним IP сидят абоненты мобильного оператора (CGNAT)
         # и родители на Wi-Fi ресепшена. Ящик жертвы бережёт лимит по email
         "otp_request_ip": "30/hour",
-        "otp_request_email": "5/hour",
         "otp_verify_ip": "10/min",
         "auth_token_refresh": "60/min",
         "auth_logout": "60/min",
@@ -305,7 +304,6 @@ else:
         "events_registration": None,
         "event_payment_status": None,
         "otp_request_ip": None,
-        "otp_request_email": None,
         "otp_verify_ip": None,
         "auth_token_refresh": None,
         "auth_logout": None,
