@@ -66,6 +66,7 @@ class ProfileSerializer(serializers.ModelSerializer[Parent]):
     pd_consent = pd_consent_field()
     pd_consent_at = serializers.DateTimeField(
         read_only=True,
+        allow_null=True,
         help_text="Когда дано согласие на обработку ПД; null — галочку надо показать",
     )
     profile_completed = serializers.BooleanField(

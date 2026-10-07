@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import secrets
 import string
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ from apps.core.locks import text_lock_key, try_advisory_xact_lock
 from apps.core.queue import kiq_safely
 from apps.users.constants import (
     OTP_COOLDOWN_SECONDS,
+    OTP_EMAIL_HOURLY_LIMIT,
+    OTP_EMAIL_LIMIT_WINDOW_SECONDS,
     OTP_LENGTH,
     OTP_MAX_ATTEMPTS,
     OTP_TTL_MINUTES,
@@ -98,15 +101,28 @@ def request_otp(email: str) -> None:
                 retry_after=OTP_COOLDOWN_SECONDS,
             )
 
-        last_token = (
-            MagicTokens.objects.filter(email=email)
+        window_start = now - timedelta(seconds=OTP_EMAIL_LIMIT_WINDOW_SECONDS)
+        # ПОЧЕМУ: лимит считает отправленные коды (строки MagicTokens), а не
+        # запросы — отказы по cooldown не съедают часовой лимит. Под той же
+        # advisory-блокировкой, что и cooldown, поэтому без гонки
+        recent_created = list(
+            MagicTokens.objects.filter(email=email, created_at__gt=window_start)
             .order_by("-created_at")
-            .values("created_at")
-            .first()
+            .values_list("created_at", flat=True)[:OTP_EMAIL_HOURLY_LIMIT]
         )
 
-        if last_token is not None and last_token["created_at"] > cooldown_threshold:
-            elapsed = (now - last_token["created_at"]).total_seconds()
+        if len(recent_created) >= OTP_EMAIL_HOURLY_LIMIT:
+            released_at = recent_created[-1] + timedelta(
+                seconds=OTP_EMAIL_LIMIT_WINDOW_SECONDS
+            )
+            remaining = max(1, math.ceil((released_at - now).total_seconds()))
+            raise OTPCooldownError(
+                f"Лимит кодов в час исчерпан, повтор через {remaining} с",
+                retry_after=remaining,
+            )
+
+        if recent_created and recent_created[0] > cooldown_threshold:
+            elapsed = (now - recent_created[0]).total_seconds()
             remaining = max(1, OTP_COOLDOWN_SECONDS - int(elapsed))
             raise OTPCooldownError(
                 f"Повторный запрос доступен через {remaining} с",
@@ -191,9 +207,11 @@ def verify_otp(email: str, code: str) -> LoginResult:
 def purge_stale_otp_tokens() -> PurgeResult:
     now = timezone.now()
 
+    # ПОЧЕМУ: протухший код живёт, пока он в окне лимита «5 кодов в час» —
+    # иначе чистка удаляла бы последний код и дарила шестой в том же часе
     expired_unused, _ = MagicTokens.objects.filter(
         is_used=False,
-        expires_at__lt=now,
+        expires_at__lt=now - timedelta(seconds=OTP_EMAIL_LIMIT_WINDOW_SECONDS),
     ).delete()
 
     retention_threshold = now - timedelta(days=OTP_USED_RETENTION_DAYS)

@@ -21,7 +21,6 @@ from apps.users.serializers import (
 from apps.users.throttling import (
     AuthLogoutThrottle,
     AuthTokenRefreshThrottle,
-    OTPRequestPerEmailThrottle,
     OTPRequestPerIPThrottle,
     OTPVerifyPerIPThrottle,
 )
@@ -41,14 +40,19 @@ class OTPRequestView(APIView):
     # запрос считался бы «не анонимным» и мог обходить IP-лимит
     authentication_classes = ()
     permission_classes = [AllowAny]
-    throttle_classes = [OTPRequestPerIPThrottle, OTPRequestPerEmailThrottle]
+    # ПОЧЕМУ: лимит по email — в request_otp по отправленным кодам; счётчик
+    # запросов по email запирал бы чужой ящик серией запросов за секунду
+    throttle_classes = [OTPRequestPerIPThrottle]
 
     @extend_schema(
         request=OTPRequestSerializer,
         responses={
             202: OpenApiResponse(description="Код отправлен на email"),
-            400: OpenApiResponse(description="Ошибка валидации формата email"),
-            429: OpenApiResponse(description="Cooldown: повторный запрос слишком рано"),
+            422: OpenApiResponse(description="Ошибка валидации формата email"),
+            429: OpenApiResponse(
+                description="RATE_LIMITED + Retry-After: cooldown 60 с, "
+                "5 кодов в час на email или лимит по IP"
+            ),
         },
         summary="Запрос OTP-кода",
         tags=["auth"],
@@ -78,6 +82,22 @@ class OTPRequestView(APIView):
         )
 
 
+# ПОЧЕМУ: APIException, а не AuthenticationFailed — у вьюхи нет классов
+# аутентификации, и DRF превратил бы такой 401 в 403
+class OTPInvalid(exceptions.APIException):
+    status_code = status.HTTP_401_UNAUTHORIZED
+    default_detail = "Неверный или истёкший код."
+    default_code = "OTP_INVALID"
+
+
+# ПОЧЕМУ: свой код, а не RATE_LIMITED — ждать бесполезно, код больше не
+# примут, фронт должен предложить запросить новый (Retry-After нет)
+class OTPAttemptsExceeded(exceptions.APIException):
+    status_code = status.HTTP_429_TOO_MANY_REQUESTS
+    default_detail = "Превышен лимит попыток ввода кода. Запросите новый код."
+    default_code = "OTP_ATTEMPTS_EXCEEDED"
+
+
 class OTPVerifyView(APIView):
     authentication_classes = ()
     permission_classes = [AllowAny]
@@ -99,9 +119,13 @@ class OTPVerifyView(APIView):
                     ),
                 },
             ),
-            400: OpenApiResponse(description="Ошибка валидации формата полей"),
-            401: OpenApiResponse(description="Неверный или истёкший код"),
-            429: OpenApiResponse(description="Превышен лимит попыток"),
+            422: OpenApiResponse(description="Ошибка валидации формата полей"),
+            401: OpenApiResponse(description="OTP_INVALID: неверный или истёкший код"),
+            429: OpenApiResponse(
+                description="OTP_ATTEMPTS_EXCEEDED: 5 неверных попыток, нужен "
+                "новый код (без Retry-After); RATE_LIMITED + Retry-After: "
+                "лимит по IP"
+            ),
         },
         summary="Верификация OTP-кода",
         tags=["auth"],
@@ -115,21 +139,12 @@ class OTPVerifyView(APIView):
 
         try:
             tokens = verify_otp(email=email, code=code)
-        except OTPBruteForceError:
-            return Response(
-                {
-                    "code": "RATE_LIMITED",
-                    "detail": "Превышен лимит попыток ввода кода.",
-                },
-                status=status.HTTP_429_TOO_MANY_REQUESTS,
-            )
-        except (OTPNotFoundError, OTPInvalidError, OTPExpiredError):
+        except OTPBruteForceError as exc:
+            raise OTPAttemptsExceeded() from exc
+        except (OTPNotFoundError, OTPInvalidError, OTPExpiredError) as exc:
             # ПОЧЕМУ: разные причины отказа схлопываются в один 401,
             # чтобы закрыть вектор энумерации email
-            return Response(
-                {"code": "OTP_INVALID", "detail": "Неверный или истёкший код."},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
+            raise OTPInvalid() from exc
 
         return Response(
             {
@@ -151,6 +166,7 @@ class OTPVerifyView(APIView):
             },
         ),
         401: OpenApiResponse(description="Невалидный или истёкший refresh-токен"),
+        429: OpenApiResponse(description="Лимит запросов с IP, есть Retry-After"),
     },
     summary="Обновление access-токена",
     tags=["auth"],
@@ -178,8 +194,9 @@ class LogoutView(APIView):
         request=LogoutSerializer,
         responses={
             205: OpenApiResponse(description="Успешный выход, токен аннулирован"),
-            400: OpenApiResponse(description="Ошибка валидации формата полей"),
+            422: OpenApiResponse(description="Ошибка валидации формата полей"),
             401: OpenApiResponse(description="Невалидный или истёкший токен"),
+            429: OpenApiResponse(description="Лимит запросов с IP, есть Retry-After"),
         },
         summary="Выход из системы (аннулирование refresh-токена)",
         tags=["auth"],
