@@ -75,7 +75,8 @@ erDiagram
 
 **activity** — кружок/услуга: `name`, `slug` (unique), `category`, `price`,
 `cover_image`, `short_description`, `description`, `features` (JSON), `tags` (JSON),
-`is_active`, `is_featured`.
+`is_active`. Поля `is_featured` нет — «популярные» на главной считаются по числу записей.
+`price` — цена пробного в копейках (0 — бесплатное).
 
 ## schedule — сетка и коллизии
 
@@ -84,9 +85,13 @@ erDiagram
 **time_slot** — `day_of_week`, `start_time`, `end_time` + check-констрейнты корректности интервала.
 
 **schedule** — группа: FK `activity`, `time_slot`, `teacher` (nullable), `room` (nullable);
-`group_name`, `max_capacity`, `age_min`/`age_max`, `is_active` и денормализованные
+`group_name`, `max_capacity`, `age_min`/`age_max` (nullable; CHECK `age_max >= age_min`),
+`is_active`, `created_at`, `updated_at` и денормализованные
 `day_of_week`, `start_time`, `end_time` — заполняются триггером БД, поэтому переживают
-`bulk_create` и `QuerySet.update`. Два GiST exclusion-констрейнта запрещают пересечение
+`bulk_create` и `QuerySet.update`; правка `time_slot` триггером же переносится во все его
+группы (сигналы Django при этом не срабатывают). Маски привязаны к дате, а не к слоту:
+если сменить день у слота, уже созданные маски на старый день перестают применяться.
+Два GiST exclusion-констрейнта запрещают пересечение
 времени у преподавателя и у кабинета: время суток якорится к константной дате
 (`tsrange`), интервалы полуоткрытые `[)` — смежные занятия 16:00–17:00 и 17:00–18:00
 не конфликтуют.
@@ -218,4 +223,5 @@ erDiagram
 
 **feedback_request** — имя (опционально), `email`, `message`, `status`; тоже с историей.
 
-**gallery_image** — `image_url`, `order`, `is_published`.
+**gallery_image** — `image_url` (готовый CDN-URL), `order`, `is_published`, `created_at`.
+Порядок выдачи — `(order, id)`.
