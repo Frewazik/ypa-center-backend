@@ -36,3 +36,12 @@ def test_checkout_documents_idempotency_header(schema: dict[str, Any]) -> None:
         header = next(p for p in parameters if p["in"] == "header")
         assert header["name"] == "X-Idempotency-Key"
         assert header["required"] is True
+
+
+def test_plan_price_per_session_is_nullable(schema: dict[str, Any]) -> None:
+    # ПОЧЕМУ: у безлимита цены занятия нет — без nullable генератор типов
+    # фронта объявит поле числом и упадёт на null
+    field = schema["components"]["schemas"]["SubscriptionPlanPublic"]["properties"][
+        "price_per_session"
+    ]
+    assert field["nullable"] is True
