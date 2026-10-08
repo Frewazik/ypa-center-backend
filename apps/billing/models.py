@@ -5,6 +5,10 @@ import uuid
 from django.db import models
 from django.db.models import Q
 
+# ПОЧЕМУ: дефолтное значение для снапшота, бизнес-правила могут меняться,
+# поэтому токены жестко фиксируются в БД на момент покупки
+TOKENS_PER_SLOT = 4
+
 
 class SubscriptionStatus(models.TextChoices):
     DRAFT = "DRAFT", "Черновик"
@@ -96,7 +100,7 @@ class SubscriptionPlan(models.Model):
     def price_per_session(self) -> int | None:
         if self.is_unlimited or not self.slots_count:
             return None
-        return round(self.price / self.slots_count)
+        return self.price // (self.slots_count * TOKENS_PER_SLOT)
 
 
 class Subscription(models.Model):

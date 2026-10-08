@@ -456,7 +456,7 @@ class TestPublicPlans:
         SubscriptionPlanFactory(
             name="Безлимит", slots_count=6, price=1_500_000, is_unlimited=True
         )
-        SubscriptionPlanFactory(name="4 занятия", slots_count=4, price=400_000)
+        SubscriptionPlanFactory(name="4 занятия", slots_count=1, price=400_000)
         SubscriptionPlanFactory(name="Скрытый", is_active=False)
 
         response = api_client.get(PLANS_URL)
@@ -467,10 +467,22 @@ class TestPublicPlans:
         assert payload[0]["price_per_session"] == 100_000
         assert payload[1]["price_per_session"] is None
 
+    def test_price_per_session_counts_four_lessons_per_slot(
+        self, api_client: APIClient
+    ) -> None:
+        SubscriptionPlanFactory(name="4 занятия (1 слот)", slots_count=1, price=400_000)
+        SubscriptionPlanFactory(
+            name="8 занятий (2 слота)", slots_count=2, price=700_000
+        )
+
+        payload = api_client.get(PLANS_URL).json()
+
+        assert [plan["price_per_session"] for plan in payload] == [100_000, 87_500]
+
     def test_price_change_is_visible_immediately(self, api_client: APIClient) -> None:
         # !!!: регресс-тест инвалидации кэша по сигналу от БД
         # правка сущности обязана отобразиться на витрине мгновенно, до истечения базового TTL
-        plan = SubscriptionPlanFactory(slots_count=4, price=400_000)
+        plan = SubscriptionPlanFactory(slots_count=1, price=400_000)
         assert api_client.get(PLANS_URL).json()[0]["price"] == 400_000
 
         plan.price = 350_000

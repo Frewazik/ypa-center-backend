@@ -139,7 +139,9 @@ class GalleryImagePublicSerializer(serializers.ModelSerializer[GalleryImage]):
 
 
 class SubscriptionPlanPublicSerializer(serializers.ModelSerializer[SubscriptionPlan]):
-    price_per_session = serializers.IntegerField(read_only=True)
+    # ПОЧЕМУ: у безлимита цены занятия нет — без allow_null схема объявит
+    # поле обязательным числом, и типы фронта не примут null
+    price_per_session = serializers.IntegerField(read_only=True, allow_null=True)
 
     class Meta:
         model = SubscriptionPlan

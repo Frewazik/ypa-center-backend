@@ -39,6 +39,7 @@ from apps.billing.models import (
     SubscriptionPlan,
     SubscriptionSlot,
     SubscriptionStatus,
+    TOKENS_PER_SLOT,
     Transaction,
     TransactionStatus,
 )
@@ -335,14 +336,10 @@ REFUND_STATUSES_AWAITING_MANUAL = frozenset(
 )
 
 
-# ПОЧЕМУ: дефолтное значение для снапшота, бизнес-правила могут меняться,
-# поэтому токены жестко фиксируются в БД на момент покупки
 # ПОЧЕМУ: абонемент действует месяц от первого занятия, но точное окно
 # известно только при подтверждении оплаты. Пять недель гарантированно
 # накрывают этот месяц, куда бы ни попало первое занятие
 _SUBSCRIPTION_SEAT_HORIZON = timedelta(weeks=5)
-
-_TOKENS_PER_SLOT = 4
 
 # ПОЧЕМУ: Контракт §2.1
 _IDEMPOTENCY_RECORD_TTL = timedelta(hours=24)
@@ -1002,8 +999,8 @@ def _fulfill_prepaid_order(tx: Transaction, schedule_port: SchedulePort) -> None
             SubscriptionSlot(
                 subscription_id=subscription_id,
                 slot_id=slot_id,
-                granted_tokens=_TOKENS_PER_SLOT,
-                remaining_tokens=_TOKENS_PER_SLOT,
+                granted_tokens=TOKENS_PER_SLOT,
+                remaining_tokens=TOKENS_PER_SLOT,
             )
             for slot_id in slot_ids
         ]
@@ -1324,8 +1321,8 @@ def _apply_success(
                                     SubscriptionSlot(
                                         subscription_id=subscription_id,
                                         slot_id=slot_id,
-                                        granted_tokens=_TOKENS_PER_SLOT,
-                                        remaining_tokens=_TOKENS_PER_SLOT,
+                                        granted_tokens=TOKENS_PER_SLOT,
+                                        remaining_tokens=TOKENS_PER_SLOT,
                                     )
                                     for slot_id in slot_ids
                                 ]
