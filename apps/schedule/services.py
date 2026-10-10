@@ -5,17 +5,18 @@
 from __future__ import annotations
 
 import datetime
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, TypeAlias
+from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 
-from django.core.exceptions import ValidationError
-from django.db import IntegrityError, models, transaction
+from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
+from django.db import IntegrityError, connection, models, transaction
 from django.db.models import Count, F, Func, Q, Value
 from django.utils import timezone
 
-from apps.billing.selectors import regular_seat_q, trial_seat_q
-from apps.core.locks import advisory_xact_lock
+from apps.billing.selectors import lesson_seat_holders, regular_seat_q, trial_seat_q
+from apps.core.locks import advisory_xact_lock, advisory_xact_lock_many
+from apps.core.queue import kiq_safely
 from apps.schedule.models import DayOfWeek, MaskType, Room, Schedule, ScheduleMask
 
 if TYPE_CHECKING:
@@ -144,6 +145,7 @@ def create_schedule_mask(
                 _lock_resources(landing)
                 _ensure_no_collision(landing, exclude_schedule_id=locked.pk)
             mask.save()
+            _notify_families(locked.pk, target_date, change="created")
     except IntegrityError as exc:
         # Единственный INSERT в транзакции сама маска; FK-существование уже
         # проверено full_clean, реалистичный источник, проигранная гонка на
@@ -311,6 +313,192 @@ def _collided_fields(
         if session.teacher_id is not None and teacher_id == session.teacher_id:
             fields.add("new_teacher")
     return fields
+
+
+LessonChange: TypeAlias = Literal["created", "removed"]
+
+
+def delete_schedule_mask(*, mask_id: int) -> None:
+    # ПОЧЕМУ только будущие даты: на сегодня утренний таск журнала уже открыл
+    # (или не открыл) занятие по маске — «отмена отмены» задним числом
+    # разошлась бы с отметками посещаемости
+    with transaction.atomic():
+        mask = ScheduleMask.objects.select_for_update().filter(pk=mask_id).first()
+        if mask is None:
+            raise ValidationError("Перенос или отмена уже удалены.", code="not_found")
+        if mask.target_date <= timezone.localdate():
+            raise ValidationError(
+                "Удалить можно только перенос или отмену на дату после сегодняшней.",
+                code="invalid",
+            )
+        schedule_id, target_date = mask.schedule_id, mask.target_date
+        mask.delete()
+        _notify_families(schedule_id, target_date, change="removed")
+
+
+def _notify_families(
+    schedule_id: int, target_date: datetime.date, *, change: LessonChange
+) -> None:
+    # ПОЧЕМУ: получатели читаются в той же транзакции, что и правка маски, а
+    # письма ставятся после коммита — по одной задаче на семью, чтобы ретрай
+    # сбойного письма не повторял остальные
+    parent_ids = sorted(
+        set(
+            lesson_seat_holders([schedule_id], on_date=target_date).values_list(
+                "student__parent_id", flat=True
+            )
+        )
+    )
+    if not parent_ids:
+        return
+
+    def enqueue() -> None:
+        # ПОЧЕМУ: локальный импорт — tasks импортирует services на уровне модуля
+        from apps.schedule import tasks
+
+        for parent_id in parent_ids:
+            kiq_safely(
+                tasks.send_lesson_change_email_task,
+                parent_id,
+                schedule_id,
+                target_date.isoformat(),
+                change,
+            )
+
+    transaction.on_commit(enqueue)
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyContact:
+    # ПОЧЕМУ: администратор обзванивает семьи сам (решение бизнеса), поэтому
+    # в админке нужен готовый список с контактами, а не id записей
+    group: str
+    child_name: str
+    parent_name: str
+    phone: str
+    email: str
+    trial_date: datetime.date | None
+
+
+def families_to_warn(
+    schedule_ids: Iterable[int], *, on_date: datetime.date | None
+) -> list[FamilyContact]:
+    return [
+        FamilyContact(
+            group=str(enrollment.schedule),
+            child_name=enrollment.student.full_name,
+            parent_name=enrollment.student.parent.full_name,
+            phone=str(enrollment.student.parent.phone or ""),
+            email=enrollment.student.parent.email,
+            trial_date=enrollment.trial_date,
+        )
+        for enrollment in lesson_seat_holders(schedule_ids, on_date=on_date)
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class GridPlacement:
+    # ПОЧЕМУ: место активной группы в постоянной сетке таким, каким его увидят
+    # exclusion-ограничения БД после сохранения формы. Django их в форме не
+    # проверяет (день и время группы — editable=False копии из слота), и
+    # без этой проверки админка отвечала 500 на IntegrityError
+    label: str
+    day_of_week: int
+    start_time: datetime.time
+    end_time: datetime.time
+    teacher_id: int | None
+    room_id: int | None
+
+
+def validate_grid_change(
+    placements: Sequence[GridPlacement],
+    *,
+    moving_ids: Collection[int],
+    day_changed: bool,
+) -> None:
+    # ПОЧЕМУ под локами: админка выполняет запрос в одной транзакции, и
+    # «проверил → сохранил» атомарно только если локи держатся до коммита.
+    # Порядок общий с create_schedule_mask: строка группы → кабинеты →
+    # преподаватели, иначе встречные правки ловят взаимную блокировку
+    if not connection.in_atomic_block:
+        raise RuntimeError("validate_grid_change вызывается внутри transaction.atomic")
+    list(
+        Schedule.objects.select_for_update()
+        .filter(pk__in=moving_ids)
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
+    advisory_xact_lock_many(
+        _LOCK_NS_ROOM, sorted({p.room_id for p in placements if p.room_id is not None})
+    )
+    advisory_xact_lock_many(
+        _LOCK_NS_TEACHER,
+        sorted({p.teacher_id for p in placements if p.teacher_id is not None}),
+    )
+
+    errors: dict[str, list[str]] = {}
+    if day_changed:
+        errors.update(_future_mask_errors(moving_ids))
+    for placement in placements:
+        for field, message in _grid_conflicts(placement, moving_ids=moving_ids):
+            errors.setdefault(field, []).append(message)
+    if errors:
+        raise ValidationError(errors, code="conflict")
+
+
+def _future_mask_errors(schedule_ids: Collection[int]) -> dict[str, list[str]]:
+    # ПОЧЕМУ: маска ищется по паре (группа, дата), а дата занятия считается
+    # от дня группы. После смены дня маска на старую дату молча перестаёт
+    # применяться — отменённое занятие снова продаётся и открывается в журнале
+    masks = (
+        ScheduleMask.objects.filter(
+            schedule_id__in=schedule_ids, target_date__gte=timezone.localdate()
+        )
+        .select_related("schedule")
+        .order_by("target_date", "pk")
+    )
+    messages = [
+        f"У группы «{mask.schedule}» есть {mask.get_type_display().lower()} на "
+        f"{mask.target_date:%d.%m.%Y} — после смены дня она перестанет "
+        "действовать. Сначала удалите её в «Расписание → Переносы и отмены»."
+        for mask in masks
+    ]
+    return {NON_FIELD_ERRORS: messages} if messages else {}
+
+
+def _grid_conflicts(
+    placement: GridPlacement, *, moving_ids: Collection[int]
+) -> Iterator[tuple[str, str]]:
+    # ПОЧЕМУ: то же условие, что у no_teacher_time_overlap/no_room_time_overlap:
+    # активные группы, без учёта активности кружка и масок — ограничение БД
+    # про них не знает. Проверка на дату с масками — _ensure_no_collision
+    resource = Q(pk__in=[])
+    if placement.teacher_id is not None:
+        resource |= Q(teacher_id=placement.teacher_id)
+    if placement.room_id is not None:
+        resource |= Q(room_id=placement.room_id)
+    occupants = (
+        Schedule.objects.filter(
+            resource,
+            is_active=True,
+            day_of_week=placement.day_of_week,
+            start_time__lt=placement.end_time,
+            end_time__gt=placement.start_time,
+        )
+        .exclude(pk__in=moving_ids)
+        .select_related("activity")
+        .order_by("pk")
+    )
+    prefix = f"«{placement.label}»: " if placement.label else ""
+    for occupant in occupants:
+        busy = f"«{occupant}» ({occupant.activity.name})"
+        if (
+            placement.teacher_id is not None
+            and occupant.teacher_id == placement.teacher_id
+        ):
+            yield "teacher", f"{prefix}Преподаватель занят в это время — группа {busy}."
+        if placement.room_id is not None and occupant.room_id == placement.room_id:
+            yield "room", f"{prefix}Кабинет занят в это время — группа {busy}."
 
 
 def build_week_grid(

@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     # оплату» в админке, прежде чем свипер освободит места
     EVENT_PENDING_PAYMENT_TTL_MINUTES: int = Field(default=30, ge=1)
 
+    # Кабинеты в админке расписания. У центра пока одно пространство —
+    # выключено: поля «Кабинет» и раздел «Кабинеты» скрыты
+    SCHEDULE_ROOMS_ENABLED: bool = False
+
 
 # ПОЧЕМУ ignore: обязательные поля заполняет pydantic-settings из env/.env,
 # mypy без pydantic-плагина видит их как незаполненные аргументы конструктора
@@ -446,6 +450,7 @@ TELEGRAM_MANAGER_CHAT_ID = _env.TELEGRAM_MANAGER_CHAT_ID
 ADMIN_BASE_URL = _env.ADMIN_BASE_URL
 
 EVENT_PENDING_PAYMENT_TTL_MINUTES = _env.EVENT_PENDING_PAYMENT_TTL_MINUTES
+SCHEDULE_ROOMS_ENABLED = _env.SCHEDULE_ROOMS_ENABLED
 
 # ПОЧЕМУ: шаблон входа Unfold не передаёт скрытое поле next — вход со страницы
 # /admin/login/ без ?next уводил на дефолтный /accounts/profile/ (404)

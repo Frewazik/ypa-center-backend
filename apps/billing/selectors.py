@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import datetime
+from collections.abc import Iterable
 
 from django.db.models import Q, QuerySet
 from django.db.models.expressions import Combinable
@@ -23,6 +24,7 @@ from django.utils import timezone
 from apps.billing.models import (
     Attendance,
     AttendanceStatus,
+    Enrollment,
     EnrollmentStatus,
     EnrollmentType,
 )
@@ -84,4 +86,20 @@ def attendances_awaiting_debit() -> QuerySet[Attendance]:
         token_debited=False,
         enrollment__status=EnrollmentStatus.ENROLLED,
         enrollment__subscription__isnull=False,
+    )
+
+
+def lesson_seat_holders(
+    schedule_ids: Iterable[int], *, on_date: datetime.date | None
+) -> QuerySet[Enrollment]:
+    """Кого касается правка занятия: постоянный состав групп и пробные.
+
+    on_date задана — пробные строго на эту дату (разовая отмена или перенос).
+    Не задана — все ещё не состоявшиеся пробные (группа переезжает насовсем).
+    """
+    return (
+        Enrollment.objects.filter(schedule_id__in=list(schedule_ids))
+        .filter(regular_seat_q() | trial_seat_q(on_date=on_date))
+        .select_related("student__parent", "schedule__activity")
+        .order_by("schedule_id", "student__full_name", "pk")
     )
