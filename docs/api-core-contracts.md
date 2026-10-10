@@ -1020,7 +1020,8 @@ POST /api/v1/checkout/trial          (auth required + анкета)
 #### Афиша событий
 
 `GET /api/v1/public/events/` — опубликованные события: будущие и прошедшие за последние
-7 дней, по возрастанию `start_datetime`, без пагинации. Вход не нужен.
+7 дней, по возрастанию `start_datetime`, без пагинации. Вход не нужен. Время — в
+поясе центра (Новосибирск, `+07:00`).
 
 ```json
 [
@@ -1029,7 +1030,7 @@ POST /api/v1/checkout/trial          (auth required + анкета)
     "title": "Мастер-класс по керамике",
     "description": "...",
     "cover_image": "https://cdn.example.com/events/12.jpg",
-    "start_datetime": "2026-10-20T15:00:00+03:00",
+    "start_datetime": "2026-10-20T15:00:00+07:00",
     "duration_minutes": 90,
     "price": 150000,
     "is_free": false,
