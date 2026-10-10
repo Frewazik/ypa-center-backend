@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import pytest
+from django.contrib.auth.models import Group
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import override_settings
 from django.utils import timezone
 
-from apps.billing.models import Subscription, SubscriptionPlan, SubscriptionSlot
+from apps.billing.models import (
+    Attendance,
+    AttendanceStatus,
+    Enrollment,
+    EnrollmentType,
+    Subscription,
+    SubscriptionPlan,
+    SubscriptionSlot,
+    Transaction,
+    TransactionStatus,
+)
 from apps.catalog.models import Activity
 from apps.content.models import GalleryImage
 from apps.events.models import Event
@@ -42,12 +53,69 @@ class TestSeedDemo:
 
         parent = Parent.objects.get(email="parent@demo.ru")
         assert Student.objects.filter(parent=parent).count() == 2
-        subscription = Subscription.objects.get(parent=parent)
+        # ПОЧЕМУ distinct: у абонемента Мирона две записи — JOIN дублирует строку
+        subscription = Subscription.objects.distinct().get(
+            enrollments__student__full_name="Синяев Мирон"
+        )
         assert SubscriptionSlot.objects.filter(subscription=subscription).count() == 2
+        # ПОЧЕМУ: без оплат и посещений дашборд и эти разделы админки пусты на демо
+        assert Transaction.objects.filter(
+            status=TransactionStatus.SUCCEEDED, subscription=subscription
+        ).exists()
+        assert Attendance.objects.filter(enrollment__subscription=subscription).exists()
 
         admin = Parent.objects.get(email="admin@demo.ru")
         assert admin.is_superuser
         assert admin.check_password("admin123")
+
+    def test_several_families_with_purchases_and_trials(self, seeded: None) -> None:
+        assert Parent.objects.filter(email__endswith="@demo.ru").count() >= 16
+        assert Student.objects.count() == 24
+        assert Enrollment.objects.filter(type=EnrollmentType.TRIAL).count() == 2
+
+    def test_slot_tokens_match_attended_lessons(self, seeded: None) -> None:
+        # ПОЧЕМУ: отметка «присутствовал» обязана списать фишку слота,
+        # пропуск — нет; иначе ЛК покажет остаток, не сходящийся с журналом
+        for slot in SubscriptionSlot.objects.all():
+            attended = Attendance.objects.filter(
+                enrollment__subscription_id=slot.subscription_id,
+                enrollment__schedule_id=slot.slot_id,
+                status=AttendanceStatus.ATTENDED,
+                token_debited=True,
+            ).count()
+            assert slot.remaining_tokens == slot.granted_tokens - attended
+
+    def test_payments_spread_over_last_month(self, seeded: None) -> None:
+        days = {
+            timezone.localtime(created_at).date()
+            for created_at in Transaction.objects.values_list("created_at", flat=True)
+        }
+        today = timezone.localdate()
+        assert len(days) >= 10
+        assert all((today - day).days <= 30 for day in days)
+
+    def test_restores_teacher_group_permissions_after_flush(self, settings) -> None:
+        # ПОЧЕМУ: flush стирает права, выданные миграцией journal/0002
+        Group.objects.filter(name="Учителя").delete()
+        settings.DEBUG = True
+
+        call_command("seed_demo")
+
+        group = Group.objects.get(name="Учителя")
+        assert group.permissions.filter(codename="change_lesson").exists()
+        assert group.permissions.filter(codename="change_attendance").exists()
+
+    def test_teachers_can_log_into_admin(self, seeded: None) -> None:
+        for profile in TeacherProfile.objects.select_related("user"):
+            assert profile.user.is_staff
+            assert profile.user.check_password("teacher123")
+
+    def test_children_fit_age_range_of_their_groups(self, seeded: None) -> None:
+        for enrollment in Enrollment.objects.select_related("student", "schedule"):
+            schedule = enrollment.schedule
+            age = (timezone.localdate() - enrollment.student.dob).days // 365
+            if schedule.age_min is not None and schedule.age_max is not None:
+                assert schedule.age_min <= age <= schedule.age_max, enrollment
 
     def test_second_run_is_idempotent(self, seeded: None) -> None:
         call_command("seed_demo")
@@ -57,7 +125,9 @@ class TestSeedDemo:
         assert SubscriptionPlan.objects.count() == 6
         assert Event.objects.count() == 4
         assert GalleryImage.objects.count() == 6
-        assert Subscription.objects.filter(parent__email="parent@demo.ru").count() == 1
+        # ПОЧЕМУ 2: у демо-родителя по абонементу на каждого из двух детей
+        assert Subscription.objects.filter(parent__email="parent@demo.ru").count() == 2
+        assert Student.objects.count() == 24
 
     def test_refuses_outside_debug(self) -> None:
         # ПОЧЕМУ: сиды содержат фиксированный пароль админа —

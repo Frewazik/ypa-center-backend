@@ -1,21 +1,28 @@
 from __future__ import annotations
 
 import datetime
+import importlib
 from typing import TypedDict
 
 from django.conf import settings
-from django.contrib.auth.models import Group
+from django.contrib.auth.models import Group, Permission
 from django.core.management.base import BaseCommand, CommandError, CommandParser
 from django.db import transaction
 from django.utils import timezone
 
 from apps.billing.models import (
+    Attendance,
+    AttendanceCommentTag,
+    AttendanceStatus,
     Enrollment,
+    EnrollmentType,
     EnrollmentStatus,
     Subscription,
     SubscriptionPlan,
     SubscriptionSlot,
     SubscriptionStatus,
+    Transaction,
+    TransactionStatus,
 )
 from apps.catalog.models import Activity
 from apps.content.models import GalleryImage
@@ -32,6 +39,9 @@ from apps.users.models import Parent, ReferralSource, Student, TeacherProfile
 DEMO_ADMIN_EMAIL = "admin@demo.ru"
 DEMO_ADMIN_PASSWORD = "admin123"  # noqa: S105 — демо-стенд, не секрет
 DEMO_PARENT_EMAIL = "parent@demo.ru"
+# ПОЧЕМУ пароль у педагогов: админка пускает только по паролю, а журнал
+# учителя живёт в админке — без него роль «Учителя» на демо не проверить
+DEMO_TEACHER_PASSWORD = "teacher123"  # noqa: S105 — демо-стенд, не секрет
 TEACHER_GROUP_NAME = "Учителя"
 
 # Источник всех фактов ниже — docs/project-context.md §3 «Каталог центра сейчас»
@@ -319,6 +329,250 @@ _BASE_SESSION_PRICE = 120_000
 _GroupKey = tuple[str, int, datetime.time]
 
 
+class _ChildSeed(TypedDict):
+    full_name: str
+    age: int
+    grade: str
+    groups: list[_GroupKey]
+    trial: _GroupKey | None
+
+
+class _FamilySeed(TypedDict):
+    email: str
+    full_name: str
+    phone: str
+    referral: ReferralSource
+    children: list[_ChildSeed]
+
+
+def _child(
+    full_name: str,
+    age: int,
+    grade: str,
+    groups: list[_GroupKey],
+    trial: _GroupKey | None = None,
+) -> _ChildSeed:
+    return {
+        "full_name": full_name,
+        "age": age,
+        "grade": grade,
+        "groups": groups,
+        "trial": trial,
+    }
+
+
+def _thinking(day: int, hour: int) -> _GroupKey:
+    return (_THINKING_SLUG, day, datetime.time(hour, 0))
+
+
+_ENGLISH_GRADE_0: _GroupKey = (_ENGLISH_SLUG, _SATURDAY, datetime.time(13, 30))
+_ENGLISH_GRADE_1: _GroupKey = (_ENGLISH_SLUG, 0, datetime.time(13, 0))
+_ENGLISH_GRADE_2: _GroupKey = (_ENGLISH_SLUG, 1, datetime.time(17, 0))
+_ENGLISH_GRADES_3_5_TUE: _GroupKey = (_ENGLISH_SLUG, 1, datetime.time(16, 0))
+_ENGLISH_GRADES_3_5_FRI: _GroupKey = (_ENGLISH_SLUG, 4, datetime.time(16, 0))
+_ENGLISH_HOMEWORK: _GroupKey = (_ENGLISH_SLUG, 4, datetime.time(17, 0))
+_THINKING_SATURDAY: _GroupKey = (_THINKING_SLUG, _SATURDAY, datetime.time(11, 0))
+
+# ПОЧЕМУ выдуманные семьи: это клиенты-заглушки для показа админки, а не
+# данные центра. Группы ребёнка подобраны по классу и без накладок по времени;
+# число групп ребёнка = число слотов его тарифа
+_FAMILIES: list[_FamilySeed] = [
+    {
+        "email": DEMO_PARENT_EMAIL,
+        "full_name": "Синяева Елена",
+        "phone": "+79991234567",
+        "referral": ReferralSource.FRIENDS,
+        "children": [
+            _child("Синяев Мирон", 8, "2", [_thinking(0, 16), _ENGLISH_GRADE_2]),
+            _child("Имажап Очур-Бады", 6, "", [_ENGLISH_GRADE_0]),
+        ],
+    },
+    {
+        "email": "a.kuznetsova@demo.ru",
+        "full_name": "Кузнецова Анна",
+        "phone": "+79992000001",
+        "referral": ReferralSource.SOCIAL,
+        "children": [
+            _child(
+                "Кузнецов Артём", 10, "4", [_thinking(2, 17), _ENGLISH_GRADES_3_5_FRI]
+            ),
+            _child("Кузнецова Полина", 7, "1", [_ENGLISH_GRADE_1]),
+        ],
+    },
+    {
+        "email": "s.petrov@demo.ru",
+        "full_name": "Петров Сергей",
+        "phone": "+79992000002",
+        "referral": ReferralSource.MAPS,
+        "children": [
+            _child(
+                "Петрова Алиса", 9, "3", [_thinking(3, 16), _ENGLISH_GRADES_3_5_TUE]
+            ),
+        ],
+    },
+    {
+        "email": "o.smirnova@demo.ru",
+        "full_name": "Смирнова Ольга",
+        "phone": "+79992000003",
+        "referral": ReferralSource.SEARCH,
+        "children": [
+            _child("Смирнов Глеб", 12, "6", [_thinking(0, 17), _thinking(3, 17)]),
+        ],
+    },
+    {
+        "email": "m.ivanova@demo.ru",
+        "full_name": "Иванова Марина",
+        "phone": "+79992000004",
+        "referral": ReferralSource.SCHOOL,
+        "children": [
+            _child("Иванов Лев", 8, "2", [_ENGLISH_GRADE_2, _THINKING_SATURDAY]),
+            _child("Иванова Ева", 6, "0", [_ENGLISH_GRADE_0]),
+        ],
+    },
+    {
+        "email": "a.fedorov@demo.ru",
+        "full_name": "Фёдоров Алексей",
+        "phone": "+79992000005",
+        "referral": ReferralSource.SIGN,
+        "children": [
+            _child(
+                "Фёдорова Ксения",
+                11,
+                "5",
+                [_thinking(2, 15), _ENGLISH_GRADES_3_5_FRI, _ENGLISH_HOMEWORK],
+            ),
+        ],
+    },
+    {
+        "email": "d.morozova@demo.ru",
+        "full_name": "Морозова Дарья",
+        "phone": "+79992000006",
+        "referral": ReferralSource.FRIENDS,
+        "children": [_child("Морозов Тимур", 7, "1", [_thinking(1, 15)])],
+    },
+    {
+        "email": "t.volkova@demo.ru",
+        "full_name": "Волкова Татьяна",
+        "phone": "+79992000007",
+        "referral": ReferralSource.SOCIAL,
+        "children": [
+            _child("Волков Даниил", 14, "8", [_thinking(4, 17), _thinking(0, 16)]),
+            _child("Волкова Мила", 9, "3", [_ENGLISH_GRADES_3_5_FRI]),
+        ],
+    },
+    {
+        "email": "e.novikova@demo.ru",
+        "full_name": "Новикова Екатерина",
+        "phone": "+79992000008",
+        "referral": ReferralSource.MAPS,
+        "children": [
+            # Только пришли: пробное на Кружок Мышления и ребёнок без записей
+            _child("Новиков Матвей", 10, "4", [], trial=_thinking(2, 16)),
+            _child("Новикова Вера", 8, "2", []),
+        ],
+    },
+    {
+        "email": "n.sokolova@demo.ru",
+        "full_name": "Соколова Наталья",
+        "phone": "+79992000009",
+        "referral": ReferralSource.SEARCH,
+        "children": [
+            _child("Соколов Егор", 9, "3", [_thinking(0, 15), _ENGLISH_GRADES_3_5_TUE]),
+            _child("Соколова Варя", 7, "1", [_ENGLISH_GRADE_1]),
+        ],
+    },
+    {
+        "email": "i.lebedev@demo.ru",
+        "full_name": "Лебедев Игорь",
+        "phone": "+79992000010",
+        "referral": ReferralSource.FRIENDS,
+        "children": [_child("Лебедева София", 13, "7", [_thinking(2, 17)])],
+    },
+    {
+        "email": "y.kozlova@demo.ru",
+        "full_name": "Козлова Юлия",
+        "phone": "+79992000011",
+        "referral": ReferralSource.SOCIAL,
+        "children": [
+            _child("Козлов Макар", 8, "2", [_ENGLISH_GRADE_2, _thinking(3, 15)]),
+        ],
+    },
+    {
+        "email": "r.orlova@demo.ru",
+        "full_name": "Орлова Регина",
+        "phone": "+79992000012",
+        "referral": ReferralSource.SCHOOL,
+        "children": [
+            _child(
+                "Орлов Никита", 11, "5", [_ENGLISH_GRADES_3_5_FRI, _thinking(4, 15)]
+            ),
+            _child("Орлова Даша", 6, "0", [_ENGLISH_GRADE_0]),
+        ],
+    },
+    {
+        "email": "v.popov@demo.ru",
+        "full_name": "Попов Виктор",
+        "phone": "+79992000013",
+        "referral": ReferralSource.MAPS,
+        "children": [
+            _child(
+                "Попов Кирилл",
+                15,
+                "9",
+                [_thinking(1, 17), _thinking(3, 17), _THINKING_SATURDAY],
+            ),
+        ],
+    },
+    {
+        "email": "a.zaitseva@demo.ru",
+        "full_name": "Зайцева Алёна",
+        "phone": "+79992000014",
+        "referral": ReferralSource.SIGN,
+        "children": [
+            _child("Зайцева Ника", 10, "4", [_ENGLISH_GRADES_3_5_TUE]),
+            # Пробное на английский для младшего брата
+            _child("Зайцев Федя", 8, "2", [], trial=_ENGLISH_GRADE_2),
+        ],
+    },
+    {
+        "email": "k.belova@demo.ru",
+        "full_name": "Белова Кристина",
+        "phone": "+79992000015",
+        "referral": ReferralSource.FRIENDS,
+        "children": [_child("Белов Артемий", 12, "6", [_thinking(2, 16)])],
+    },
+]
+
+# ПОЧЕМУ разные дни: покупки разнесены по последнему месяцу — график
+# платежей и журнал занятий выглядят как живые. Дни берутся по кругу
+_PURCHASE_DAYS_AGO: tuple[int, ...] = (
+    27, 9, 22, 15, 4, 18, 12, 25, 7, 20, 14, 29, 11,
+    24, 6, 17, 21, 8, 26, 13, 19, 10, 23, 16, 28,
+)  # fmt: skip
+_TRIAL_DAYS_AGO: tuple[int, ...] = (2, 5, 1)
+_TOKENS_PER_SLOT = 4
+_THINKING_TOPICS: tuple[str, ...] = (
+    "Логические задачи на взвешивание",
+    "Задачи на переливание",
+    "Графы: кто с кем знаком",
+    "Разбор заданий конкурса «Кенгуру»",
+)
+_ENGLISH_TOPICS: tuple[str, ...] = (
+    "Present Simple: рассказываем о себе",
+    "Семья и друзья: новая лексика",
+    "Читаем короткий рассказ",
+    "Can и can not: что я умею",
+)
+_ATTENDANCE_COMMENTS: tuple[tuple[str, AttendanceCommentTag], ...] = (
+    ("Решал задачи с интересом, помогал соседу.", AttendanceCommentTag.POSITIVE),
+    ("Хорошо работал, к концу занятия устал.", AttendanceCommentTag.NEUTRAL),
+    ("Не сделал домашнее задание, обсудили с ребёнком.", AttendanceCommentTag.NEGATIVE),
+    ("Отлично отвечал устно, словарь растёт.", AttendanceCommentTag.POSITIVE),
+    ("Отвлекался, пересадили ближе к доске.", AttendanceCommentTag.NEGATIVE),
+    ("Первым решил задачу со звёздочкой.", AttendanceCommentTag.POSITIVE),
+)
+
+
 class Command(BaseCommand):
     help = "Наполняет базу демо-данными для локальной разработки и интеграции фронта."
 
@@ -346,12 +600,16 @@ class Command(BaseCommand):
         self._seed_events()
         self._seed_gallery()
         self._seed_form_requests()
-        parent = self._seed_family(groups)
+        parent = self._seed_families(groups)
         if not options.get("no_admin"):
             self._seed_admin()
 
         self.stdout.write(self.style.SUCCESS("Демо-данные загружены."))
         self.stdout.write(f"Админка: {DEMO_ADMIN_EMAIL} / {DEMO_ADMIN_PASSWORD}")
+        teacher_emails = ", ".join(seed["email"] for seed in _TEACHERS)
+        self.stdout.write(
+            f"Педагоги (журнал): {teacher_emails} / {DEMO_TEACHER_PASSWORD}"
+        )
         self.stdout.write(
             f"Демо-родитель: {DEMO_PARENT_EMAIL} — вход по OTP, код появится "
             "в логе backend (консольный email-бэкенд при DEBUG)."
@@ -384,6 +642,15 @@ class Command(BaseCommand):
 
     def _seed_teachers(self) -> dict[str, TeacherProfile]:
         group, _ = Group.objects.get_or_create(name=TEACHER_GROUP_NAME)
+        # ПОЧЕМУ: права группе выдаёт миграция journal/0002, но manage.py flush
+        # их стирает — без этого учитель видит «недостаточно полномочий»
+        for app_label, model, actions in _teacher_group_permissions():
+            group.permissions.add(
+                *Permission.objects.filter(
+                    content_type__app_label=app_label,
+                    codename__in=[f"{action}_{model}" for action in actions],
+                )
+            )
         profiles: dict[str, TeacherProfile] = {}
         for seed in _TEACHERS:
             user = Parent.objects.filter(email=seed["email"]).first()
@@ -392,6 +659,9 @@ class Command(BaseCommand):
                     email=seed["email"], full_name=seed["full_name"], is_staff=True
                 )
             user.groups.add(group)
+            if not user.has_usable_password():
+                user.set_password(DEMO_TEACHER_PASSWORD)
+                user.save(update_fields=["password"])
             # ПОЧЕМУ quote и photo_url пустые: это реальные люди — чужое
             # стоковое лицо и придуманная цитата от их имени недопустимы
             profile, _ = TeacherProfile.objects.update_or_create(
@@ -520,70 +790,180 @@ class Command(BaseCommand):
                 message="Подскажите, есть ли места в группе английского для 2 класса?",
             )
 
-    def _seed_family(self, groups: dict[_GroupKey, Schedule]) -> Parent:
-        parent = Parent.objects.filter(email=DEMO_PARENT_EMAIL).first()
-        if parent is None:
-            parent = Parent.objects.create_user(
-                email=DEMO_PARENT_EMAIL, full_name="Правый лев"
-            )
-            parent.phone = "+79991234567"
-            # Анкета заполнена — иначе демо-ЛК отвечает 403 PROFILE_INCOMPLETE
-            parent.referral_source = ReferralSource.FRIENDS
-            # Демо-данные: согласие проставлено напрямую, без журнала — на
-            # проде оно появляется только из анкеты (apps.users.consent)
-            parent.pd_consent_at = timezone.now()
-            parent.save(update_fields=["phone", "referral_source", "pd_consent_at"])
-
+    def _seed_families(self, groups: dict[_GroupKey, Schedule]) -> Parent:
         today = timezone.localdate()
-        children = [
-            Student.objects.get_or_create(
-                parent=parent,
-                full_name=name,
-                dob=dob,
-                defaults={"school_grade": grade},
-            )[0]
-            for name, dob, grade in (
-                ("Синяев Мирон", datetime.date(2017, 5, 12), "2"),
-                ("Имажап Очур-Бады", datetime.date(2019, 9, 3), ""),
-            )
-        ]
+        demo_parent: Parent | None = None
+        purchases = 0
+        trials = 0
+        for family in _FAMILIES:
+            parent = self._seed_parent(family)
+            if demo_parent is None:
+                demo_parent = parent
+            # ПОЧЕМУ проверка по родителю: дети и абонементы создаются один раз,
+            # повторный прогон не плодит покупки и отметки
+            has_purchases = Enrollment.objects.filter(student__parent=parent).exists()
+            for child in family["children"]:
+                student, _ = Student.objects.get_or_create(
+                    parent=parent,
+                    full_name=child["full_name"],
+                    defaults={
+                        "dob": _birth_date(today, child["age"]),
+                        "school_grade": child["grade"],
+                    },
+                )
+                if has_purchases:
+                    continue
+                if child["groups"]:
+                    days_ago = _PURCHASE_DAYS_AGO[purchases % len(_PURCHASE_DAYS_AGO)]
+                    purchases += 1
+                    self._seed_subscription(
+                        parent,
+                        student,
+                        [groups[key] for key in child["groups"]],
+                        days_ago,
+                    )
+                if child["trial"] is not None:
+                    days_ago = _TRIAL_DAYS_AGO[trials % len(_TRIAL_DAYS_AGO)]
+                    trials += 1
+                    self._seed_trial(parent, student, groups[child["trial"]], days_ago)
+        if demo_parent is None:
+            raise CommandError("В _FAMILIES нет ни одной семьи.")
+        return demo_parent
 
-        if not Subscription.objects.filter(parent=parent).exists():
-            # Мирон во 2 классе: Кружок Мышления Пн 16:00 + английский «2 класс»
-            demo_groups = [
-                groups[(_THINKING_SLUG, 0, datetime.time(16, 0))],
-                groups[(_ENGLISH_SLUG, 1, datetime.time(17, 0))],
-            ]
-            plan = SubscriptionPlan.objects.get(slots_count=2, is_unlimited=False)
-            subscription = Subscription.objects.create(
-                parent=parent,
-                plan=plan,
-                status=SubscriptionStatus.ACTIVE,
-                purchase_price=plan.price,
-                base_session_price=plan.base_session_price,
-                start_date=today,
-                expires_at=timezone.now() + datetime.timedelta(days=30),
-            )
-            for schedule in demo_groups:
-                Enrollment.objects.create(
-                    student=children[0],
-                    subscription=subscription,
-                    schedule=schedule,
-                    status=EnrollmentStatus.ENROLLED,
-                )
-                SubscriptionSlot.objects.create(
-                    subscription=subscription,
-                    slot_id=schedule.pk,
-                    granted_tokens=4,
-                    remaining_tokens=4,
-                )
-            # Занятие на сегодня, чтобы журнал в админке не был пустым
-            Lesson.objects.get_or_create(
-                schedule=demo_groups[0],
-                date=today,
-                defaults={"topic": "Вводное занятие"},
-            )
+    def _seed_parent(self, family: _FamilySeed) -> Parent:
+        parent = Parent.objects.filter(email=family["email"]).first()
+        if parent is not None:
+            return parent
+        parent = Parent.objects.create_user(
+            email=family["email"], full_name=family["full_name"]
+        )
+        parent.phone = family["phone"]
+        # Анкета заполнена — иначе демо-ЛК отвечает 403 PROFILE_INCOMPLETE
+        parent.referral_source = family["referral"]
+        # Демо-данные: согласие проставлено напрямую, без журнала — на
+        # проде оно появляется только из анкеты (apps.users.consent)
+        parent.pd_consent_at = timezone.now()
+        parent.save(update_fields=["phone", "referral_source", "pd_consent_at"])
         return parent
+
+    def _seed_subscription(
+        self,
+        parent: Parent,
+        student: Student,
+        schedules: list[Schedule],
+        days_ago: int,
+    ) -> None:
+        bought_at = timezone.now() - datetime.timedelta(days=days_ago)
+        start_date = timezone.localtime(bought_at).date()
+        plan = SubscriptionPlan.objects.get(
+            slots_count=len(schedules), is_unlimited=False
+        )
+        subscription = Subscription.objects.create(
+            parent=parent,
+            plan=plan,
+            status=SubscriptionStatus.ACTIVE,
+            purchase_price=plan.price,
+            base_session_price=plan.base_session_price,
+            start_date=start_date,
+            expires_at=bought_at + datetime.timedelta(days=30),
+        )
+        tx = Transaction.objects.create(
+            parent=parent,
+            subscription=subscription,
+            amount=plan.price,
+            received_amount=plan.price,
+            status=TransactionStatus.SUCCEEDED,
+            selected_slot_ids=[schedule.pk for schedule in schedules],
+        )
+        # ПОЧЕМУ update: created_at — auto_now_add, а на демо покупки должны
+        # быть разнесены по месяцу, иначе график платежей — один столбик
+        Subscription.objects.filter(pk=subscription.pk).update(created_at=bought_at)
+        Transaction.objects.filter(pk=tx.pk).update(created_at=bought_at)
+        for schedule in schedules:
+            enrollment = Enrollment.objects.create(
+                student=student,
+                subscription=subscription,
+                schedule=schedule,
+                status=EnrollmentStatus.ENROLLED,
+            )
+            Enrollment.objects.filter(pk=enrollment.pk).update(created_at=bought_at)
+            debited = self._seed_lessons(enrollment, schedule, start_date)
+            SubscriptionSlot.objects.create(
+                subscription=subscription,
+                slot_id=schedule.pk,
+                granted_tokens=_TOKENS_PER_SLOT,
+                remaining_tokens=_TOKENS_PER_SLOT - debited,
+            )
+
+    def _seed_lessons(
+        self, enrollment: Enrollment, schedule: Schedule, since: datetime.date
+    ) -> int:
+        topics = (
+            _THINKING_TOPICS
+            if schedule.activity.slug == _THINKING_SLUG
+            else _ENGLISH_TOPICS
+        )
+        dates = _weekly_dates(
+            since,
+            timezone.localdate(),
+            schedule.time_slot.day_of_week,
+            limit=_TOKENS_PER_SLOT,
+        )
+        debited = 0
+        for week, lesson_date in enumerate(dates):
+            Lesson.objects.get_or_create(
+                schedule=schedule,
+                date=lesson_date,
+                defaults={"topic": topics[lesson_date.toordinal() // 7 % len(topics)]},
+            )
+            # ПОЧЕМУ каждое пятое — пропуск: в журнале видны оба исхода,
+            # а у пропуска по уважительной фишка не списывается
+            attended = (enrollment.pk + week) % 5 != 0
+            comment, tag = _ATTENDANCE_COMMENTS[
+                (enrollment.pk + week) % len(_ATTENDANCE_COMMENTS)
+            ]
+            Attendance.objects.create(
+                enrollment=enrollment,
+                date=lesson_date,
+                status=AttendanceStatus.ATTENDED
+                if attended
+                else AttendanceStatus.ABSENT_OK,
+                token_debited=attended,
+                comment=comment if attended else "",
+                comment_tag=tag if attended else AttendanceCommentTag.NEUTRAL,
+            )
+            debited += attended
+        return debited
+
+    def _seed_trial(
+        self,
+        parent: Parent,
+        student: Student,
+        schedule: Schedule,
+        days_ago: int,
+    ) -> None:
+        activity = schedule.activity
+        enrollment = Enrollment.objects.create(
+            student=student,
+            schedule=schedule,
+            type=EnrollmentType.TRIAL,
+            trial_date=_next_weekday_after(
+                timezone.localdate(), schedule.time_slot.day_of_week
+            ),
+            activity=activity,
+            status=EnrollmentStatus.ENROLLED,
+        )
+        tx = Transaction.objects.create(
+            parent=parent,
+            enrollment=enrollment,
+            amount=activity.price,
+            received_amount=activity.price,
+            status=TransactionStatus.SUCCEEDED,
+            selected_slot_ids=[schedule.pk],
+        )
+        Transaction.objects.filter(pk=tx.pk).update(
+            created_at=timezone.now() - datetime.timedelta(days=days_ago)
+        )
 
     def _seed_admin(self) -> None:
         if not Parent.objects.filter(email=DEMO_ADMIN_EMAIL).exists():
@@ -606,3 +986,37 @@ def _upcoming_wednesdays(now: datetime.datetime, count: int) -> list[datetime.da
                 starts.append(start)
         day += datetime.timedelta(days=1)
     return starts
+
+
+def _birth_date(today: datetime.date, age: int) -> datetime.date:
+    # ПОЧЕМУ от сегодняшней даты: фиксированная дата рождения со временем
+    # вывела бы ребёнка из возраста его группы
+    return datetime.date(today.year - age, today.month, 1) - datetime.timedelta(days=60)
+
+
+def _weekly_dates(
+    since: datetime.date, today: datetime.date, weekday: int, *, limit: int
+) -> list[datetime.date]:
+    """Прошедшие даты занятий группы с `since` до вчера, не больше `limit` последних."""
+    day = today - datetime.timedelta(days=1)
+    dates: list[datetime.date] = []
+    while day >= since and len(dates) < limit:
+        if day.weekday() == weekday:
+            dates.append(day)
+        day -= datetime.timedelta(days=1)
+    return sorted(dates)
+
+
+def _next_weekday_after(today: datetime.date, weekday: int) -> datetime.date:
+    day = today + datetime.timedelta(days=1)
+    while day.weekday() != weekday:
+        day += datetime.timedelta(days=1)
+    return day
+
+
+def _teacher_group_permissions() -> list[tuple[str, str, tuple[str, ...]]]:
+    # ПОЧЕМУ импорт из миграции: список прав группы живёт в одном месте;
+    # имя модуля начинается с цифры, поэтому обычный import не подходит
+    migration = importlib.import_module("apps.journal.migrations.0002_teachers_group")
+    permissions: list[tuple[str, str, tuple[str, ...]]] = migration.GROUP_PERMISSIONS
+    return permissions
