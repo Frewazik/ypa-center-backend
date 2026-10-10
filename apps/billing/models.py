@@ -52,10 +52,12 @@ class AttendanceCommentTag(models.TextChoices):
 class SubscriptionPlan(models.Model):
     name = models.CharField("Название", max_length=255)
     slots_count = models.PositiveSmallIntegerField("Число слотов")
-    price = models.IntegerField("Цена, в копейках")
+    # ПОЧЕМУ подписи без «в копейках»: поля редактируются в админке в рублях
+    # (RublesInputModelAdmin), а в БД, как все суммы, — копейки
+    price = models.IntegerField("Цена")
     # ПОЧЕМУ: деление price на slots_count дает плавающую копейку;
     # нужна строгая база для возврата на депозит
-    base_session_price = models.IntegerField("Базовая цена занятия, в копейках")
+    base_session_price = models.IntegerField("Базовая цена занятия")
     is_unlimited = models.BooleanField("Безлимит", default=False)
     is_active = models.BooleanField("Активен", default=True)
 
@@ -138,7 +140,7 @@ class Subscription(models.Model):
         verbose_name_plural = "Абонементы"
 
     def __str__(self) -> str:
-        return f"Subscription #{self.pk} ({self.status})"
+        return f"Абонемент #{self.pk} ({self.get_status_display()})"
 
     @property
     def is_active(self) -> bool:
@@ -172,7 +174,7 @@ class SubscriptionSlot(models.Model):
         ]
 
     def __str__(self) -> str:
-        return f"SubscriptionSlot #{self.pk} (remaining={self.remaining_tokens})"
+        return f"Слот абонемента #{self.pk} (осталось фишек: {self.remaining_tokens})"
 
     @property
     def is_depleted(self) -> bool:
@@ -335,7 +337,7 @@ class Transaction(models.Model):
         ]
 
     def __str__(self) -> str:
-        return f"Transaction {self.pk} ({self.status})"
+        return f"Транзакция {self.pk} ({self.get_status_display()})"
 
     @property
     def is_pending(self) -> bool:
@@ -470,7 +472,10 @@ class Enrollment(models.Model):
         ]
 
     def __str__(self) -> str:
-        return f"Enrollment #{self.pk} ({self.type}, {self.status})"
+        return (
+            f"Запись #{self.pk} ({self.get_type_display()}, "
+            f"{self.get_status_display()})"
+        )
 
     @property
     def is_active(self) -> bool:
@@ -515,7 +520,7 @@ class Attendance(models.Model):
         ]
 
     def __str__(self) -> str:
-        return f"Attendance #{self.pk} ({self.status})"
+        return f"Отметка #{self.pk} ({self.get_status_display()})"
 
 
 class IdempotencyRecord(models.Model):
@@ -537,7 +542,7 @@ class IdempotencyRecord(models.Model):
         verbose_name_plural = "Записи идемпотентности"
 
     def __str__(self) -> str:
-        return f"IdempotencyRecord {self.key}"
+        return f"Ключ идемпотентности {self.key}"
 
 
 class DepositEntryReason(models.TextChoices):
@@ -570,7 +575,7 @@ class ParentDeposit(models.Model):
         ]
 
     def __str__(self) -> str:
-        return f"ParentDeposit #{self.pk} (balance={self.balance})"
+        return f"Депозит #{self.pk} (баланс {self.balance} коп.)"
 
 
 class DepositEntry(models.Model):
@@ -625,4 +630,4 @@ class DepositEntry(models.Model):
         ]
 
     def __str__(self) -> str:
-        return f"DepositEntry #{self.pk} ({self.reason}: {self.amount})"
+        return f"Движение депозита #{self.pk} ({self.get_reason_display()}: {self.amount} коп.)"

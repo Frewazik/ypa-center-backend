@@ -6,10 +6,10 @@ from django import forms
 from django.contrib import admin
 from django.http import HttpRequest
 
-from unfold.admin import ModelAdmin
 from unfold.widgets import UnfoldBooleanWidget
 
 from apps.catalog.models import Activity
+from apps.core.admin import RublesInputModelAdmin
 
 # ПОЧЕМУ развилка: ModelForm[Activity] нужен mypy, а в рантайме класс
 # не подписываемый (параметризация есть только в стабах django-stubs)
@@ -67,13 +67,15 @@ class ActivityChangelistForm(_ActivityModelForm):
 
 
 @admin.register(Activity)
-class ActivityAdmin(ModelAdmin):
+class ActivityAdmin(RublesInputModelAdmin):
     form = ActivityAdminForm
     list_display = ("name", "slug", "category", "price", "is_active")
     list_editable = ("price", "is_active")
     list_filter = ("is_active", "category")
     search_fields = ("name", "slug")
+    search_help_text = "Название или адрес в ссылке"
     prepopulated_fields = {"slug": ("name",)}
+    rubles_fields = {"price": "Цена, ₽"}
 
     def get_changelist_form(
         self, request: HttpRequest, **kwargs: object

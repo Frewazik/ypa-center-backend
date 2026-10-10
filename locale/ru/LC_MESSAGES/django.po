@@ -1,0 +1,163 @@
+# Русский перевод строк django-unfold, у которого нет своего ru-каталога.
+# Только строки, которые встречаются в нашей админке. После правки:
+#   uv run python scripts/compile_messages.py
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: ru\n"
+
+msgid "Welcome back to"
+msgstr "Добро пожаловать в"
+
+msgid "Welcome"
+msgstr "Добро пожаловать"
+
+msgid "Return to site"
+msgstr "Вернуться на сайт"
+
+msgid "Forgotten your password or username?"
+msgstr "Забыли пароль или email?"
+
+msgid "Toggle password visibility"
+msgstr "Показать или скрыть пароль"
+
+msgid "You have been successfully logged out from the administration"
+msgstr "Вы вышли из админки"
+
+msgid "Type to search"
+msgstr "Поиск"
+
+msgid "Search apps and models..."
+msgstr "Поиск по разделам..."
+
+msgid "Recent searches"
+msgstr "Недавние запросы"
+
+msgid "Nothing matched your search"
+msgstr "Ничего не найдено"
+
+msgid "No results found"
+msgstr "Ничего не найдено"
+
+msgid "This page yielded into no results. Create a new item or reset your filters."
+msgstr "Здесь пока пусто. Добавьте запись или сбросьте фильтры."
+
+msgid "No data"
+msgstr "Нет данных"
+
+msgid "Not enough data."
+msgstr "Недостаточно данных."
+
+msgid "All applications"
+msgstr "Все разделы"
+
+msgid "Navigate"
+msgstr "Перейти"
+
+msgid "Select"
+msgstr "Выбрать"
+
+msgid "Select all rows"
+msgstr "Выбрать все строки"
+
+msgid "Expand row"
+msgstr "Развернуть строку"
+
+msgid "Collapse"
+msgstr "Свернуть"
+
+msgid "More actions"
+msgstr "Ещё действия"
+
+msgid "Run the selected action"
+msgstr "Выполнить выбранное действие"
+
+msgid "Select action"
+msgstr "Выберите действие"
+
+msgid "Select action to run"
+msgstr "Выберите действие"
+
+msgid "Select record"
+msgstr "Выберите запись"
+
+msgid "Select value"
+msgstr "Выберите значение"
+
+msgid "Apply Filters"
+msgstr "Применить фильтры"
+
+msgid "Reset filters"
+msgstr "Сбросить фильтры"
+
+msgid "True"
+msgstr "Да"
+
+msgid "False"
+msgstr "Нет"
+
+msgid "Date"
+msgstr "Дата"
+
+msgid "Date from"
+msgstr "Дата с"
+
+msgid "Date to"
+msgstr "Дата по"
+
+msgid "From"
+msgstr "С"
+
+msgid "To"
+msgstr "По"
+
+msgid "Value"
+msgstr "Значение"
+
+msgid "Cancel"
+msgstr "Отмена"
+
+msgid "Click to cancel"
+msgstr "Нажмите, чтобы отменить"
+
+msgid "Submit"
+msgstr "Отправить"
+
+msgid "Go back"
+msgstr "Назад"
+
+msgid "Previous"
+msgstr "Назад"
+
+msgid "Next"
+msgstr "Вперёд"
+
+msgid "General"
+msgstr "Основное"
+
+msgid "Light"
+msgstr "Светлая"
+
+msgid "Dark"
+msgstr "Тёмная"
+
+msgid "System"
+msgstr "Как в системе"
+
+msgid "Add row"
+msgstr "Добавить строку"
+
+msgid "This item will be deleted."
+msgstr "Эта запись будет удалена."
+
+msgid "Click to download"
+msgstr "Нажмите, чтобы скачать"
+
+msgid "Image preview"
+msgstr "Просмотр изображения"
+
+msgid "Choose file to upload"
+msgstr "Выберите файл"
+
+msgid "After you've created a user, you’ll be able to edit more user options."
+msgstr "После создания пользователя можно будет изменить остальные настройки."

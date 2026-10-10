@@ -37,6 +37,7 @@ from apps.billing.models import (
     TransactionStatus,
 )
 from apps.billing.services import REFUND_STATUSES_AWAITING_MANUAL, BillingError
+from apps.core.admin import RublesInputModelAdmin, rubles_column
 
 
 class FreezeSubscriptionActionForm(forms.Form):
@@ -52,7 +53,7 @@ class FreezeSubscriptionActionForm(forms.Form):
 
 
 @admin.register(SubscriptionPlan)
-class SubscriptionPlanAdmin(ModelAdmin):
+class SubscriptionPlanAdmin(RublesInputModelAdmin):
     # ПОЧЕМУ: менять цену тарифа безопасно — активные абонементы считаются
     # по зафиксированному Subscription.purchase_price, витрина инвалидируется
     # сигналом public_api мгновенно
@@ -68,7 +69,12 @@ class SubscriptionPlanAdmin(ModelAdmin):
     list_editable = ("price", "base_session_price", "is_active")
     list_filter = ("is_active", "is_unlimited")
     search_fields = ("name",)
+    search_help_text = "Название тарифа"
     ordering = ("id",)
+    rubles_fields = {
+        "price": "Цена, ₽",
+        "base_session_price": "Базовая цена занятия, ₽",
+    }
 
 
 @admin.register(Subscription)
@@ -78,7 +84,7 @@ class SubscriptionAdmin(ModelAdmin):
         "parent",
         "plan",
         "display_status",
-        "purchase_price",
+        rubles_column("purchase_price", "Цена покупки"),
         "created_at",
         "expires_at",
     )
@@ -89,9 +95,15 @@ class SubscriptionAdmin(ModelAdmin):
     list_select_related = ("parent", "plan")
     autocomplete_fields = ("parent", "plan")
     search_fields = ("parent__email", "parent__full_name", "parent__phone")
+    search_help_text = "Email, ФИО или телефон родителя"
     # ПОЧЕМУ: цены зафиксированы на момент покупки, правка руками
-    # разъедется с суммой транзакции
-    readonly_fields = ("purchase_price", "base_session_price", "created_at")
+    # разъедется с суммой транзакции; показываем их в рублях только для чтения
+    exclude = ("purchase_price", "base_session_price")
+    readonly_fields = (
+        rubles_column("purchase_price", "Цена покупки"),
+        rubles_column("base_session_price", "Базовая цена занятия на момент покупки"),
+        "created_at",
+    )
     actions = ("freeze_subscriptions",)
 
     @display(
@@ -104,8 +116,8 @@ class SubscriptionAdmin(ModelAdmin):
             SubscriptionStatus.CANCELED: "danger",
         },
     )
-    def display_status(self, obj: Subscription) -> str:
-        return obj.status
+    def display_status(self, obj: Subscription) -> tuple[str, str]:
+        return obj.status, obj.get_status_display()
 
     @admin.action(description="Заморозить абонемент")
     def freeze_subscriptions(
@@ -194,8 +206,8 @@ class TransactionAdmin(ModelAdmin):
         "created_at",
         "order_kind",
         "parent",
-        "amount",
-        "received_amount",
+        rubles_column("amount", "Сумма"),
+        rubles_column("received_amount", "Получено"),
         "display_status",
         "display_refund",
         "refund_error",
@@ -216,8 +228,14 @@ class TransactionAdmin(ModelAdmin):
         "event_registration__phone",
         "external_id",
     )
+    search_help_text = "Email или телефон плательщика, ID платежа ЮКассы"
     ordering = ("-created_at",)
     actions_row = ("row_resolve_refund",)
+    exclude = ("amount", "received_amount")
+    readonly_fields = (
+        rubles_column("amount", "Сумма"),
+        rubles_column("received_amount", "Получено от ЮКассы"),
+    )
 
     @admin.display(description="Заказ")
     def order_kind(self, obj: Transaction) -> str:
@@ -249,8 +267,8 @@ class TransactionAdmin(ModelAdmin):
             TransactionStatus.CANCELED: "danger",
         },
     )
-    def display_status(self, obj: Transaction) -> str:
-        return obj.status
+    def display_status(self, obj: Transaction) -> tuple[str, str]:
+        return obj.status, obj.get_status_display()
 
     @display(description="Возврат")
     def display_refund(self, obj: Transaction) -> str:
@@ -319,6 +337,7 @@ class EnrollmentAdmin(ModelAdmin):
         "student__parent__email",
         "student__parent__phone",
     )
+    search_help_text = "Ребёнок, email или телефон родителя"
     ordering = ("-created_at",)
 
     def has_add_permission(self, request: HttpRequest) -> bool:
@@ -341,8 +360,8 @@ class EnrollmentAdmin(ModelAdmin):
             EnrollmentType.REGULAR: "info",
         },
     )
-    def display_type(self, obj: Enrollment) -> str:
-        return obj.type
+    def display_type(self, obj: Enrollment) -> tuple[str, str]:
+        return obj.type, obj.get_type_display()
 
     @display(
         description="Статус",
@@ -352,8 +371,8 @@ class EnrollmentAdmin(ModelAdmin):
             EnrollmentStatus.CANCELED: "danger",
         },
     )
-    def display_status(self, obj: Enrollment) -> str:
-        return obj.status
+    def display_status(self, obj: Enrollment) -> tuple[str, str]:
+        return obj.status, obj.get_status_display()
 
 
 @admin.register(Attendance)
@@ -366,6 +385,7 @@ class AttendanceAdmin(ModelAdmin):
         "display_status",
         "token_debited",
         "display_comment_tag",
+        "comment_text",
     )
     list_filter = (
         ("date", RangeDateFilter),
@@ -381,6 +401,7 @@ class AttendanceAdmin(ModelAdmin):
         "enrollment__schedule__activity",
     )
     search_fields = ("enrollment__student__full_name",)
+    search_help_text = "ФИО ребёнка"
     # ПОЧЕМУ status read-only: сохранение формы писало бы поле напрямую, мимо
     # set_attendance_status — без списания и возврата фишки. Статус меняется
     # только кнопками строки
@@ -404,8 +425,7 @@ class AttendanceAdmin(ModelAdmin):
 
     @admin.display(description="Группа")
     def group_name(self, obj: Attendance) -> str:
-        schedule = obj.enrollment.schedule
-        return schedule.group_name or schedule.activity.name
+        return str(obj.enrollment.schedule)
 
     @display(
         description="Статус",
@@ -415,8 +435,8 @@ class AttendanceAdmin(ModelAdmin):
             AttendanceStatus.ABSENT_ERR: "danger",
         },
     )
-    def display_status(self, obj: Attendance) -> str:
-        return obj.status
+    def display_status(self, obj: Attendance) -> tuple[str, str]:
+        return obj.status, obj.get_status_display()
 
     @display(
         description="Тон комментария",
@@ -426,8 +446,14 @@ class AttendanceAdmin(ModelAdmin):
             AttendanceCommentTag.NEUTRAL: "info",
         },
     )
-    def display_comment_tag(self, obj: Attendance) -> str:
-        return obj.comment_tag
+    def display_comment_tag(self, obj: Attendance) -> tuple[str, str]:
+        return obj.comment_tag, obj.get_comment_tag_display()
+
+    # ПОЧЕМУ колонка: тон без текста ничего не говорит — комментарий педагога
+    # читается прямо в списке, без захода в карточку каждой отметки
+    @admin.display(description="Комментарий педагога")
+    def comment_text(self, obj: Attendance) -> str:
+        return obj.comment or "—"
 
     @action(description="Присутствовал", permissions=["change"])
     def row_mark_attended(
