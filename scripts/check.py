@@ -62,6 +62,12 @@ def build_steps(*, fast: bool, fix: bool) -> list[Step]:
                 os.devnull,
             ],
         ),
+        # ПОЧЕМУ: Django читает только .mo — правка .po без пересборки
+        # молча не попадает в админку
+        Step(
+            "compile_messages --check",
+            [PY, str(ROOT / "scripts" / "compile_messages.py"), "--check"],
+        ),
     ]
     if not fast:
         steps.append(Step("pytest", [PY, "-m", "pytest", "-q"]))

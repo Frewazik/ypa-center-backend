@@ -29,6 +29,11 @@ class DayOfWeek(models.IntegerChoices):
     SUNDAY = 6, "Воскресенье"
 
 
+# ПОЧЕМУ отдельно от DayOfWeek: короткие подписи нужны там, где полное
+# название дня не помещается (журнал, график на главной админки)
+DAY_SHORT_NAMES: tuple[str, ...] = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+
+
 class MaskType(models.TextChoices):
     CANCELLATION = "CANCELLATION", "Отмена"
     RESCHEDULE = "RESCHEDULE", "Перенос"
@@ -151,10 +156,10 @@ class Schedule(models.Model):
     # ПОЧЕМУ: Денормализация ради ExclusionConstraint
     # Значения перезаписываются триггером (0003), ORM-хуки игнорируются
     day_of_week = models.SmallIntegerField(
-        "День недели (денорм.)", choices=DayOfWeek.choices, editable=False
+        "День недели", choices=DayOfWeek.choices, editable=False
     )
-    start_time = models.TimeField("Начало (денорм.)", editable=False)
-    end_time = models.TimeField("Окончание (денорм.)", editable=False)
+    start_time = models.TimeField("Начало", editable=False)
+    end_time = models.TimeField("Окончание", editable=False)
 
     created_at = models.DateTimeField("Создано", auto_now_add=True)
     updated_at = models.DateTimeField("Обновлено", auto_now=True)
@@ -203,7 +208,14 @@ class Schedule(models.Model):
         ]
 
     def __str__(self) -> str:
-        return f"Группа #{self.pk} · {self.group_name or self.activity_id}"
+        # ПОЧЕМУ день и время: у кружка много слотов с одним названием группы
+        # («1–9 классы»), без них в журнале и списках занятия не различить
+        name = self.group_name or f"Группа #{self.pk}"
+        # ПОЧЕМУ проверка: день и время пишет триггер БД — у только что
+        # сохранённого объекта (сообщение админки «добавлено») их ещё нет
+        if self.day_of_week is None or self.start_time is None:
+            return name
+        return f"{name} · {DAY_SHORT_NAMES[self.day_of_week]} {self.start_time:%H:%M}"
 
 
 class ScheduleMask(models.Model):

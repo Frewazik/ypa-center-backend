@@ -414,6 +414,9 @@ CORS_EXPOSE_HEADERS = ["Retry-After", "X-Request-ID"]
 LANGUAGE_CODE = "ru-ru"
 TIME_ZONE = "Asia/Novosibirsk"
 USE_I18N = True
+# ПОЧЕМУ: у django-unfold нет русского каталога — свои переводы его строк
+# (вход, поиск, фильтры); собирает scripts/compile_messages.py
+LOCALE_PATHS = [BASE_DIR / "locale"]
 USE_TZ = True
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
@@ -443,6 +446,10 @@ TELEGRAM_MANAGER_CHAT_ID = _env.TELEGRAM_MANAGER_CHAT_ID
 ADMIN_BASE_URL = _env.ADMIN_BASE_URL
 
 EVENT_PENDING_PAYMENT_TTL_MINUTES = _env.EVENT_PENDING_PAYMENT_TTL_MINUTES
+
+# ПОЧЕМУ: шаблон входа Unfold не передаёт скрытое поле next — вход со страницы
+# /admin/login/ без ?next уводил на дефолтный /accounts/profile/ (404)
+LOGIN_REDIRECT_URL = "admin:index"
 
 UNFOLD = {
     "SITE_TITLE": "Улица Радости - админка",

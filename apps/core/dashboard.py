@@ -16,6 +16,8 @@ from apps.billing.models import (
     Transaction,
     TransactionStatus,
 )
+from apps.core.admin import format_rubles
+from apps.schedule.models import DAY_SHORT_NAMES
 from apps.users.models import Student
 
 DASHBOARD_CACHE_KEY = "admin:dashboard:metrics:v1"
@@ -43,10 +45,6 @@ class DashboardMetrics(TypedDict):
     payments_chart: ChartData
 
 
-def _format_rubles(amount_kopecks: int) -> str:
-    return f"{amount_kopecks / 100:,.0f} ₽".replace(",", " ")
-
-
 def _kpi_cards(month_start: date) -> list[KpiCard]:
     revenue: int = (
         Transaction.objects.filter(
@@ -61,7 +59,7 @@ def _kpi_cards(month_start: date) -> list[KpiCard]:
         .count()
     )
     return [
-        {"title": "Выручка за месяц", "metric": _format_rubles(revenue)},
+        {"title": "Выручка за месяц", "metric": format_rubles(revenue)},
         {"title": "Активных учеников", "metric": str(active_students)},
     ]
 
@@ -71,12 +69,30 @@ def _top_groups_chart() -> ChartData:
     # а не показатель популярности группы
     rows = (
         Enrollment.objects.filter(status=EnrollmentStatus.ENROLLED)
-        .values("schedule_id", "schedule__activity__name", "schedule__group_name")
+        .values(
+            "schedule_id",
+            "schedule__activity__name",
+            "schedule__group_name",
+            "schedule__day_of_week",
+            "schedule__start_time",
+        )
         .annotate(enrollments_count=Count("id"))
         .order_by("-enrollments_count")[:5]
     )
+    # ПОЧЕМУ день и время в подписи: у кружка несколько слотов с одним
+    # названием группы («1–9 классы») — без них столбцы не различить
     labels: list[str] = [
-        row["schedule__group_name"] or row["schedule__activity__name"] or "—"
+        " · ".join(
+            filter(
+                None,
+                (
+                    row["schedule__activity__name"],
+                    row["schedule__group_name"],
+                    f"{DAY_SHORT_NAMES[row['schedule__day_of_week']]} "
+                    f"{row['schedule__start_time']:%H:%M}",
+                ),
+            )
+        )
         for row in rows
     ]
     data: list[float] = [float(row["enrollments_count"]) for row in rows]
@@ -119,6 +135,11 @@ def build_dashboard_metrics() -> DashboardMetrics:
 
 
 def dashboard_callback(request: HttpRequest, context: dict[str, Any]) -> dict[str, Any]:
+    # ПОЧЕМУ: выручка и платежи — коммерческие данные центра; учитель заходит
+    # в админку ради журнала, и показывать ему деньги незачем
+    if not request.user.has_perm("billing.view_transaction"):
+        context["show_metrics"] = False
+        return context
     # ПОЧЕМУ: cache-aside — агрегации бьют БД на каждый заход в админку,
     # отдаём из Redis (default cache) с TTL
     # TODO: пересчёт вынести в периодическую Taskiq-задачу, которая кладёт
@@ -131,6 +152,7 @@ def dashboard_callback(request: HttpRequest, context: dict[str, Any]) -> dict[st
 
     context.update(
         {
+            "show_metrics": True,
             "kpi": metrics["kpi"],
             # ПОЧЕМУ: компоненты chart в Unfold принимают data строго
             # JSON-строкой, dict молча рендерится пустым графиком

@@ -12,6 +12,7 @@ from unfold.admin import ModelAdmin
 
 from apps.billing.ports import resolve_event_port
 from apps.billing.services import BillingError, cancel_event_registration
+from apps.core.admin import RublesInputModelAdmin, rubles_column
 from apps.events.models import Event, EventRegistration
 from apps.events.services import (
     cancel_registration,
@@ -27,19 +28,21 @@ _EVENT_ADMIN_EDITABLE_FIELDS: Final[tuple[str, ...]] = tuple(
 
 
 @admin.register(Event)
-class EventAdmin(ModelAdmin):
+class EventAdmin(RublesInputModelAdmin):
     list_display = (
         "title",
         "start_datetime",
-        "price",
+        rubles_column("price", "Цена"),
         "capacity",
         "seats_taken",
         "is_published",
     )
     list_filter = ("is_published",)
     search_fields = ("title",)
+    search_help_text = "Название события"
     ordering = ("-start_datetime",)
     readonly_fields = ("seats_taken",)
+    rubles_fields = {"price": "Цена, ₽"}
 
     def save_model(
         self, request: HttpRequest, obj: Event, form: ModelForm[Event], change: bool
@@ -61,17 +64,24 @@ class EventRegistrationAdmin(ModelAdmin):
         "parent_name",
         "phone",
         "attendees_count",
-        "amount",
+        rubles_column("amount", "Сумма брони"),
         "status",
         "created_at",
     )
     list_filter = ("status",)
     search_fields = ("child_name", "parent_name", "phone", "email")
+    search_help_text = "Имя ребёнка или родителя, телефон, email"
     list_select_related = ("event",)
     # ПОЧЕМУ: status/attendees_count/event участвуют в инварианте
     # Event.seats_taken — правки только через сервисы и экшены; amount —
     # снимок цены на момент записи, по нему ЛК и выручка
-    readonly_fields = ("event", "attendees_count", "amount", "status")
+    exclude = ("amount",)
+    readonly_fields = (
+        "event",
+        "attendees_count",
+        rubles_column("amount", "Сумма брони"),
+        "status",
+    )
     actions = ("confirm_selected", "cancel_selected")
 
     def has_add_permission(self, request: HttpRequest) -> bool:

@@ -3,10 +3,21 @@ from __future__ import annotations
 from django.db import models
 
 
+class ActivityCategory(models.TextChoices):
+    CLUB = "CLUB", "Кружок"
+    SERVICE = "SERVICE", "Услуга"
+
+
 class Activity(models.Model):
     name = models.CharField("Название", max_length=255)
-    slug = models.SlugField("Слуг", unique=True)
-    category = models.CharField("Категория", max_length=50, default="CLUB")
+    slug = models.SlugField("Адрес в ссылке", unique=True)
+    category = models.CharField(
+        "Категория",
+        max_length=50,
+        choices=ActivityCategory.choices,
+        default=ActivityCategory.CLUB,
+    )
+    # ПОЧЕМУ: в копейках, как все суммы в проекте; админка вводит её в рублях
     price = models.IntegerField("Цена", default=0)
     is_active = models.BooleanField("Активен", default=True)
 
@@ -20,6 +31,8 @@ class Activity(models.Model):
 
     class Meta:
         db_table = "activity"
+        verbose_name = "Кружок"
+        verbose_name_plural = "Кружки"
 
     def __str__(self) -> str:
         return self.name

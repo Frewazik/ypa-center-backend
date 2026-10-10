@@ -8,7 +8,11 @@ from django.test import RequestFactory
 
 from apps.billing.models import EnrollmentStatus, TransactionStatus
 from apps.core.dashboard import DASHBOARD_CACHE_KEY, dashboard_callback
-from apps.schedule.tests.factories import EnrollmentFactory, SubscriptionFactory
+from apps.schedule.tests.factories import (
+    EnrollmentFactory,
+    SubscriptionFactory,
+    UserFactory,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -52,6 +56,35 @@ class TestDashboardCallback:
 
         top_groups = json.loads(context["top_groups_chart"])
         assert len(top_groups["labels"]) == 1
+
+    def test_top_group_label_names_activity_day_and_time(
+        self, rf: RequestFactory, admin_user
+    ) -> None:
+        enrollment = EnrollmentFactory(status=EnrollmentStatus.ENROLLED)
+        # ПОЧЕМУ refresh: день и время группы заполняет триггер БД
+        schedule = enrollment.schedule
+        schedule.refresh_from_db()
+        request = rf.get("/admin/")
+        request.user = admin_user
+
+        context = dashboard_callback(request, {})
+
+        label = json.loads(context["top_groups_chart"])["labels"][0]
+        assert schedule.activity.name in label
+        assert f"{schedule.start_time:%H:%M}" in label
+
+    def test_teacher_without_billing_access_sees_no_money(
+        self, rf: RequestFactory
+    ) -> None:
+        _succeeded_transaction(700_000)
+        request = rf.get("/admin/")
+        request.user = UserFactory(is_staff=True)
+
+        context = dashboard_callback(request, {})
+
+        assert context["show_metrics"] is False
+        assert "kpi" not in context
+        assert "payments_chart" not in context
 
     def test_held_enrollments_not_counted(self, rf: RequestFactory, admin_user) -> None:
         # ПОЧЕМУ: HELD — 15-минутная бронь до оплаты, не «активный ученик»

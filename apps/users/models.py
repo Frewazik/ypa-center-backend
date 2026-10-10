@@ -306,6 +306,7 @@ class PersonalDataConsent(models.Model):
 class TeacherProfile(models.Model):
     user = models.OneToOneField(
         settings.AUTH_USER_MODEL,
+        verbose_name="Учётная запись",
         on_delete=models.CASCADE,
         related_name="teacher_profile",
     )
@@ -317,3 +318,9 @@ class TeacherProfile(models.Model):
 
     class Meta:
         db_table = "teacher_profile"
+        verbose_name = "Преподаватель"
+        verbose_name_plural = "Преподаватели"
+
+    def __str__(self) -> str:
+        full_name = " ".join(filter(None, (self.user.full_name, self.middle_name)))
+        return full_name or self.user.email

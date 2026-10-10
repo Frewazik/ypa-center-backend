@@ -3,6 +3,11 @@
 
 {% block content %}
   {% component "unfold/components/container.html" %}
+    {% if not show_metrics %}
+      {% component "unfold/components/card.html" %}
+        {% component "unfold/components/text.html" %}Журнал занятий и отметки посещения — в меню слева.{% endcomponent %}
+      {% endcomponent %}
+    {% else %}
     {% component "unfold/components/flex.html" with class="gap-4 mb-8" %}
       {% for card in kpi %}
         {% component "unfold/components/card.html" with class="lg:w-1/2" %}
@@ -19,5 +24,6 @@
     {% component "unfold/components/card.html" with title="Платежи за 30 дней" %}
       {% component "unfold/components/chart/line.html" with data=payments_chart height=320 %}{% endcomponent %}
     {% endcomponent %}
+    {% endif %}
   {% endcomponent %}
 {% endblock %}

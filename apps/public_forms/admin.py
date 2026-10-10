@@ -13,6 +13,7 @@ class CallbackRequestAdmin(ModelAdmin):
     list_editable = ("status",)
     list_filter = ("status", "preferred_time_window")
     search_fields = ("name", "phone")
+    search_help_text = "Имя или телефон"
 
 
 @admin.register(FeedbackRequest)
@@ -21,3 +22,4 @@ class FeedbackRequestAdmin(ModelAdmin):
     list_editable = ("status",)
     list_filter = ("status",)
     search_fields = ("name", "email", "message")
+    search_help_text = "Имя, email или текст обращения"

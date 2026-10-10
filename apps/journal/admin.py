@@ -50,6 +50,7 @@ class LessonAdmin(ModelAdmin):
     list_filter = (LessonHorizonFilter, "schedule")
     date_hierarchy = "date"
     search_fields = ("topic", "schedule__group_name", "schedule__activity__name")
+    search_help_text = "Тема, группа или кружок"
     autocomplete_fields = ("schedule",)
 
     def get_queryset(self, request: HttpRequest) -> QuerySet[Lesson]:

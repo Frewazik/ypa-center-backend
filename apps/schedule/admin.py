@@ -16,6 +16,7 @@ class RoomAdmin(ModelAdmin):
     list_display = ("name", "is_active")
     list_editable = ("is_active",)
     search_fields = ("name",)
+    search_help_text = "Название кабинета"
 
 
 @admin.register(TimeSlot)
@@ -43,5 +44,6 @@ class ScheduleAdmin(ModelAdmin):
     list_editable = ("age_min", "age_max", "max_capacity", "is_active")
     list_filter = ("is_active", "day_of_week")
     search_fields = ("group_name", "activity__name")
+    search_help_text = "Группа или кружок"
     list_select_related = ("activity", "teacher__user", "room", "time_slot")
     autocomplete_fields = ("activity", "teacher", "room")

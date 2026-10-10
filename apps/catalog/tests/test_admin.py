@@ -19,7 +19,8 @@ def _form_data(**overrides: object) -> dict[str, object]:
         "name": "Шахматы",
         "slug": "shahmaty",
         "category": "CLUB",
-        "price": 120_000,
+        # ПОЧЕМУ рубли: админка вводит цену в рублях, в БД — копейки
+        "price": "1200",
         "is_active": "on",
         "cover_image": "",
         "short_description": "",

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from django.contrib import admin
+from django.db.models import QuerySet
 from django.http import HttpRequest
+from rest_framework_simplejwt.token_blacklist.models import (
+    BlacklistedToken,
+    OutstandingToken,
+)
 
 from unfold.admin import ModelAdmin, TabularInline
 
 from apps.billing.models import Subscription
+from apps.core.admin import rubles_column
 from apps.users.models import Parent, PersonalDataConsent, Student, TeacherProfile
 
 
@@ -21,7 +27,13 @@ class SubscriptionInline(TabularInline):
     model = Subscription
     extra = 0
     can_delete = False
-    fields = ("id", "status", "purchase_price", "created_at", "expires_at")
+    fields = (
+        "id",
+        "status",
+        rubles_column("purchase_price", "Цена покупки"),
+        "created_at",
+        "expires_at",
+    )
     readonly_fields = fields
     show_change_link = True
 
@@ -31,6 +43,12 @@ class SubscriptionInline(TabularInline):
         return False
 
 
+# ПОЧЕМУ: служебные таблицы отзыва JWT — менеджеру в них делать нечего,
+# а удаление строки из чёрного списка снова оживляет отозванный токен
+admin.site.unregister(BlacklistedToken)
+admin.site.unregister(OutstandingToken)
+
+
 @admin.register(Parent)
 class ParentAdmin(ModelAdmin):
     list_display = ("id", "email", "full_name", "phone", "is_staff", "created_at")
@@ -38,6 +56,7 @@ class ParentAdmin(ModelAdmin):
     # ПОЧЕМУ: search_fields обязателен — StudentAdmin ссылается сюда через
     # autocomplete, без него Django падает при рендере виджета
     search_fields = ("email", "full_name", "phone")
+    search_help_text = "Email, ФИО или телефон"
     ordering = ("-created_at",)
     # ПОЧЕМУ: согласие даёт только сам родитель на сайте — поставить его
     # «за клиента» из админки нельзя, это подделка доказательства
@@ -74,6 +93,7 @@ class StudentAdmin(ModelAdmin):
         "parent__email",
         "parent__phone",
     )
+    search_help_text = "ФИО ребёнка, email или телефон родителя"
     autocomplete_fields = ("parent",)
 
 
@@ -91,6 +111,7 @@ class PersonalDataConsentAdmin(ModelAdmin):
     )
     list_filter = ("purpose", "document_version")
     search_fields = ("email", "phone", "parent__email")
+    search_help_text = "Email или телефон"
     list_select_related = ("parent",)
 
     def has_add_permission(self, request: HttpRequest) -> bool:
@@ -111,8 +132,14 @@ class PersonalDataConsentAdmin(ModelAdmin):
 class TeacherProfileAdmin(ModelAdmin):
     list_display = ("id", "teacher_full_name", "middle_name", "position")
     search_fields = ("user__full_name", "user__email", "middle_name")
+    search_help_text = "ФИО или email"
     list_select_related = ("user",)
     autocomplete_fields = ("user",)
+
+    def get_queryset(self, request: HttpRequest) -> QuerySet[TeacherProfile]:
+        # ПОЧЕМУ: __str__ преподавателя читает user — без JOIN выпадающий
+        # список автокомплита в расписании делал бы запрос на каждую строку
+        return super().get_queryset(request).select_related("user")
 
     @admin.display(description="ФИО")
     def teacher_full_name(self, obj: TeacherProfile) -> str:
