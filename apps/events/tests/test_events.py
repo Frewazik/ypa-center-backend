@@ -6,7 +6,8 @@ from collections.abc import Iterator
 
 import pytest
 from django.contrib.admin.sites import AdminSite
-from django.test import RequestFactory, override_settings
+from django.test import Client, RequestFactory, override_settings
+from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.exceptions import NotFound, ValidationError
@@ -33,6 +34,10 @@ THROTTLE_LIMIT = 3
 
 def _register_url(event_id: int) -> str:
     return f"/api/v1/public/events/{event_id}/register/"
+
+
+def _registration_change_url(registration: EventRegistration) -> str:
+    return reverse("admin:events_eventregistration_change", args=[registration.pk])
 
 
 def _submission(**overrides: object) -> RegistrationSubmission:
@@ -293,6 +298,28 @@ class TestEventRegistrationAdminGuards:
         assert {"event", "attendees_count", "status"} <= set(
             registration_admin.readonly_fields
         )
+
+
+class TestEventRegistrationAdminParentField:
+    def test_change_page_does_not_list_all_parents(self, admin_client: Client) -> None:
+        # ПОЧЕМУ: обычный <select> выгружал бы в страницу всех родителей базы
+        registration = EventRegistrationFactory()
+        others = ParentFactory.create_batch(3)
+
+        response = admin_client.get(_registration_change_url(registration))
+
+        assert response.status_code == 200
+        html = response.content.decode()
+        assert not any(parent.email in html for parent in others)
+
+    def test_change_page_shows_bound_parent(self, admin_client: Client) -> None:
+        parent = ParentFactory()
+        registration = EventRegistrationFactory(parent=parent)
+
+        response = admin_client.get(_registration_change_url(registration))
+
+        assert response.status_code == 200
+        assert parent.email in response.content.decode()
 
 
 class TestEventAdminSave:

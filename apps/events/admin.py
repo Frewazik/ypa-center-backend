@@ -72,6 +72,10 @@ class EventRegistrationAdmin(ModelAdmin):
     search_fields = ("child_name", "parent_name", "phone", "email")
     search_help_text = "Имя ребёнка или родителя, телефон, email"
     list_select_related = ("event",)
+    # ПОЧЕМУ: обычный <select> выгружает в карточку всех родителей базы.
+    # Поле не только для чтения: гостя без email (или с другим email) в его
+    # ЛК привязывает только менеджер — «Мои записи» ищут ничьи брони по email
+    autocomplete_fields = ("parent",)
     # ПОЧЕМУ: status/attendees_count/event участвуют в инварианте
     # Event.seats_taken — правки только через сервисы и экшены; amount —
     # снимок цены на момент записи, по нему ЛК и выручка
