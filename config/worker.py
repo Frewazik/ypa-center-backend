@@ -18,6 +18,7 @@ import apps.billing.tasks  # noqa: E402, F401
 import apps.events.tasks  # noqa: E402, F401
 import apps.journal.tasks  # noqa: E402, F401
 import apps.public_forms.tasks  # noqa: E402, F401
+import apps.schedule.tasks  # noqa: E402, F401
 import apps.users.tasks  # noqa: E402, F401
 from config.tkq import broker, scheduler  # noqa: E402
 

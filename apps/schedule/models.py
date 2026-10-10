@@ -226,7 +226,9 @@ class ScheduleMask(models.Model):
         related_name="masks",
     )
     target_date = models.DateField("Дата занятия", db_index=True)
-    type = models.CharField("Тип маски", max_length=20, choices=MaskType.choices)
+    type = models.CharField(
+        "Отмена или перенос", max_length=20, choices=MaskType.choices
+    )
     new_day_of_week = models.SmallIntegerField(
         "Новый день недели", choices=DayOfWeek.choices, null=True, blank=True
     )
@@ -252,8 +254,8 @@ class ScheduleMask(models.Model):
 
     class Meta:
         db_table = "schedule_mask"
-        verbose_name = "Маска расписания"
-        verbose_name_plural = "Маски расписания"
+        verbose_name = "Перенос или отмена"
+        verbose_name_plural = "Переносы и отмены"
         constraints = [
             models.UniqueConstraint(
                 fields=("schedule", "target_date"),
