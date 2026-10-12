@@ -404,9 +404,22 @@ class AttendanceAdmin(ModelAdmin):
     search_help_text = "ФИО ребёнка"
     # ПОЧЕМУ status read-only: сохранение формы писало бы поле напрямую, мимо
     # set_attendance_status — без списания и возврата фишки. Статус меняется
-    # только кнопками строки
-    readonly_fields = ("status", "token_debited", "created_at")
+    # только кнопками строки. Запись и дата read-only: фишка возвращается на
+    # абонемент текущей записи — после смены записи списанная у одного ребёнка
+    # фишка вернулась бы другому
+    readonly_fields = ("enrollment", "date", "status", "token_debited", "created_at")
     actions_row = ("row_mark_attended", "row_mark_absent_ok", "row_mark_absent_err")
+
+    # ПОЧЕМУ закрыто и суперюзеру: отметки создаёт утренняя задача (ручная
+    # получила бы пустой статус), удаление мимо set_attendance_status не
+    # возвращает списанную фишку
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+    def has_delete_permission(
+        self, request: HttpRequest, obj: Attendance | None = None
+    ) -> bool:
+        return False
 
     def get_queryset(self, request: HttpRequest) -> QuerySet[Attendance]:
         # ПОЧЕМУ: роль «Учитель» видит посещаемость только своих групп;
