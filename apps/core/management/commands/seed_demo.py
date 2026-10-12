@@ -82,7 +82,6 @@ class _TeacherSeed(TypedDict):
 class _ActivitySeed(TypedDict):
     name: str
     slug: str
-    price: int
     short: str
     description: str
     cover_image: str
@@ -128,13 +127,10 @@ _TEACHERS: list[_TeacherSeed] = [
     },
 ]
 
-# ПОЧЕМУ price 1 200 ₽: Activity.price — цена пробного занятия (schedule/ports.py),
-# у центра пробное и разовое занятие стоят 1 200 ₽
 _ACTIVITIES: list[_ActivitySeed] = [
     {
         "name": "Кружок Мышления",
         "slug": _THINKING_SLUG,
-        "price": 120_000,
         "short": "Основное направление центра: развиваем мышление у школьников 1–9 классов.",
         "description": (
             "Кружок Мышления — основное направление «Улицы Радости». Его ведёт "
@@ -156,7 +152,6 @@ _ACTIVITIES: list[_ActivitySeed] = [
     {
         "name": "Английский язык",
         "slug": _ENGLISH_SLUG,
-        "price": 120_000,
         "short": "Английский для 0–5 классов и помощь с домашними заданиями.",
         "description": (
             "Английский в «Улице Радости» ведёт основатель центра Надежда "
@@ -685,7 +680,6 @@ class Command(BaseCommand):
                 defaults={
                     "name": seed["name"],
                     "category": "CLUB",
-                    "price": seed["price"],
                     "short_description": seed["short"],
                     "description": seed["description"],
                     "cover_image": seed["cover_image"],
@@ -956,8 +950,8 @@ class Command(BaseCommand):
         tx = Transaction.objects.create(
             parent=parent,
             enrollment=enrollment,
-            amount=activity.price,
-            received_amount=activity.price,
+            amount=settings.TRIAL_PRICE,
+            received_amount=settings.TRIAL_PRICE,
             status=TransactionStatus.SUCCEEDED,
             selected_slot_ids=[schedule.pk],
         )

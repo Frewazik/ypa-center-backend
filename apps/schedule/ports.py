@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime
 from typing import Final
 
+from django.conf import settings
 from django.utils import timezone
 
 from apps.billing.ports import SlotTrialInfo, UnknownSlotError
@@ -44,13 +45,12 @@ class DjangoSchedulePort:
             Schedule.objects.filter(
                 pk=slot_id, is_active=True, activity__is_active=True
             )
-            .values_list("activity_id", "activity__price")
+            .values_list("activity_id", flat=True)
             .first()
         )
         if row is None:
             raise UnknownSlotError(slot_id)
-        activity_id, price = row
-        return SlotTrialInfo(activity_id=activity_id, price_kopecks=price)
+        return SlotTrialInfo(activity_id=row, price_kopecks=settings.TRIAL_PRICE)
 
     def get_next_lesson_date(
         self, slot_id: int, after: datetime.datetime

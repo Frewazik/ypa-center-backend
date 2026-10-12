@@ -23,9 +23,9 @@
   `enrollment` с `type=TRIAL`, `trial_date` и денормализованным `activity_id`;
   лимит «1 пробное на ребёнка по кружку» держит partial-unique
   `uniq_trial_per_student_per_activity`, форму строки — `ck_billing_enrollment_type_shape`.
-  Цена берётся из `catalog.Activity.price` через `SchedulePort.get_slot_trial_info`.
-  Бесплатное пробное подтверждается сразу (`CONFIRMED`), платное — через тот же
-  шлюз и вебхук, что абонемент. Список — `GET /api/v1/me/bookings/?kind=TRIAL`
+  Цена единая для всех кружков — `settings.TRIAL_PRICE` (1 200 ₽), отдаёт её
+  `SchedulePort.get_slot_trial_info`; в API кружка цены нет, фронт держит ту же
+  константу. Оплата — через тот же шлюз и вебхук, что абонемент. Список — `GET /api/v1/me/bookings/?kind=TRIAL`
   (вместе с событиями; `GET /api/v1/me/trials` устарела), в ленте ЛК — `kind=TRIAL`. Превышение лимита → `409 TRIAL_LIMIT_EXCEEDED`.
   Пробное в группу, где ребёнок уже на абонементе → `409 STUDENT_ALREADY_ENROLLED`.
   Абонемент в группу после пробного (главный путь продажи) разрешён.
