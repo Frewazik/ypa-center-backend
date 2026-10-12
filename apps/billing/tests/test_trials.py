@@ -121,16 +121,13 @@ class TestCreateTrialPayment:
         # бронь занимает место до подтверждения оплаты
         assert _occupied_seats(101) == 1
 
-    def test_free_trial_is_confirmed_without_gateway(self) -> None:
-        gateway = FakeGateway()
-        result, _, _ = _trial_checkout(101, price=0, gateway=gateway)
+    def test_zero_trial_price_is_rejected(self) -> None:
+        # Бесплатного пробного нет: нулевая цена — ошибка, а не запись без оплаты
+        with pytest.raises(ValueError):
+            _trial_checkout(101, price=0)
 
-        assert result.status == "CONFIRMED"
-        assert result.payment_url is None
-        assert gateway.created_payments == []
-        enrollment = Enrollment.objects.get(type=EnrollmentType.TRIAL)
-        assert enrollment.status == EnrollmentStatus.ENROLLED
-        assert Transaction.objects.get().status == TransactionStatus.SUCCEEDED
+        assert not Enrollment.objects.exists()
+        assert not Transaction.objects.exists()
 
     def test_second_trial_same_activity_hits_limit(self) -> None:
         result, parent, student = _trial_checkout(101)
@@ -257,7 +254,7 @@ class TestCreateTrialPayment:
 @pytest.mark.django_db
 class TestTrialSeatLifecycle:
     def test_past_trial_frees_the_seat(self) -> None:
-        result, _, _ = _trial_checkout(101, price=0)
+        result, _, _ = _trial_checkout(101)
         assert _occupied_seats(101) == 1
 
         Enrollment.objects.filter(type=EnrollmentType.TRIAL).update(
@@ -455,7 +452,7 @@ class TestSeatTimeAxis:
     # «плоский count() схлопывает разные даты в одну загрузку слота»
 
     def _trial_on(self, offset_days: int, *, capacity: int = 10) -> None:
-        _trial_checkout(101, days_ahead=offset_days, capacity=capacity, price=0)
+        _trial_checkout(101, days_ahead=offset_days, capacity=capacity)
 
     def test_trials_on_distinct_dates_do_not_sell_out_the_group(self) -> None:
         # Десять пробных на десять разных недель — это один занятый стул
@@ -572,7 +569,7 @@ class TestTrialAndSubscriptionSameGroup:
         )
 
     def test_subscription_after_past_trial_in_same_slot(self) -> None:
-        _, parent, student = _trial_checkout(101, price=0, days_ahead=0)
+        _, parent, student = _trial_checkout(101, days_ahead=0)
         self._pass_trial()
 
         result = _checkout([101], parent=parent, student=student)
@@ -583,7 +580,7 @@ class TestTrialAndSubscriptionSameGroup:
         assert regular.status == EnrollmentStatus.HELD
 
     def test_trial_limit_still_holds_after_trial_passed(self) -> None:
-        _, parent, student = _trial_checkout(101, price=0, days_ahead=0)
+        _, parent, student = _trial_checkout(101, days_ahead=0)
         self._pass_trial()
 
         with pytest.raises(TrialLimitExceededError):
