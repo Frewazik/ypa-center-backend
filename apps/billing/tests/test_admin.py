@@ -14,11 +14,16 @@ from django.utils import timezone
 from apps.billing.admin import AttendanceAdmin
 from apps.billing.models import (
     Attendance,
+    AttendanceCommentTag,
     AttendanceStatus,
     EnrollmentStatus,
     SubscriptionStatus,
 )
-from apps.billing.tests.factories import AttendanceFactory, SubscriptionSlotFactory
+from apps.billing.tests.factories import (
+    AttendanceFactory,
+    EnrollmentFactory,
+    SubscriptionSlotFactory,
+)
 from apps.schedule.tests.factories import SubscriptionFactory
 
 pytestmark = pytest.mark.django_db
@@ -177,3 +182,50 @@ class TestAttendanceRowActions:
 
         assert response.status_code == 302
         assert response.url == reverse("admin:billing_attendance_changelist")
+
+
+class TestAttendanceChangeForm:
+    def test_change_form_post_does_not_change_enrollment_or_date(
+        self, admin_client
+    ) -> None:
+        # ПОЧЕМУ: смена записи в карточке переносила возврат фишки на чужой
+        # абонемент — списали у ребёнка А, вернули ребёнку Б
+        attendance = _debitable_attendance()
+        original_enrollment_id = attendance.enrollment_id
+        original_date = attendance.date
+        foreign_enrollment = EnrollmentFactory()
+        url = reverse("admin:billing_attendance_change", args=[attendance.pk])
+
+        response = admin_client.post(
+            url,
+            {
+                "enrollment": foreign_enrollment.pk,
+                "date": (original_date - datetime.timedelta(days=7)).isoformat(),
+                "comment": "Работал хорошо",
+                "comment_tag": AttendanceCommentTag.POSITIVE,
+                "_save": "1",
+            },
+        )
+
+        attendance.refresh_from_db()
+        assert response.status_code == 302
+        assert attendance.enrollment_id == original_enrollment_id
+        assert attendance.date == original_date
+        assert attendance.comment == "Работал хорошо"
+
+
+class TestAttendanceAddDeleteClosed:
+    def test_add_forbidden_even_for_superuser(self, admin_client) -> None:
+        response = admin_client.get(reverse("admin:billing_attendance_add"))
+
+        assert response.status_code == 403
+
+    def test_delete_forbidden_even_for_superuser(self, admin_client) -> None:
+        # ПОЧЕМУ: удаление мимо set_attendance_status не возвращает фишку
+        attendance = _debitable_attendance()
+        url = reverse("admin:billing_attendance_delete", args=[attendance.pk])
+
+        response = admin_client.post(url, {"post": "yes"})
+
+        assert response.status_code == 403
+        assert Attendance.objects.filter(pk=attendance.pk).exists()
