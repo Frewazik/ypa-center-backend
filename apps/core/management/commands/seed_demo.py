@@ -543,11 +543,13 @@ _FAMILIES: list[_FamilySeed] = [
     },
 ]
 
-# ПОЧЕМУ разные дни: покупки разнесены по последнему месяцу — график
-# платежей и журнал занятий выглядят как живые. Дни берутся по кругу
+# ПОЧЕМУ разные дни: покупки разнесены по последним 4 неделям — график
+# платежей и журнал занятий выглядят как живые. Дни берутся по кругу.
+# Не старше 26 дней: абонемент живёт 4 недели, более старый свипер закрыл
+# бы сразу после сида
 _PURCHASE_DAYS_AGO: tuple[int, ...] = (
-    27, 9, 22, 15, 4, 18, 12, 25, 7, 20, 14, 29, 11,
-    24, 6, 17, 21, 8, 26, 13, 19, 10, 23, 16, 28,
+    2, 9, 22, 15, 4, 18, 12, 25, 7, 20, 14, 3, 11,
+    24, 6, 17, 21, 8, 26, 13, 19, 10, 23, 16, 5,
 )  # fmt: skip
 _TRIAL_DAYS_AGO: tuple[int, ...] = (2, 5, 1)
 _TOKENS_PER_SLOT = 4
@@ -865,7 +867,12 @@ class Command(BaseCommand):
             purchase_price=plan.price,
             base_session_price=plan.base_session_price,
             start_date=start_date,
-            expires_at=bought_at + datetime.timedelta(days=30),
+            expires_at=timezone.make_aware(
+                datetime.datetime.combine(
+                    start_date + datetime.timedelta(days=27),
+                    datetime.time(23, 59, 59),
+                )
+            ),
         )
         tx = Transaction.objects.create(
             parent=parent,
@@ -876,7 +883,7 @@ class Command(BaseCommand):
             selected_slot_ids=[schedule.pk for schedule in schedules],
         )
         # ПОЧЕМУ update: created_at — auto_now_add, а на демо покупки должны
-        # быть разнесены по месяцу, иначе график платежей — один столбик
+        # быть разнесены по 4 неделям, иначе график платежей — один столбик
         Subscription.objects.filter(pk=subscription.pk).update(created_at=bought_at)
         Transaction.objects.filter(pk=tx.pk).update(created_at=bought_at)
         for schedule in schedules:

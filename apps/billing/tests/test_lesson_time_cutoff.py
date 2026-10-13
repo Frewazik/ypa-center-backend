@@ -17,9 +17,9 @@ from apps.billing.models import (
 )
 from apps.billing.services import (
     TrialDateUnavailableError,
-    _month_after,
     confirm_payment,
     create_payment,
+    sweep_expired_subscriptions,
     create_trial_payment,
 )
 from apps.billing.tests.test_billing import (
@@ -74,18 +74,18 @@ def _monday_group() -> Schedule:
 
 
 def _buy_subscription(
-    group: Schedule, *, student: Student | None = None, from_deposit: bool = False
+    *groups: Schedule, student: Student | None = None, from_deposit: bool = False
 ) -> Subscription:
     port = DjangoSchedulePort()
     child = student if student is not None else StudentFactory()
-    plan = SubscriptionPlanFactory(slots_count=1, price=700_000)
+    plan = SubscriptionPlanFactory(slots_count=len(groups), price=700_000)
     if from_deposit:
         ParentDepositFactory(parent=child.parent, balance=plan.price)
     create_payment(
         child.parent_id,
         plan.pk,
         child.pk,
-        [group.pk],
+        sorted(group.pk for group in groups),
         str(uuid.uuid4()),
         "lesson-cutoff",
         gateway=FakeGateway(),
@@ -155,9 +155,9 @@ class TestSubscriptionStartsFromUpcomingLesson:
 
         assert subscription.start_date == MONDAY + WEEK
         assert subscription.expires_at is not None
-        # Срок — месяц от первого занятия, на неделю дальше, чем сейчас
-        assert timezone.localtime(subscription.expires_at).date() == _month_after(
-            MONDAY + WEEK
+        # Срок — 4 недели от первого занятия, на неделю дальше, чем сейчас
+        assert timezone.localtime(subscription.expires_at).date() == (
+            MONDAY + WEEK + datetime.timedelta(days=27)
         )
 
     def test_bought_before_start_keeps_today(
@@ -259,9 +259,10 @@ class TestTrialThenSubscriptionSameDay:
         subscription = _buy_subscription(group, student=student)
 
         assert subscription.start_date == MONDAY + WEEK
-        last_day = _month_after(MONDAY + WEEK)
-        # 5 занятий в окне на 4 фишки — пятое запасное
-        assert MONDAY + 5 * WEEK <= last_day < MONDAY + 6 * WEEK
+        assert subscription.expires_at is not None
+        last_day = timezone.localdate(subscription.expires_at)
+        # 4 занятия в окне на 4 фишки, пятое — уже за сроком
+        assert MONDAY + 4 * WEEK <= last_day < MONDAY + 5 * WEEK
         for week in range(1, 5):
             day = MONDAY + week * WEEK
             _freeze(monkeypatch, _at(day, 7))
@@ -276,6 +277,68 @@ class TestTrialThenSubscriptionSameDay:
                 student=student, attendances__date=MONDAY
             ).values_list("type", flat=True)
         ) == {EnrollmentType.TRIAL}
+
+
+def _group_on(weekday: int) -> Schedule:
+    group: Schedule = ScheduleFactory(
+        time_slot=TimeSlotFactory(
+            day_of_week=weekday,
+            start_time=datetime.time(16),
+            end_time=datetime.time(17),
+        )
+    )
+    return group
+
+
+class TestFourWeekSubscription:
+    # ПОЧЕМУ: требование заказчика 2026-10-11 — абонемент 4 недели,
+    # по каждому слоту ровно 4 занятия = 4 фишки, бесплатного пятого нет
+
+    @pytest.mark.parametrize("start_offset", range(7))
+    def test_every_slot_gets_exactly_four_paid_lessons(
+        self, monkeypatch: pytest.MonkeyPatch, start_offset: int
+    ) -> None:
+        start = MONDAY + datetime.timedelta(days=start_offset)
+        groups = [_group_on((start.weekday() + shift) % 7) for shift in (0, 2, 5)]
+        _freeze(monkeypatch, _at(start - datetime.timedelta(days=1), 12))
+
+        subscription = _buy_subscription(*groups)
+
+        assert subscription.start_date == start
+        assert subscription.expires_at is not None
+        last_day = start + datetime.timedelta(days=27)
+        assert timezone.localtime(subscription.expires_at) == _at(
+            last_day, 23, 59
+        ) + datetime.timedelta(seconds=59)
+        day = start
+        while day <= last_day + WEEK:
+            _freeze(monkeypatch, _at(day, 0, 30))
+            sweep_expired_subscriptions(schedule_port=DjangoSchedulePort())
+            _freeze(monkeypatch, _at(day, 7))
+            materialize_today_lessons()
+            _freeze(monkeypatch, _at(day, 23))
+            debit_attended_lessons()
+            day += datetime.timedelta(days=1)
+        for group in groups:
+            attendances = Attendance.objects.filter(enrollment__schedule=group)
+            assert attendances.count() == 4
+            assert attendances.filter(token_debited=True).count() == 4
+            slot = SubscriptionSlot.objects.get(slot_id=group.pk)
+            assert slot.remaining_tokens == 0
+
+    def test_prepaid_from_deposit_lasts_four_weeks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        group = _monday_group()
+        _freeze(monkeypatch, _at(MONDAY, 12))
+
+        subscription = _buy_subscription(group, from_deposit=True)
+
+        assert subscription.start_date == MONDAY
+        assert subscription.expires_at is not None
+        assert timezone.localdate(subscription.expires_at) == (
+            MONDAY + datetime.timedelta(days=27)
+        )
 
 
 class TestJoinTodaysJournal:

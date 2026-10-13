@@ -150,9 +150,9 @@ class TestNightlyDebit:
         assert debit_attended_lessons() == 0
         assert Attendance.objects.get().token_debited is False
 
-    def test_fifth_lesson_is_free_and_does_not_stop_others(self) -> None:
-        # ПОЧЕМУ: месяц «до той же даты» даёт 5 занятий на 4 фишки — пятое
-        # бесплатно (решение бизнеса), задача не падает и идёт дальше
+    def test_slot_without_tokens_is_skipped_and_does_not_stop_others(self) -> None:
+        # ПОЧЕМУ: в норме занятий 4 на 4 фишки, лишнее — только при сбое
+        # (заморозка не на целые недели, смена дня группы); задача не падает
         out_of_tokens = _open_today(_enrolled_child(remaining_tokens=0))
         regular = _open_today(_enrolled_child())
 

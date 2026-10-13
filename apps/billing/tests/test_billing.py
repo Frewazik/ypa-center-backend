@@ -1975,9 +1975,9 @@ class TestActivationWindow:
     def test_expiry_counts_from_earliest_lesson_across_slots(self) -> None:
         # ПОЧЕМУ: дата активации вычисляется как минимум по датам всех слотов в корзине
         # независимая сортировка slot_ids гарантирует правильный выбор первой сессии
-
+        earliest = timezone.localdate() + timedelta(days=3)
         port = FakeSchedulePort(
-            lesson_dates={101: date(2026, 7, 20), 102: date(2026, 7, 10)}
+            lesson_dates={101: earliest + timedelta(days=4), 102: earliest}
         )
         tx = _make_pending_payment([101, 102])
         payment_id, gateway = _gateway_for(tx, "succeeded")
@@ -1990,23 +1990,27 @@ class TestActivationWindow:
         )
 
         subscription = Subscription.objects.get()
-        assert subscription.start_date == date(2026, 7, 10)
+        assert subscription.start_date == earliest
         local_expiry = timezone.localtime(subscription.expires_at)
-        assert local_expiry.date() == date(2026, 8, 10)
+        # 4 недели (требование заказчика 2026-10-11): последний день — D + 27
+        assert local_expiry.date() == earliest + timedelta(days=27)
         assert local_expiry.time() == time(23, 59, 59)
 
     def test_prepaid_order_window_comes_from_port_too(self) -> None:
         parent = ParentFactory()
         ParentDepositFactory(parent=parent, balance=800_000)
         plan = SubscriptionPlanFactory(slots_count=1, price=700_000)
-        port = FakeSchedulePort(lesson_dates={101: date(2026, 7, 15)})
+        first_lesson = timezone.localdate() + timedelta(days=5)
+        port = FakeSchedulePort(lesson_dates={101: first_lesson})
 
         result = _checkout([101], parent=parent, plan=plan, use_deposit=True, port=port)
 
         subscription = Subscription.objects.get()
         assert result.payment_url is None
-        assert subscription.start_date == date(2026, 7, 15)
-        assert timezone.localtime(subscription.expires_at).date() == date(2026, 8, 15)
+        assert subscription.start_date == first_lesson
+        assert timezone.localtime(subscription.expires_at).date() == (
+            first_lesson + timedelta(days=27)
+        )
 
 
 @pytest.mark.django_db

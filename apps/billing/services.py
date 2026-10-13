@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import calendar
 import logging
 import uuid
 from collections.abc import Callable, Sequence
@@ -336,9 +335,12 @@ REFUND_STATUSES_AWAITING_MANUAL = frozenset(
 )
 
 
-# ПОЧЕМУ: абонемент действует месяц от первого занятия, но точное окно
-# известно только при подтверждении оплаты. Пять недель гарантированно
-# накрывают этот месяц, куда бы ни попало первое занятие
+# ПОЧЕМУ: требование заказчика 2026-10-11 — 4 недели, 4 занятия на слот
+_SUBSCRIPTION_TERM = timedelta(weeks=4)
+# ПОЧЕМУ не 4 недели: точное окно известно только при подтверждении оплаты.
+# Купили в ПН после начала занятия ПН — занятия абонемента на +7…+28 дней,
+# и пробное на +28 горизонт «строго меньше 4 недель» пропустил бы. Запас
+# покрывает и переход суток между заказом и вебхуком
 _SUBSCRIPTION_SEAT_HORIZON = timedelta(weeks=5)
 
 # ПОЧЕМУ: Контракт §2.1
@@ -1053,7 +1055,7 @@ def _occupied_seats_bulk(
     # группу навсегда, хотя физически в каждый день занят один стул.
     #
     # on_date задана (покупка/подтверждение пробного) — занятость строго этого
-    # дня. on_date не задана (абонемент, покрывающий ~месяц занятий) — пик:
+    # дня. on_date не задана (абонемент, покрывающий 4 недели занятий) — пик:
     # постоянные плюс самый загруженный пробными день горизонта, потому что
     # абонемент обязан иметь место на каждом занятии, а не в среднем.
     #
@@ -1646,13 +1648,6 @@ def _selected_slot_ids(tx: Transaction, payment_id: str) -> list[int]:
     return [int(item) for item in raw]
 
 
-def _month_after(day: date) -> date:
-    year = day.year + day.month // 12
-    month = day.month % 12 + 1
-    last_day = calendar.monthrange(year, month)[1]
-    return day.replace(year=year, month=month, day=min(day.day, last_day))
-
-
 def _first_lessons(slot_ids: list[int], schedule_port: SchedulePort) -> dict[int, date]:
     # ПОЧЕМУ «сейчас» — момент активации, а не оформления заказа (решение
     # бизнеса 2026-10-01): вебхук, пришедший после начала занятия, сдвигает
@@ -1665,12 +1660,12 @@ def _first_lessons(slot_ids: list[int], schedule_port: SchedulePort) -> dict[int
 
 
 def _activation_window(first_lessons: dict[int, date]) -> tuple[date, datetime]:
-    # ПОЧЕМУ: согласно checkout-flow.md, абонемент действует строго месяц
-    # начиная с даты первого фактического занятия в выбранных слотах
+    # ПОЧЕМУ: требование заказчика 2026-10-11 — абонемент 4 недели с даты
+    # первого занятия (D … D+27 включительно). В 28 днях подряд каждый день
+    # недели ровно 4 раза: по каждому слоту 4 занятия на 4 фишки, без пятого
     first_lesson = min(first_lessons.values())
-    expires_at = timezone.make_aware(
-        datetime.combine(_month_after(first_lesson), time(23, 59, 59))
-    )
+    last_day = first_lesson + _SUBSCRIPTION_TERM - timedelta(days=1)
+    expires_at = timezone.make_aware(datetime.combine(last_day, time(23, 59, 59)))
     return first_lesson, expires_at
 
 
@@ -2350,8 +2345,9 @@ def _debit_attended_before_expiry(
         try:
             _spend_slot_token(attendance, subscription.pk)
         except (InsufficientTokensError, SlotBalanceNotFoundError) as exc:
-            # ПОЧЕМУ: пятое занятие месяца при 4 фишках бесплатно (решение
-            # бизнеса) — не причина срывать закрытие абонемента
+            # ПОЧЕМУ: в норме занятий в окне ровно 4 на 4 фишки; лишнее даёт
+            # только сбой (заморозка не на целые недели, смена дня группы,
+            # перенос в окно) — не причина срывать закрытие абонемента
             logger.info("Отметка #%s не списана при истечении: %s", attendance.pk, exc)
 
 
