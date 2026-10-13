@@ -495,6 +495,14 @@ class TestSeatTimeAxis:
         # в день без пробного постоянная запись всё равно держит место
         assert _occupied_seats(101, on_date=target + timedelta(days=7)) == 1
 
+    def test_trial_on_day_28_is_within_subscription_horizon(self) -> None:
+        # Купили в ПН после начала занятия ПН — четыре занятия абонемента
+        # придутся на +7, +14, +21 и +28 дней. Горизонт в ровно 4 недели
+        # (строго меньше +28) пропустил бы пробное в день четвёртого занятия
+        self._trial_on(28)
+
+        assert _occupied_seats(101) == 1
+
     def test_trial_beyond_subscription_horizon_is_ignored(self) -> None:
         # Пробное через полгода не должно вечно резервировать место
         # под каждый продаваемый абонемент

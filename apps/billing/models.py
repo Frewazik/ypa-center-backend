@@ -131,7 +131,6 @@ class Subscription(models.Model):
         "Базовая цена занятия на момент покупки, в копейках"
     )
     created_at = models.DateTimeField("Создан", auto_now_add=True)
-    # TODO: заполнять при активации через SchedulePort — месяц от первого занятия, не от оплаты.
     start_date = models.DateField("Дата первого занятия", null=True, blank=True)
     expires_at = models.DateTimeField("Истекает", null=True, blank=True)
 

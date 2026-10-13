@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime
+
 import pytest
 from django.contrib.auth.models import Group
 from django.core.management import call_command
@@ -93,6 +95,19 @@ class TestSeedDemo:
         today = timezone.localdate()
         assert len(days) >= 10
         assert all((today - day).days <= 30 for day in days)
+
+    def test_subscriptions_last_four_weeks_and_are_still_active(
+        self, seeded: None
+    ) -> None:
+        # ПОЧЕМУ: срок абонемента — 4 недели (требование заказчика 2026-10-11);
+        # демо-абонемент, истёкший уже в момент сида, свипер сразу закроет
+        for start_date, expires_at in Subscription.objects.values_list(
+            "start_date", "expires_at"
+        ):
+            local_expiry = timezone.localtime(expires_at)
+            assert local_expiry.date() == start_date + datetime.timedelta(days=27)
+            assert local_expiry.time() == datetime.time(23, 59, 59)
+            assert expires_at > timezone.now()
 
     def test_restores_teacher_group_permissions_after_flush(self, settings) -> None:
         # ПОЧЕМУ: flush стирает права, выданные миграцией journal/0002

@@ -122,7 +122,8 @@ erDiagram
 (`PENDING` / `ACTIVE` / `EXPIRED` / `CANCELED`; в модели есть и `DRAFT` — не
 используется, абонемент создаётся сразу `PENDING`), `purchase_price` и
 `base_session_price` — снапшоты на момент покупки (смена тарифа не трогает купленное),
-`start_date`, `expires_at` — месяц от первого фактического занятия.
+`start_date`, `expires_at` — 4 недели от первого фактического занятия (`expires_at` —
+23:59:59 дня `start_date + 27`).
 
 **subscription_slot** — фишки по конкретному слоту: `subscription` FK, `slot_id`
 (id из домена schedule, намеренно без FK через границу домена), `granted_tokens`,

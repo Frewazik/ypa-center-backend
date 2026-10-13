@@ -143,8 +143,9 @@ def debit_attended_lessons(*, today: datetime.date | None = None) -> int:
         try:
             debit_token(attendance_id)
         except InsufficientTokensError:
-            # ПОЧЕМУ: пятое занятие месяца при 4 фишках бесплатно (решение
-            # бизнеса); после истечения абонемента строка выпадет из выборки
+            # ПОЧЕМУ: в норме занятий в окне ровно 4 на 4 фишки; лишнее даёт
+            # только сбой (заморозка не на целые недели, смена дня группы,
+            # перенос в окно); после истечения строка выпадет из выборки
             logger.info("Отметка #%s: фишки слота кончились", attendance_id)
             continue
         except BillingError as exc:
