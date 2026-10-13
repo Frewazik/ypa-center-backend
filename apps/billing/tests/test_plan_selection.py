@@ -39,6 +39,7 @@ from apps.billing.tests.test_billing import (
 )
 from apps.billing.tests.test_trials import _trial_checkout
 from apps.core.management.commands.seed_demo import Command as SeedDemo
+from apps.schedule.ports import DjangoSchedulePort
 from apps.schedule.tests.factories import ScheduleFactory
 from apps.events.ports import DjangoEventBookingPort
 
@@ -145,7 +146,7 @@ class TestUnlimitedExpiryCredit:
                 remaining_tokens=left,
             )
 
-        sweep_expired_subscriptions()
+        sweep_expired_subscriptions(schedule_port=DjangoSchedulePort())
 
         assert DepositEntry.objects.get().amount == 300_000
 

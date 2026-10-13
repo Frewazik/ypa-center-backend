@@ -15,6 +15,7 @@ from apps.events.services import RegistrationSubmission, register_for_event
 from apps.events.models import Event, EventRegistration, RegistrationStatus
 from apps.events.tests.factories import EventFactory, EventRegistrationFactory
 from apps.schedule.models import MaskType
+from apps.schedule.ports import DjangoSchedulePort
 from apps.schedule.tests.factories import (
     ActivityFactory,
     EnrollmentFactory,
@@ -531,7 +532,7 @@ class TestSubscriptionHistory:
         )
         EnrollmentFactory(student=student, subscription=subscription, schedule=schedule)
         # Настоящий свипер: EXPIRED, записи → CANCELED, остаток → депозит
-        assert sweep_expired_subscriptions() == 1
+        assert sweep_expired_subscriptions(schedule_port=DjangoSchedulePort()) == 1
 
         response = api_client.get(SUBSCRIPTIONS_URL)
 
@@ -553,7 +554,7 @@ class TestSubscriptionHistory:
     ) -> None:
         student = StudentFactory(parent=parent, full_name="Петров Пётр")
         _paid_subscription(parent, student, expires_in_days=-1)
-        sweep_expired_subscriptions()
+        sweep_expired_subscriptions(schedule_port=DjangoSchedulePort())
         Student.objects.filter(pk=student.pk).update(archived_at=timezone.now())
 
         (card,) = api_client.get(SUBSCRIPTIONS_URL).json()
@@ -596,7 +597,7 @@ class TestSubscriptionHistory:
         newer_expired = _paid_subscription(
             parent, student, created_days_ago=60, expires_in_days=-1
         )
-        assert sweep_expired_subscriptions() == 2
+        assert sweep_expired_subscriptions(schedule_port=DjangoSchedulePort()) == 2
         new_active = _paid_subscription(parent, student, created_days_ago=1)
 
         ids = [card["id"] for card in api_client.get(SUBSCRIPTIONS_URL).json()]

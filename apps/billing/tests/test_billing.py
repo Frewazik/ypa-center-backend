@@ -46,7 +46,7 @@ from apps.billing.models import (
     Transaction,
     TransactionStatus,
 )
-from apps.billing.ports import SlotTrialInfo, UnknownSlotError
+from apps.billing.ports import SchedulePort, SlotTrialInfo, UnknownSlotError
 from apps.billing.services import (
     AmountMismatchError,
     CheckoutResult,
@@ -284,6 +284,10 @@ class FakeSchedulePort:
         return SlotTrialInfo(
             activity_id=schedule.activity_id, price_kopecks=self.default_trial_price
         )
+
+    def has_lesson_on(self, slot_id: int, on_date: date) -> bool:
+        # ПОЧЕМУ: в тестах биллинга масок нет — каждое занятие состоялось
+        return True
 
 
 def _port(**capacities: int) -> FakeSchedulePort:
@@ -1315,7 +1319,7 @@ class TestSweepers:
             expires_at=timezone.now() + timedelta(days=10),
         )
 
-        swept = sweep_expired_subscriptions()
+        swept = sweep_expired_subscriptions(schedule_port=FakeSchedulePort())
 
         expired_sub.refresh_from_db()
         alive_sub.refresh_from_db()
@@ -1781,7 +1785,7 @@ class TestDepositAccrual:
     def test_expiry_credits_unused_money_and_zeroes_tokens(self) -> None:
         subscription = self._expired_subscription(remaining_total=4)  # сходил 8
 
-        swept = sweep_expired_subscriptions()
+        swept = sweep_expired_subscriptions(schedule_port=FakeSchedulePort())
 
         subscription.refresh_from_db()
         deposit = ParentDeposit.objects.get(parent_id=subscription.parent_id)
@@ -1800,8 +1804,8 @@ class TestDepositAccrual:
     def test_second_sweep_does_not_double_credit(self) -> None:
         subscription = self._expired_subscription(remaining_total=4)
 
-        sweep_expired_subscriptions()
-        sweep_expired_subscriptions()
+        sweep_expired_subscriptions(schedule_port=FakeSchedulePort())
+        sweep_expired_subscriptions(schedule_port=FakeSchedulePort())
 
         deposit = ParentDeposit.objects.get(parent_id=subscription.parent_id)
         assert deposit.balance == 240_000
@@ -1812,7 +1816,7 @@ class TestDepositAccrual:
         # возврат на депозит обрезается до нуля (отрицательных начислений нет)
         subscription = self._expired_subscription(remaining_total=0)
 
-        sweep_expired_subscriptions()
+        sweep_expired_subscriptions(schedule_port=FakeSchedulePort())
 
         assert not ParentDeposit.objects.filter(
             parent_id=subscription.parent_id
@@ -2028,7 +2032,7 @@ class TestPriceSnapshotImmunity:
         )
         Subscription.objects.update(expires_at=timezone.now() - timedelta(days=1))
 
-        assert sweep_expired_subscriptions() == 1
+        assert sweep_expired_subscriptions(schedule_port=FakeSchedulePort()) == 1
 
         deposit = ParentDeposit.objects.get(parent=parent)
         assert deposit.balance == 700_000
@@ -2056,7 +2060,7 @@ class TestSeatNecromancy:
         )  # место занято мертвецом-будущим
         Subscription.objects.update(expires_at=timezone.now() - timedelta(days=1))
 
-        assert sweep_expired_subscriptions() == 1
+        assert sweep_expired_subscriptions(schedule_port=FakeSchedulePort()) == 1
 
         dead.refresh_from_db()
         assert dead.status == EnrollmentStatus.CANCELED
@@ -2107,9 +2111,11 @@ class TestExpiryCreditRace:
         sweeper_claimed = Event()
         original_catch_up = billing_services._debit_attended_before_expiry
 
-        def signalling_catch_up(subscription: Subscription) -> None:
+        def signalling_catch_up(
+            subscription: Subscription, schedule_port: SchedulePort
+        ) -> None:
             sweeper_claimed.set()
-            original_catch_up(subscription)
+            original_catch_up(subscription, schedule_port)
 
         monkeypatch.setattr(
             billing_services, "_debit_attended_before_expiry", signalling_catch_up
@@ -2123,7 +2129,7 @@ class TestExpiryCreditRace:
 
         def run_sweeper() -> None:
             try:
-                sweep_expired_subscriptions()
+                sweep_expired_subscriptions(schedule_port=FakeSchedulePort())
             finally:
                 connection.close()
 
@@ -2340,7 +2346,7 @@ class TestGrantedTokensSnapshot:
             subscription=subscription, slot_id=100, granted_tokens=4, remaining_tokens=1
         )
 
-        assert sweep_expired_subscriptions() == 1
+        assert sweep_expired_subscriptions(schedule_port=FakeSchedulePort()) == 1
 
         deposit = ParentDeposit.objects.get(parent=subscription.parent)
         assert deposit.balance == 340_000

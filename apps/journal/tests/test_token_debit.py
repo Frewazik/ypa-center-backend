@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import datetime
-from datetime import timedelta
+import logging
+from datetime import date, timedelta
 from itertools import count
 
 import pytest
@@ -26,8 +27,14 @@ from apps.billing.services import (
     sweep_expired_subscriptions,
 )
 from apps.billing.tests.factories import AttendanceFactory, SubscriptionSlotFactory
-from apps.journal.services import debit_attended_lessons, open_lesson
+from apps.journal.services import (
+    debit_attended_lessons,
+    materialize_today_lessons,
+    open_lesson,
+)
 from apps.schedule.models import MaskType
+from apps.schedule.ports import DjangoSchedulePort
+from apps.schedule.services import normalize_week_start
 from apps.schedule.tests.factories import (
     EnrollmentFactory,
     ScheduleFactory,
@@ -42,11 +49,15 @@ _BASE = 100_000  # 1 000 ₽ за занятие
 _start_hours = count()
 
 
-def _enrolled_child(*, remaining_tokens: int = 4) -> Enrollment:
+def _enrolled_child(
+    *, remaining_tokens: int = 4, day_of_week: int | None = None
+) -> Enrollment:
     # ПОЧЕМУ день недели = сегодня: open_lesson проверяет, что дата — день группы
     today = timezone.localdate()
     schedule = ScheduleFactory(
-        time_slot__day_of_week=today.weekday(),
+        time_slot__day_of_week=(
+            today.weekday() if day_of_week is None else day_of_week
+        ),
         time_slot__start_time=datetime.time(hour=8 + next(_start_hours) % 12),
     )
     subscription = SubscriptionFactory(
@@ -194,13 +205,119 @@ class TestNightlyDebit:
         assert _remaining() == 4
 
 
+class TestMissedMorning:
+    def test_caught_up_lesson_is_debited_at_night(self) -> None:
+        # воспроизведение аудита §2.2: утром вчера задача не запускалась —
+        # без добора занятие ушло бы на депозит как непосещённое
+        yesterday = timezone.localdate() - timedelta(days=1)
+        _enrolled_child(day_of_week=yesterday.weekday())
+
+        materialize_today_lessons()
+
+        assert debit_attended_lessons() == 1
+        assert Attendance.objects.get().date == yesterday
+        assert _remaining() == 3
+
+
+class TestRescheduledLessonDebit:
+    def _monday_group(self) -> tuple[Enrollment, date, date]:
+        monday = normalize_week_start(timezone.localdate()) + timedelta(weeks=1)
+        enrollment = _enrolled_child(day_of_week=monday.weekday())
+        return enrollment, monday, monday + timedelta(days=2)
+
+    def test_token_is_debited_on_landing_day_only(self) -> None:
+        # аудит §2.5: перенос ПН→СР списывал фишку в понедельник за ещё не
+        # прошедшее занятие
+        enrollment, monday, wednesday = self._monday_group()
+        ScheduleMaskFactory(
+            schedule=enrollment.schedule,
+            target_date=monday,
+            reschedule=True,
+            new_day_of_week=wednesday.weekday(),
+        )
+
+        materialize_today_lessons(today=monday)
+        assert debit_attended_lessons(today=monday) == 0
+
+        materialize_today_lessons(today=wednesday)
+        assert debit_attended_lessons(today=wednesday) == 1
+        assert Attendance.objects.get().date == wednesday
+
+    def test_moved_away_after_opening_burns_nothing(self) -> None:
+        # журнал открыт в 07:00, днём занятие перенесли на среду
+        enrollment, monday, wednesday = self._monday_group()
+        materialize_today_lessons(today=monday)
+        ScheduleMaskFactory(
+            schedule=enrollment.schedule,
+            target_date=monday,
+            reschedule=True,
+            new_day_of_week=wednesday.weekday(),
+        )
+
+        assert debit_attended_lessons(today=monday) == 0
+
+        attendance = Attendance.objects.get(date=monday)
+        assert attendance.status == AttendanceStatus.ABSENT_OK
+        assert _remaining() == 4
+
+    def test_time_only_reschedule_is_debited_as_usual(self) -> None:
+        enrollment, monday, _ = self._monday_group()
+        ScheduleMaskFactory(
+            schedule=enrollment.schedule, target_date=monday, reschedule=True
+        )
+
+        materialize_today_lessons(today=monday)
+
+        assert debit_attended_lessons(today=monday) == 1
+
+
 class TestExpiryCatchUp:
+    def test_sweeper_skips_cancelled_lesson(self) -> None:
+        # аудит §2.6: ночная задача не отработала, занятие отменили —
+        # при истечении фишка сгорала, на депозит приходило меньше
+        attendance = _open_today(_enrolled_child())
+        ScheduleMaskFactory(
+            schedule=attendance.enrollment.schedule,
+            target_date=attendance.date,
+            type=MaskType.CANCELLATION,
+        )
+        _expire_now()
+
+        sweep_expired_subscriptions(schedule_port=DjangoSchedulePort())
+
+        assert DepositEntry.objects.get().amount == _PRICE
+        # следующая ночь снимает «пришёл» без возврата фишки — её не списывали
+        debit_attended_lessons()
+        attendance.refresh_from_db()
+        assert attendance.status == AttendanceStatus.ABSENT_OK
+        assert attendance.token_debited is False
+
+    def test_debited_mark_of_expired_is_not_retried(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # списано в 23:00, отменили после, абонемент истёк — вернуть фишку
+        # нельзя, и каждую ночь писать об этом warning бессмысленно
+        attendance = _open_today(_enrolled_child())
+        debit_attended_lessons()
+        ScheduleMaskFactory(
+            schedule=attendance.enrollment.schedule,
+            target_date=attendance.date,
+            type=MaskType.CANCELLATION,
+        )
+        _expire_now()
+        sweep_expired_subscriptions(schedule_port=DjangoSchedulePort())
+        caplog.set_level(logging.WARNING, logger="apps.journal.services")
+
+        debit_attended_lessons()
+
+        assert not caplog.records
+
     def test_sweeper_debits_lesson_missed_by_nightly_job(self) -> None:
         # воспроизведение аудита §2.3: ходил, а на депозит пришла полная цена
         attendance = _open_today(_enrolled_child())
         _expire_now()
 
-        sweep_expired_subscriptions()
+        sweep_expired_subscriptions(schedule_port=DjangoSchedulePort())
 
         attendance.refresh_from_db()
         entry = DepositEntry.objects.get()
@@ -215,7 +332,7 @@ class TestExpiryCatchUp:
         )
         _expire_now()
 
-        sweep_expired_subscriptions()
+        sweep_expired_subscriptions(schedule_port=DjangoSchedulePort())
 
         assert DepositEntry.objects.get().amount == _PRICE
 
@@ -223,7 +340,7 @@ class TestExpiryCatchUp:
         _open_today(_enrolled_child(remaining_tokens=0))
         _expire_now()
 
-        assert sweep_expired_subscriptions() == 1
+        assert sweep_expired_subscriptions(schedule_port=DjangoSchedulePort()) == 1
         assert Subscription.objects.get().status == SubscriptionStatus.EXPIRED
         assert not DepositEntry.objects.exists()
 
@@ -232,7 +349,7 @@ class TestExpiryCatchUp:
         # депозит менеджер правит вручную
         attendance = _open_today(_enrolled_child())
         _expire_now()
-        sweep_expired_subscriptions()
+        sweep_expired_subscriptions(schedule_port=DjangoSchedulePort())
 
         with pytest.raises(TokenNotRefundableError):
             set_attendance_status(
@@ -268,7 +385,7 @@ class TestMonthEndToEnd:
 
         # абонемент истёк: сходил 1 раз → 4 000 − 1 000 = 3 000 ₽ на депозит
         _expire_now()
-        assert sweep_expired_subscriptions() == 1
+        assert sweep_expired_subscriptions(schedule_port=DjangoSchedulePort()) == 1
 
         deposit = ParentDeposit.objects.get(
             parent_id=enrollment.subscription.parent_id  # type: ignore[union-attr]

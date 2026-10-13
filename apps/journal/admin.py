@@ -8,6 +8,7 @@ from django.utils import timezone
 from unfold.admin import ModelAdmin
 
 from apps.journal.models import Lesson
+from apps.schedule.services import teacher_lessons_q
 from apps.users.models import TeacherProfile
 
 
@@ -58,4 +59,6 @@ class LessonAdmin(ModelAdmin):
         teacher = _teacher_profile(request)
         if teacher is None:
             return queryset
-        return queryset.filter(schedule__teacher=teacher)
+        return queryset.filter(
+            teacher_lessons_q(teacher.pk, schedule_path="schedule", date_path="date")
+        )
