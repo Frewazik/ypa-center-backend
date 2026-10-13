@@ -253,6 +253,10 @@ https://api.example.ru/admin/public_forms/feedbackrequest/123/change/
 Локально и на `staging` пустой Telegram допустим: уведомление не отправляется, в лог
 пишется «Telegram не настроен», без повторов.
 
+Запросы httpx в лог не пишутся (`LOGGING` в `config/settings.py`: логгеры `httpx` и
+`httpcore` на `WARNING`): токен бота — часть адреса запроса, и на `--log-level INFO`
+воркера он попадал бы в вывод с каждым уведомлением.
+
 Как отправка реагирует на ответ Telegram:
 
 | Ответ | Действие |

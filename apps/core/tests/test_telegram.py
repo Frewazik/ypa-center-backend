@@ -55,6 +55,19 @@ class TestSendManagerMessage:
         assert seen[0].url.path == "/botbot-token/sendMessage"
         assert json.loads(seen[0].content) == {"chat_id": "-100500", "text": "Привет"}
 
+    async def test_bot_token_not_in_logs_at_info(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # ПОЧЕМУ: воркер работает с --log-level INFO, а у Telegram токен — часть
+        # адреса. Уровень ставится только корню, как это делает taskiq
+        # через basicConfig, — логгеру httpx его не задаём
+        _route(monkeypatch, lambda r: httpx.Response(200, json={"ok": True}))
+
+        with caplog.at_level(logging.INFO):
+            await send_manager_message("Привет", context="test")
+
+        assert not [r for r in caplog.records if "bot-token" in r.getMessage()]
+
     async def test_rate_limit_waits_and_retries_once(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

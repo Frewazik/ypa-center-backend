@@ -447,6 +447,20 @@ EXTERNAL_HTTP_TIMEOUT_SECONDS = 5.0
 # получала отказ — и уведомления менеджерам молча не доходили нигде
 TELEGRAM_BOT_TOKEN = _env.TELEGRAM_BOT_TOKEN
 TELEGRAM_MANAGER_CHAT_ID = _env.TELEGRAM_MANAGER_CHAT_ID
+
+# ПОЧЕМУ: httpx на INFO пишет каждый запрос с полным адресом, а у Telegram
+# токен бота — часть адреса; воркер запускается с --log-level INFO.
+# basicConfig taskiq меняет только корневой логгер, этот уровень не сбивает.
+# disable_existing_loggers=False: иначе dictConfig выключит уже созданные
+# логгеры (taskiq, apps.*)
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "loggers": {
+        "httpx": {"level": "WARNING"},
+        "httpcore": {"level": "WARNING"},
+    },
+}
 ADMIN_BASE_URL = _env.ADMIN_BASE_URL
 
 EVENT_PENDING_PAYMENT_TTL_MINUTES = _env.EVENT_PENDING_PAYMENT_TTL_MINUTES
