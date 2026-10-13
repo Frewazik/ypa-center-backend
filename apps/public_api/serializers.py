@@ -29,7 +29,6 @@ class ActivityCardSerializer(serializers.ModelSerializer[Activity]):
             "name",
             "slug",
             "category",
-            "price",
             "cover_image",
             "short_description",
             "features",

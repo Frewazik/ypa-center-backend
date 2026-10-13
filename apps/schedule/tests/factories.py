@@ -41,7 +41,6 @@ class ActivityFactory(factory.django.DjangoModelFactory):
     name = factory.Sequence(lambda n: f"Кружок {n}")
     slug = factory.Sequence(lambda n: f"activity-{n}")
     category = "CLUB"
-    price = 400_000
     is_active = True
 
 

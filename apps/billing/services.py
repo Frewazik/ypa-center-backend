@@ -812,27 +812,6 @@ def create_trial_payment(
                 selected_slot_ids=[schedule_id],
                 metadata={"kind": "trial", "trial_date": trial_date.isoformat()},
             )
-
-            if tx.amount == 0:
-                # ПОЧЕМУ: бесплатное пробное подтверждается без похода в кассу —
-                # симметрично бесплатным ивентам и депозитному абонементу
-                tx.status = TransactionStatus.SUCCEEDED
-                tx.metadata = {**tx.metadata, "free_trial": True}
-                tx.save(update_fields=["status", "metadata"])
-                enrollment.status = EnrollmentStatus.ENROLLED
-                enrollment.save(update_fields=["status"])
-                # ПОЧЕМУ: как у платного (_apply_trial_success) — журнал дня
-                # собран в 07:00, без этого ребёнка нет в сегодняшнем занятии
-                if trial_date == timezone.localdate():
-                    _add_to_journal({enrollment.pk: trial_date})
-                result = CheckoutResult(
-                    transaction_id=tx.pk,
-                    status="CONFIRMED",
-                    payment_url=None,
-                    expires_at=None,
-                )
-                _finalize_idempotency_record(idempotency_key, lock_token, result)
-                return result
     except _IdempotencyLockLostError:
         return _recover_lost_idempotency(idempotency_key)
     except Exception:

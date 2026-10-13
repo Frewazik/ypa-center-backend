@@ -263,16 +263,27 @@ class TestFingerprintSlotOrder:
 
 
 @pytest.mark.django_db
-class TestFreeTrialToday:
-    def test_free_trial_today_lands_in_todays_journal(self) -> None:
-        result, _, _ = _trial_checkout(101, days_ahead=0, price=0)
+class TestPaidTrialToday:
+    def _pay(self) -> None:
+        tx = Transaction.objects.get()
+        payment_id, gateway = _gateway_for(tx, "succeeded")
+        confirm_payment(
+            payment_id=payment_id,
+            gateway=gateway,
+            schedule_port=FakeSchedulePort(),
+            event_port=DjangoEventBookingPort(),
+        )
 
-        assert result.status == "CONFIRMED"
+    def test_paid_trial_today_lands_in_todays_journal(self) -> None:
+        _trial_checkout(101, days_ahead=0)
+        self._pay()
+
         attendance = Attendance.objects.get()
         assert attendance.date == timezone.localdate()
         assert attendance.status == AttendanceStatus.ATTENDED
 
-    def test_free_trial_in_future_not_in_journal(self) -> None:
-        _trial_checkout(101, days_ahead=3, price=0)
+    def test_paid_trial_in_future_not_in_journal(self) -> None:
+        _trial_checkout(101, days_ahead=3)
+        self._pay()
 
         assert not Attendance.objects.exists()
