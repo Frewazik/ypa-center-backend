@@ -12,10 +12,11 @@ from typing import Final
 from django.utils import timezone
 
 from apps.billing.ports import SlotTrialInfo, UnknownSlotError
-from apps.schedule.models import MaskType, Schedule, ScheduleMask
+from apps.schedule.models import Schedule, ScheduleMask
 from apps.schedule.services import (
-    _effective_session,
     is_lesson_bookable,
+    lesson_on_q,
+    lesson_session,
     normalize_week_start,
 )
 
@@ -78,17 +79,17 @@ class DjangoSchedulePort:
         for week_offset in range(_LOOKAHEAD_WEEKS):
             week_start = first_week + datetime.timedelta(weeks=week_offset)
             original = week_start + datetime.timedelta(days=schedule.day_of_week)
-            mask = masks.get(original)
-            if mask is None:
-                lesson_date, start_time = original, schedule.start_time
-            elif mask.type == MaskType.CANCELLATION:
+            # ПОЧЕМУ: перенос двигает и день, и время — граница записи
+            # считается от фактического начала, как в сетке next-slots
+            session = lesson_session(schedule, masks.get(original), original=original)
+            if session is None:
                 continue
-            else:
-                # ПОЧЕМУ: перенос двигает и день, и время — граница записи
-                # считается от фактического начала, как в сетке next-slots
-                session = _effective_session(schedule, mask)
-                lesson_date, start_time = session.date, session.start_time
-            if is_lesson_bookable(lesson_date, start_time, now=after):
-                return lesson_date
+            if is_lesson_bookable(session.date, session.start_time, now=after):
+                return session.date
 
         raise UnknownSlotError(slot_id)
+
+    def has_lesson_on(self, slot_id: int, on_date: datetime.date) -> bool:
+        # ПОЧЕМУ без is_active: вопрос о прошедшем занятии — было ли оно,
+        # а не продаётся ли группа сейчас
+        return Schedule.objects.filter(pk=slot_id).filter(lesson_on_q(on_date)).exists()

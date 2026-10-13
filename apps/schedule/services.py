@@ -11,7 +11,8 @@ from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.db import IntegrityError, connection, models, transaction
-from django.db.models import Count, F, Func, Q, Value
+from django.db.models import Count, Exists, F, Func, OuterRef, Q, QuerySet, Value
+from django.db.models.functions import Cast, Coalesce, TruncWeek
 from django.utils import timezone
 
 from apps.billing.selectors import lesson_seat_holders, regular_seat_q, trial_seat_q
@@ -203,6 +204,92 @@ def _effective_session(schedule: Schedule, mask: ScheduleMask) -> _EffectiveSess
         room_id=room_id,
         teacher_id=teacher_id,
     )
+
+
+def lesson_session(
+    schedule: Schedule, mask: ScheduleMask | None, *, original: datetime.date
+) -> _EffectiveSession | None:
+    # ПОЧЕМУ: маска висит на исходной дате занятия (original), а перенос
+    # двигает его внутри той же недели — без маски занятие на своём месте,
+    # отмена — занятия нет. SQL-двойник для фильтров — MaskLandingDate
+    if mask is None:
+        return _EffectiveSession(
+            date=original,
+            day_of_week=schedule.day_of_week,
+            start_time=schedule.start_time,
+            end_time=schedule.end_time,
+            room_id=schedule.room_id,
+            teacher_id=schedule.teacher_id,
+        )
+    if mask.type == MaskType.CANCELLATION:
+        return None
+    return _effective_session(schedule, mask)
+
+
+class MaskLandingDate(Func):
+    # ПОЧЕМУ: то же правило, что _effective_session(...).date, но в SQL —
+    # журналу и админке нужно фильтровать по фактической дате занятия, не
+    # поднимая маски в Python. Понедельник недели исходной даты + новый день
+    # (пустой new_day_of_week — перенос только по времени, день прежний)
+
+    arg_joiner = " + "
+    template = "(%(expressions)s)"
+    output_field = models.DateField()
+
+    def __init__(self) -> None:
+        super().__init__(
+            Cast(TruncWeek("target_date"), models.DateField()),
+            Coalesce("new_day_of_week", "schedule__day_of_week"),
+        )
+
+
+def masks_without_lesson_on_target() -> QuerySet[ScheduleMask]:
+    # ПОЧЕМУ отмена отдельно: у неё нет new_*, MaskLandingDate совпал бы
+    # с исходной датой
+    return ScheduleMask.objects.annotate(landing=MaskLandingDate()).filter(
+        Q(type=MaskType.CANCELLATION)
+        | (Q(type=MaskType.RESCHEDULE) & ~Q(landing=F("target_date")))
+    )
+
+
+def lesson_on_q(day: datetime.date) -> Q:
+    """Условие на Schedule: у группы есть занятие на дату day с учётом масок."""
+    week_start = normalize_week_start(day)
+    week_end = week_start + datetime.timedelta(days=6)
+    kept_on_grid_day = Q(day_of_week=day.weekday()) & ~Q(
+        Exists(
+            masks_without_lesson_on_target().filter(
+                schedule=OuterRef("pk"), target_date=day
+            )
+        )
+    )
+    moved_here = Exists(
+        ScheduleMask.objects.annotate(landing=MaskLandingDate()).filter(
+            schedule=OuterRef("pk"),
+            type=MaskType.RESCHEDULE,
+            target_date__range=(week_start, week_end),
+            landing=day,
+        )
+    )
+    return kept_on_grid_day | Q(moved_here)
+
+
+def teacher_lessons_q(teacher_id: int, *, schedule_path: str, date_path: str) -> Q:
+    """Занятия педагога: его группы и чужие, перенесённые на него маской.
+
+    schedule_path и date_path — пути к группе и дате занятия от модели
+    запроса (у журнала "schedule"/"date", у отметок "enrollment__schedule"/"date").
+    """
+    # ПОЧЕМУ: подменный педагог из маски ведёт занятие на фактическую дату
+    # переноса — без этого он не видит, кого отмечать. Основной педагог группы
+    # занятие тоже видит: группа его
+    substitute = ScheduleMask.objects.annotate(landing=MaskLandingDate()).filter(
+        schedule=OuterRef(schedule_path),
+        type=MaskType.RESCHEDULE,
+        new_teacher_id=teacher_id,
+        landing=OuterRef(date_path),
+    )
+    return Q(**{f"{schedule_path}__teacher_id": teacher_id}) | Q(Exists(substitute))
 
 
 def _lock_resources(session: _EffectiveSession) -> None:

@@ -24,11 +24,16 @@ from apps.billing.services import (
     set_attendance_status,
 )
 from apps.journal.models import Lesson
-from apps.schedule.models import MaskType, Schedule, ScheduleMask
+from apps.schedule.models import Schedule
+from apps.schedule.services import lesson_on_q, masks_without_lesson_on_target
 
 logger = logging.getLogger(__name__)
 
 _DEBIT_CHUNK_SIZE = 1_000
+# ПОЧЕМУ неделя: у каждой группы в окне ровно одно занятие — сбой планировщика
+# до недели добирается целиком. Дольше без журналов не заметить нельзя, а
+# «пришёл всем» на давнем занятии — уже догадка, за которую списываются деньги
+_CATCH_UP_DAYS = 6
 
 
 def open_lesson(schedule_id: int, date: datetime.date) -> Lesson:
@@ -36,19 +41,30 @@ def open_lesson(schedule_id: int, date: datetime.date) -> Lesson:
     # записанных — посещаемость автоматическая, учитель только снимает
     # отсутствующих
     schedule = Schedule.objects.get(pk=schedule_id, is_active=True)
-    if not _is_lesson_day(schedule, date):
+    if not Schedule.objects.filter(pk=schedule.pk).filter(lesson_on_q(date)).exists():
         raise ValidationError(
             {"date": ["На эту дату занятие группы не запланировано."]},
             code="VALIDATION_ERROR",
         )
+    return _fill_lesson(schedule.pk, date)
+
+
+def _fill_lesson(schedule_id: int, date: datetime.date) -> Lesson:
+    day_start = timezone.make_aware(datetime.datetime.combine(date, datetime.time.min))
     with transaction.atomic():
-        lesson, _ = Lesson.objects.get_or_create(schedule=schedule, date=date)
+        lesson, _ = Lesson.objects.get_or_create(schedule_id=schedule_id, date=date)
         # ПОЧЕМУ: пробный ученик попадает в журнал только на дату своего
-        # визита — регулярная запись материализуется на каждое занятие
+        # визита — регулярная запись материализуется на каждое занятие в
+        # сроке абонемента: добор прошлых дней не должен вписать абонемент,
+        # начавшийся позже, или занятие после последнего дня
         enrolled = Enrollment.objects.filter(
-            schedule=schedule, status=EnrollmentStatus.ENROLLED
+            schedule_id=schedule_id, status=EnrollmentStatus.ENROLLED
         ).filter(
-            Q(type=EnrollmentType.REGULAR)
+            Q(
+                type=EnrollmentType.REGULAR,
+                subscription__start_date__lte=date,
+                subscription__expires_at__gte=day_start,
+            )
             | Q(type=EnrollmentType.TRIAL, trial_date=date)
         )
         # ПОЧЕМУ bulk_create: get_or_create в цикле давал 2 запроса на ученика
@@ -69,21 +85,41 @@ def open_lesson(schedule_id: int, date: datetime.date) -> Lesson:
     return lesson
 
 
-def materialize_today_lessons() -> int:
-    today = timezone.localdate()
-    schedules = Schedule.objects.filter(
-        is_active=True, day_of_week=today.weekday()
-    ).values_list("pk", flat=True)
+def materialize_today_lessons(*, today: datetime.date | None = None) -> int:
+    # ПОЧЕМУ добор прошлых дней: если утренний тик пропущен (воркер или
+    # планировщик лежал), у занятия нет отметок — ночное списание ничего не
+    # найдёт, и при истечении абонемента занятие уйдёт на депозит как
+    # непосещённое
+    day = today if today is not None else timezone.localdate()
     opened = 0
-    for schedule_id in schedules:
-        try:
-            open_lesson(schedule_id, today)
-        except ValidationError:
-            continue
-        opened += 1
-    if opened:
-        logger.info("Открыто занятий на %s: %d", today, opened)
+    for days_ago in range(_CATCH_UP_DAYS, -1, -1):
+        opened += _open_lessons_on(
+            day - datetime.timedelta(days=days_ago), catch_up=days_ago > 0
+        )
     return opened
+
+
+def _open_lessons_on(day: datetime.date, *, catch_up: bool) -> int:
+    schedules = Schedule.objects.filter(is_active=True).filter(lesson_on_q(day))
+    if catch_up:
+        # ПОЧЕМУ: прошлое занятие — только если утро его не открыло. Повторное
+        # открытие вписало бы купившего абонемент после начала занятия (его
+        # первое занятие через неделю), и ночью за него сгорела бы фишка
+        schedules = schedules.exclude(
+            Exists(Lesson.objects.filter(schedule=OuterRef("pk"), date=day))
+        )
+    schedule_ids = list(schedules.order_by("pk").values_list("pk", flat=True))
+    for schedule_id in schedule_ids:
+        _fill_lesson(schedule_id, day)
+    if schedule_ids and catch_up:
+        logger.warning(
+            "Утреннее открытие журнала за %s было пропущено, добрано занятий: %d",
+            day,
+            len(schedule_ids),
+        )
+    elif schedule_ids:
+        logger.info("Открыто занятий на %s: %d", day, len(schedule_ids))
+    return len(schedule_ids)
 
 
 def debit_attended_lessons(*, today: datetime.date | None = None) -> int:
@@ -92,7 +128,7 @@ def debit_attended_lessons(*, today: datetime.date | None = None) -> int:
     # списание — своя транзакция: падение посередине оставляет уже списанное,
     # повторный запуск добирает остальное (token_debited + FOR UPDATE)
     day = today if today is not None else timezone.localdate()
-    _release_cancelled_lessons(day)
+    _release_missing_lessons(day)
     candidate_ids = list(
         attendances_awaiting_debit()
         .filter(
@@ -122,18 +158,27 @@ def debit_attended_lessons(*, today: datetime.date | None = None) -> int:
     return debited
 
 
-def _release_cancelled_lessons(day: datetime.date) -> None:
-    # ПОЧЕМУ: маску отмены могут поставить уже после утреннего открытия
-    # занятия — отметки «пришёл» остались бы и сожгли фишку за несостоявшееся
-    # занятие. Через сервис: если фишку успели списать, она вернётся
-    cancelled = ScheduleMask.objects.filter(
-        schedule=OuterRef("enrollment__schedule"),
-        target_date=OuterRef("date"),
-        type=MaskType.CANCELLATION,
+def _release_missing_lessons(day: datetime.date) -> None:
+    # ПОЧЕМУ: маску отмены или переноса на другой день могут поставить уже
+    # после утреннего открытия занятия — отметки «пришёл» остались бы и сожгли
+    # фишку за несостоявшееся занятие. Через сервис: если фишку успели
+    # списать, она вернётся
+    no_lesson = masks_without_lesson_on_target().filter(
+        schedule=OuterRef("enrollment__schedule"), target_date=OuterRef("date")
     )
-    attendance_ids = Attendance.objects.filter(
-        Exists(cancelled), status=AttendanceStatus.ATTENDED, date__lte=day
-    ).values_list("pk", flat=True)
+    attendance_ids = (
+        Attendance.objects.filter(
+            Exists(no_lesson), status=AttendanceStatus.ATTENDED, date__lte=day
+        )
+        # ПОЧЕМУ: списанную фишку истёкшего абонемента не вернуть
+        # (TokenNotRefundableError) — без отсечки задача каждую ночь вечно
+        # повторяла бы попытку и warning. Депозит тогда правит менеджер
+        .filter(
+            Q(token_debited=False)
+            | Q(enrollment__subscription__status=SubscriptionStatus.ACTIVE)
+        )
+        .values_list("pk", flat=True)
+    )
     for attendance_id in attendance_ids:
         try:
             set_attendance_status(
@@ -141,12 +186,7 @@ def _release_cancelled_lessons(day: datetime.date) -> None:
             )
         except BillingError as exc:
             logger.warning(
-                "Отметка #%s на отменённом занятии не снята: %s", attendance_id, exc
+                "Отметка #%s на несостоявшемся занятии не снята: %s",
+                attendance_id,
+                exc,
             )
-
-
-def _is_lesson_day(schedule: Schedule, date: datetime.date) -> bool:
-    mask = ScheduleMask.objects.filter(schedule=schedule, target_date=date).first()
-    if mask is not None:
-        return mask.type != MaskType.CANCELLATION
-    return schedule.day_of_week == date.weekday()

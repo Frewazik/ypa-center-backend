@@ -2279,7 +2279,9 @@ def _close_overdue_rechecks(moment: datetime) -> None:
             )
 
 
-def sweep_expired_subscriptions(*, now: datetime | None = None) -> int:
+def sweep_expired_subscriptions(
+    *, schedule_port: SchedulePort, now: datetime | None = None
+) -> int:
     # ПОЧЕМУ: автоматический перевод протухших абонементов в EXPIRED
     # с расчетом и начислением несгораемого остатка на депозит
     moment = now if now is not None else timezone.now()
@@ -2308,7 +2310,7 @@ def sweep_expired_subscriptions(*, now: datetime | None = None) -> int:
                 continue  # конкурентный тик успел первым
             # !!!: до расчёта остатка и до отмены записей — иначе занятие
             # последнего дня, не списанное ночной задачей, вернулось бы деньгами
-            _debit_attended_before_expiry(subscription)
+            _debit_attended_before_expiry(subscription, schedule_port)
             subscription.status = SubscriptionStatus.EXPIRED
             subscription.save(update_fields=["status"])
             Enrollment.objects.filter(
@@ -2320,7 +2322,9 @@ def sweep_expired_subscriptions(*, now: datetime | None = None) -> int:
     return swept
 
 
-def _debit_attended_before_expiry(subscription: Subscription) -> None:
+def _debit_attended_before_expiry(
+    subscription: Subscription, schedule_port: SchedulePort
+) -> None:
     # ПОЧЕМУ: страховка ночной задачи (journal.debit_attended_lessons) —
     # упала, не успела до 23:59:59 последнего дня или отметку вернули в
     # «пришёл» после неё. debit_token здесь не подходит: срок по дате уже
@@ -2335,6 +2339,14 @@ def _debit_attended_before_expiry(subscription: Subscription) -> None:
         .order_by("pk")
     )
     for attendance in attendances:
+        # ПОЧЕМУ: снять «пришёл» с отменённого или перенесённого занятия
+        # успевает только ночная задача журнала — если она не отработала,
+        # здесь сгорела бы фишка за занятие, которого не было. Статус
+        # снимет следующая ночная задача: фишка не списана, возвращать нечего
+        if not schedule_port.has_lesson_on(
+            attendance.enrollment.schedule_id, attendance.date
+        ):
+            continue
         try:
             _spend_slot_token(attendance, subscription.pk)
         except (InsufficientTokensError, SlotBalanceNotFoundError) as exc:

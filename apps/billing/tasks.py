@@ -99,12 +99,13 @@ def sweep_billing_states() -> None:
     # в случае сбоя стейт будет консистентно починен в следующий тик крона.
     # Сбои ЮКассы при сверке гасятся внутри свипера — истечение абонементов
     # ниже не зависит от доступности провайдера
+    schedule_port = resolve_schedule_port()
     canceled = sweep_stale_pending_transactions(
         gateway=YookassaHttpGateway(),
-        schedule_port=resolve_schedule_port(),
+        schedule_port=schedule_port,
         event_port=resolve_event_port(),
     )
-    expired = sweep_expired_subscriptions()
+    expired = sweep_expired_subscriptions(schedule_port=schedule_port)
     purged_keys = sweep_finalized_idempotency_records()
     if canceled or expired or purged_keys:
         logger.info(

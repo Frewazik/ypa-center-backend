@@ -38,6 +38,7 @@ from apps.billing.models import (
 )
 from apps.billing.services import REFUND_STATUSES_AWAITING_MANUAL, BillingError
 from apps.core.admin import RublesInputModelAdmin, rubles_column
+from apps.schedule.services import teacher_lessons_q
 
 
 class FreezeSubscriptionActionForm(forms.Form):
@@ -430,7 +431,13 @@ class AttendanceAdmin(ModelAdmin):
         teacher = getattr(request.user, "teacher_profile", None)
         if teacher is None:
             return queryset
-        return queryset.filter(enrollment__schedule__teacher=teacher)
+        # ПОЧЕМУ правило из расписания: какие занятия ведёт педагог (с учётом
+        # подмены по маске переноса) — знание расписания, не биллинга
+        return queryset.filter(
+            teacher_lessons_q(
+                teacher.pk, schedule_path="enrollment__schedule", date_path="date"
+            )
+        )
 
     @admin.display(description="Ребёнок", ordering="enrollment__student__full_name")
     def student_name(self, obj: Attendance) -> str:

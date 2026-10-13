@@ -190,3 +190,36 @@ class TestGetNextLessonDate:
     def test_unknown_slot_raises(self) -> None:
         with pytest.raises(UnknownSlotError):
             DjangoSchedulePort().get_next_lesson_date(999_999, _at(MONDAY, 9))
+
+
+@pytest.mark.django_db
+class TestHasLessonOn:
+    def test_plain_grid_day(self) -> None:
+        schedule = _wednesday_schedule()
+        port = DjangoSchedulePort()
+        assert port.has_lesson_on(schedule.pk, WEDNESDAY) is True
+        assert port.has_lesson_on(schedule.pk, MONDAY) is False
+
+    def test_cancelled_day(self) -> None:
+        schedule = _wednesday_schedule()
+        ScheduleMaskFactory(
+            schedule=schedule, target_date=WEDNESDAY, type=MaskType.CANCELLATION
+        )
+        assert DjangoSchedulePort().has_lesson_on(schedule.pk, WEDNESDAY) is False
+
+    def test_reschedule_moves_lesson_to_landing_day(self) -> None:
+        schedule = _wednesday_schedule()
+        ScheduleMaskFactory(
+            schedule=schedule,
+            target_date=WEDNESDAY,
+            reschedule=True,
+            new_day_of_week=MONDAY.weekday(),
+        )
+        port = DjangoSchedulePort()
+        assert port.has_lesson_on(schedule.pk, WEDNESDAY) is False
+        assert port.has_lesson_on(schedule.pk, MONDAY) is True
+
+    def test_past_lesson_of_closed_group_still_counts(self) -> None:
+        # ПОЧЕМУ: свиперу важно, было ли занятие, а не продаётся ли группа сейчас
+        schedule = _wednesday_schedule(is_active=False)
+        assert DjangoSchedulePort().has_lesson_on(schedule.pk, WEDNESDAY) is True

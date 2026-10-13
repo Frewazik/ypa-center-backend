@@ -40,6 +40,10 @@ class SchedulePort(Protocol):
 
     def get_slot_trial_info(self, slot_id: int) -> SlotTrialInfo: ...
 
+    # Было ли у группы занятие на дату — с учётом отмен и переносов
+    # (перенесённое занятие стоит на фактической дате, не на исходной)
+    def has_lesson_on(self, slot_id: int, on_date: date) -> bool: ...
+
 
 @dataclass(frozen=True, slots=True)
 class EventHold:
