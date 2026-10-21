@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 
 import pytest
+from pytest_django.fixtures import SettingsWrapper
 from django.utils import timezone
 
 from apps.billing.ports import (
@@ -75,8 +76,11 @@ class TestGetSlotCapacity:
 
 @pytest.mark.django_db
 class TestGetSlotTrialInfo:
-    def test_returns_activity_and_price(self) -> None:
-        activity = ActivityFactory(price=150_000)
+    def test_returns_activity_and_settings_price(
+        self, settings: SettingsWrapper
+    ) -> None:
+        settings.TRIAL_PRICE = 150_000
+        activity = ActivityFactory()
         schedule = _wednesday_schedule(activity=activity)
 
         info = DjangoSchedulePort().get_slot_trial_info(schedule.pk)

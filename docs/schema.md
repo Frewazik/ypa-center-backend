@@ -73,10 +73,10 @@ erDiagram
 
 ## catalog
 
-**activity** — кружок/услуга: `name`, `slug` (unique), `category`, `price`,
+**activity** — кружок/услуга: `name`, `slug` (unique), `category`,
 `cover_image`, `short_description`, `description`, `features` (JSON), `tags` (JSON),
 `is_active`. Поля `is_featured` нет — «популярные» на главной считаются по числу записей.
-`price` — цена пробного в копейках (0 — бесплатное).
+Цены у кружка нет: пробное стоит одинаково везде — `settings.TRIAL_PRICE`.
 
 ## schedule — сетка и коллизии
 

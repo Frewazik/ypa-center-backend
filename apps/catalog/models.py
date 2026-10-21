@@ -17,8 +17,6 @@ class Activity(models.Model):
         choices=ActivityCategory.choices,
         default=ActivityCategory.CLUB,
     )
-    # ПОЧЕМУ: в копейках, как все суммы в проекте; админка вводит её в рублях
-    price = models.IntegerField("Цена", default=0)
     is_active = models.BooleanField("Активен", default=True)
 
     # ПОЧЕМУ: медиа хранится в S3, витрина получает готовый CDN-URL.

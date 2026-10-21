@@ -307,7 +307,7 @@ class CheckoutTrialView(_CheckoutView):
         description="Идемпотентная запись на пробное занятие. "
         f"Заголовок {_IDEMPOTENCY_HEADER} (UUID v4) обязателен. "
         "Не более одного пробного на ребёнка по кружку. "
-        "Бесплатное пробное подтверждается сразу (CONFIRMED).",
+        "Цена единая (settings.TRIAL_PRICE), оплата всегда через ЮКассу.",
         parameters=[_IDEMPOTENCY_PARAMETER],
         tags=["checkout"],
     )
