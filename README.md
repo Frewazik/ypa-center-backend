@@ -7,7 +7,7 @@
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql&logoColor=white)
 ![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)
 ![mypy](https://img.shields.io/badge/mypy-strict%20%7C%200%20errors-blue)
-![tests](https://img.shields.io/badge/tests-278%20passed-brightgreen)
+![tests](https://img.shields.io/badge/tests-780%20passed-brightgreen)
 ![ruff](https://img.shields.io/badge/code%20style-ruff-D7FF64)
 
 ## Возможности
